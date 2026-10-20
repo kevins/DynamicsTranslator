@@ -1,0 +1,83 @@
+/* "All labels on this page": a non-modal side sheet on the right edge, like Dynamics' own side panes.
+   Every class is prefixed pl- (styles.css has short global classes); toggled states use is-. */
+.pgl{position:absolute;top:0;right:0;bottom:0;z-index:3;width:min(360px,100vw);display:flex;flex-direction:column;background:var(--bg1);border-left:1px solid var(--s2);box-shadow:-8px 0 24px rgba(0,0,0,.08);pointer-events:auto;animation:slideIn .18s var(--ease)}
+/* Dragged off the edge by its header: a panel over the page, like the Workbench window (pagelist.ts floatBox places
+   and sizes it). Same animation name as docked, so switching never replays it. Placed there on purpose, it sits above
+   the bar (.tbx is 11), which no longer keeps clear of it, and below the popup (18) and tooltips. */
+.pgl.is-float{z-index:12;right:auto;bottom:auto;border:1px solid var(--s2);border-radius:8px;box-shadow:var(--sh64);overflow:hidden}
+/* The header is the handle (not its buttons): the Workbench window's title bar cursor. */
+.pl-hd{display:flex;align-items:center;gap:4px;height:48px;padding:0 8px 0 16px;border-bottom:1px solid var(--s2);flex:none;cursor:move;user-select:none;-webkit-user-select:none;touch-action:none}
+.pl-hd h2{flex:1;min-width:0;margin:0 4px 0 0;font-size:16px;line-height:22px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pl-nt{display:flex;flex-direction:column;gap:6px;padding:12px 16px 0;flex:none}
+.pl-nt:empty{display:none}
+.pl-nt .note{font-size:13px;line-height:18px;align-items:center}
+.pl-fl{display:flex;flex-direction:column;gap:8px;padding:12px 16px;border-bottom:1px solid var(--s3);flex:none}
+.pl-fl .seg{align-self:flex-start;max-width:100%}
+.pl-fl .seg button{padding:0 10px;gap:6px}
+.pl-n{font-weight:400;color:var(--fg3)}
+.pl-fl .seg button[aria-pressed=true] .pl-n{color:inherit}
+.pl-list{flex:1;min-height:0;overflow:auto;padding-bottom:16px;overscroll-behavior:contain}
+/* A group: a grey band across the sheet, its name and its count, that stays at the top while its rows scroll by, and
+   collapses and expands them (its chevron, like "Not on screen right now"). One font throughout the list: 14px for the
+   band and the labels, 13px for the second line and the pages of changes made elsewhere, 12px for kinds. */
+.pl-gh{position:sticky;top:0;z-index:1;margin:12px 0 0;background:var(--bg3);border-top:1px solid var(--s2);border-bottom:1px solid var(--s2)}
+.pl-list>.pl-gh:first-child,.pl-aw:first-child>.pl-gh:first-child{margin-top:0;border-top:0}
+/* A collapsed group: the next band (or section) right under it. */
+.pl-gh+.pl-gh,.pl-gh+.pl-aw,.pl-gh+.pl-hid{margin-top:0}
+.pl-gh+.pl-gh,.pl-gh+.pl-aw>.pl-gh:first-child,.pl-gh+.pl-hid>summary{border-top:0}
+.pl-gb{display:flex;align-items:center;gap:8px;width:100%;min-height:40px;box-sizing:border-box;margin:0;padding:8px 16px;border:0;background:none;font:inherit;font-size:14px;line-height:20px;font-weight:600;color:var(--fg1);text-align:left;cursor:pointer}
+.pl-gb:hover{background:var(--bg4)}
+.pl-gb:focus-visible{outline:0;box-shadow:inset 0 0 0 2px #000;border-radius:4px}
+.pl-gb svg{flex:none;transform:rotate(-90deg);transition:transform .1s;color:var(--fg3)}
+.pl-gb[aria-expanded=true] svg{transform:none}
+.pl-gn{flex:1;min-width:0}
+.pl-gh .count{color:var(--fg2);background:var(--bg1);box-shadow:inset 0 0 0 1px var(--s2);line-height:20px}
+/* A row: the base-language text with its kind on the right, then the target-language text (or its state) under it,
+   hidden with one language. A long text wraps at word boundaries, two lines at most. */
+.pl-r{display:flex;flex-direction:column;justify-content:center;gap:2px;min-height:44px;box-sizing:border-box;padding:6px 16px;cursor:pointer;color:var(--fg1);outline:0}
+.pl-r:hover{background:var(--bg2)}
+.pl-r:active{background:var(--bg3)}
+.pl-r:focus-visible{box-shadow:inset 0 0 0 2px #000;border-radius:4px}
+.pl-a{display:flex;align-items:flex-start;gap:12px;min-width:0}
+.pl-b,.pl-t{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:break-word}
+.pl-b{flex:1;min-width:0;font-size:14px;line-height:20px}
+/* Its kind (Table, Group, App…), or a choice value's column: a small grey tag, on one line (a long column name ends
+   with … rather than squeezing the label; the row's tooltip has it in full). */
+.pl-k{flex:none;max-width:45%;margin-top:2px;padding:0 6px;border-radius:4px;background:var(--bg3);font-size:12px;line-height:16px;color:var(--fg3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pl-k:empty{display:none}
+.pl-t{font-size:13px;line-height:18px;color:var(--fg2)}
+/* A state is said by a dot before the line, in the colour of the page's marks, and plain text: amber not translated,
+   green changed, red couldn't be published, grey read-only or built-in. */
+.pl-t.is-miss,.pl-t.is-chg,.pl-t.is-bad,.pl-t.is-ro,.pl-t.is-na{color:var(--fg3)}
+.pl-t.is-chg{color:var(--green)}
+.pl-t.is-bad{color:var(--red)}
+.pl-t.is-miss::before,.pl-t.is-chg::before,.pl-t.is-bad::before,.pl-t.is-ro::before,.pl-t.is-na::before{content:'';display:inline-block;width:8px;height:8px;margin-right:6px;border-radius:50%;background:var(--fg4);vertical-align:0}
+.pl-t.is-miss::before{background:#c48a00}
+.pl-t.is-chg::before{background:var(--green)}
+.pl-t.is-bad::before{background:var(--red)}
+.pl-t.is-ro::before,.pl-t.is-na::before{background:#a8a8a8}
+/* What isn't on screen right now: a band like a group's that opens and closes, its groups inside it. */
+.pl-hid{margin-top:12px}
+.pl-hid>summary{display:flex;align-items:center;gap:8px;min-height:40px;box-sizing:border-box;padding:8px 16px;background:var(--bg1);border-top:1px solid var(--s2);border-bottom:1px solid var(--s2);color:var(--fg1);font-size:14px;line-height:20px;font-weight:600;cursor:pointer;list-style:none}
+.pl-hid>summary::-webkit-details-marker{display:none}
+.pl-hid>summary:hover{background:var(--bg2)}
+.pl-hid>summary:focus-visible{outline:0;box-shadow:inset 0 0 0 2px #000;border-radius:4px}
+.pl-hid>summary svg{flex:none;transform:rotate(-90deg);transition:transform .1s;color:var(--fg3)}
+.pl-hid[open]>summary svg{transform:none}
+.pl-hs{flex:1;min-width:0}
+.pl-hid>summary .count{color:var(--fg2);background:var(--bg3)}
+.pl-hid .pl-gh{margin-top:0;border-top:0}
+.pl-more{margin:12px 16px}
+/* Changes staged on other pages, after the page's own labels (pagelist.ts AWAY), each page a sub-heading of the group:
+   its icon and name, a line between pages. */
+.pl-aw{margin-top:12px}
+.pl-aw:first-child{margin-top:0}
+.pl-aw>.pl-gh:first-child{margin-top:0}
+.pl-pg{display:flex;align-items:center;gap:6px;padding:12px 16px 4px;font-size:13px;line-height:18px;font-weight:600;color:var(--fg2)}
+.pl-pg svg{flex:none;color:var(--fg3)}
+.pl-pg span{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pl-r+.pl-pg{margin-top:4px;border-top:1px solid var(--s3)}
+.pgl .empty{padding:40px 24px}
+.pgl .sk{height:36px}
+@media (prefers-reduced-motion:reduce){.pgl{animation:none}.pl-hid>summary svg,.pl-gb svg{transition:none}}
+@media (forced-colors:active){.pl-t.is-miss::before,.pl-t.is-chg::before,.pl-t.is-bad::before,.pl-t.is-ro::before,.pl-t.is-na::before{forced-color-adjust:none;background:CanvasText}}

@@ -1,0 +1,121 @@
+/* Workbench: the Easy Translator style workbook (header, message bar, Setup or the workbook card with its
+   sheet tabs). The grid's own styles live in grid.css, the Setup screen's with scope.ts. Shared widgets
+   (.btn .input .sel .link .empty .sk .pop .menu .note .tag kbd) come from ui/styles.css.
+   State classes use an is- prefix (styles.css has bare global classes such as .msg .bar .sel). */
+.wb{flex:1;display:flex;flex-direction:column;min-height:0;min-width:0;background:var(--bg3);scrollbar-color:auto}
+
+/* Scrollbars always show, so the grid's bottom one is there without hovering (Edge's overlay scrollbars appear only
+   under the pointer; a styled one never overlays): a 12px bar on a light track, its 8px thumb a mid grey that is easy
+   to spot and grab, darker under the pointer. scrollbar-color is set back to auto above: a value inherited from the
+   page would make Edge ignore these. Firefox gets its own thin bar. */
+.wb ::-webkit-scrollbar{width:12px;height:12px;background:var(--bg3)}
+.wb ::-webkit-scrollbar-thumb{min-width:32px;min-height:32px;border:2px solid transparent;border-radius:6px;background:#a8a8a8 padding-box}
+.wb ::-webkit-scrollbar-thumb:hover,.wb ::-webkit-scrollbar-thumb:active{background-color:var(--fg3)}
+.wb ::-webkit-scrollbar-corner{background:var(--bg3)}
+@supports not selector(::-webkit-scrollbar){.wb{scrollbar-color:#a8a8a8 var(--bg3)}.wb *{scrollbar-width:thin}}
+@media (forced-colors:active){.wb ::-webkit-scrollbar,.wb ::-webkit-scrollbar-corner{forced-color-adjust:none;background:Canvas}.wb ::-webkit-scrollbar-thumb,.wb ::-webkit-scrollbar-thumb:hover{forced-color-adjust:none;background-color:CanvasText}}
+
+/* header: title, Extract translations, Excel, Save and Publish */
+.wb-head{flex:none;display:flex;align-items:center;gap:8px;min-height:52px;padding:0 16px;background:var(--bg1);border-bottom:1px solid var(--s2)}
+.wb-head h2{flex:1;min-width:0;margin:0;font-size:16px;line-height:22px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wb-hb svg{flex:none}
+
+/* body: message bar, then Setup or the workbook */
+.wb-main{flex:1;min-height:0;display:flex;flex-direction:column;gap:12px;padding:16px}
+.wb-msg{flex:none;display:flex;align-items:center;gap:12px;min-height:40px;padding:4px 8px 4px 12px;border:1px solid transparent;border-radius:6px;background:var(--brand-bg);color:var(--fg1);font-size:13px;line-height:18px}
+.wb-msg.is-ok{background:var(--green-bg);color:var(--green)}
+.wb-msg.is-err{border-color:var(--red-s);background:var(--red-bg);color:var(--red);font-weight:600}
+.wb-ml{flex:1;min-width:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.wb-mic{flex:none;display:inline-flex;color:var(--brand)}
+.wb-msg.is-ok .wb-mic{color:var(--green)}
+.wb-msg.is-err .wb-mic{color:var(--red)}
+.wb-mt{flex:0 1 auto;min-width:0;overflow-wrap:anywhere}
+.wb-ma{display:inline-flex;gap:12px;flex:none}
+.wb-ma .link{font-weight:600}
+.wb-tgl{flex:none}
+/* Setup's own root scrolls (setup.css) */
+.wb-setup{flex:1;min-height:0;min-width:0;display:flex;flex-direction:column}
+
+/* workbook card */
+.wb-book{flex:1;min-height:0;display:flex;flex-direction:column;border:1px solid var(--s2);border-radius:8px;background:var(--bg1);overflow:hidden}
+.wb-top{flex:none;display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:8px 12px;border-bottom:1px solid var(--s2)}
+.wb-q{flex:0 1 300px;min-width:160px}
+.wb-rows{flex:0 1 auto;min-width:0;max-width:260px}
+.wb-cnt,.wb-seli{font-size:12px;line-height:16px;color:var(--fg3);white-space:nowrap}
+.wb-cnt:empty,.wb-seli:empty{display:none}
+.wb-sp{flex:1}
+.wb-tb svg{flex:none}
+.wb-qm{font-weight:700}
+.wb-nav{display:inline-flex;align-items:center;gap:4px;flex:none}
+.wb-pc{gap:6px;font-weight:600}
+.wb-pc.is-has::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--green);flex:none}
+
+/* grid area and its empty states (the grid fills it, absolutely positioned or as a flex child) */
+.wb-grid{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}
+.wb-grid>*{flex:1;min-height:0}
+.wb-empty{position:absolute;inset:0;overflow:auto;background:var(--bg1);display:flex;flex-direction:column}
+.wb-empty>.empty{flex:1}
+
+/* sheet tabs at the bottom, like Excel (with many sheets in a narrow window, their scrollbar shows too) */
+.wb-tabs{flex:none;position:relative;display:flex;gap:2px;overflow-x:auto;padding:0 8px 4px;border-top:1px solid var(--s1);background:var(--bg2)}
+.wb-tab{flex:none;display:inline-flex;align-items:center;gap:6px;height:32px;margin-top:-1px;padding:0 12px;border:1px solid var(--s1);border-top:0;border-radius:0 0 6px 6px;background:var(--bg3);color:var(--fg2);font-size:13px;white-space:nowrap;cursor:pointer;transition:background .1s}
+.wb-tab:hover{background:var(--bg4);color:var(--fg1)}
+.wb-tab.is-on{background:var(--bg1);color:var(--fg1);font-weight:600;box-shadow:inset 0 -2px 0 var(--green)}
+.wb-tab.is-zero{color:var(--fg4)}
+.wb-tab.is-zero:not(.is-on){background:var(--bg2)}
+.wb-tab:focus-visible{outline:2px solid #000;outline-offset:-2px}
+.wb-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex:none}
+
+/* "?" popover: this sheet, colors, keys */
+.wb-pop{width:360px}
+.wb-help{padding:8px 0 12px;font-size:13px;line-height:18px;color:var(--fg2)}
+.wb-hs{margin:0;padding:4px 12px}
+.wb-hs b{color:var(--fg1)}
+.wb-ph{padding:8px 12px 4px;font-size:12px;line-height:16px;font-weight:600;color:var(--fg3)}
+.wb-lg{display:flex;flex-direction:column;gap:6px;padding:0 12px}
+.wb-lg>div{display:flex;align-items:flex-start;gap:8px}
+.wb-sw{flex:none;width:16px;height:16px;margin-top:1px;border-radius:3px;border:1px solid var(--s1);display:grid;place-items:center}
+/* the cells' looks (grid.css): a light tint with a 2px line on the left edge; ! for a problem, ? for a conflict */
+.wb-sw.c-chg{background:var(--green-bg);border-color:var(--s2);box-shadow:inset 2px 0 0 var(--green)}
+.wb-sw.c-ok{border:0;color:var(--green)}
+.wb-sw.c-bad{background:var(--red-bg);border-color:var(--s2);box-shadow:inset 2px 0 0 var(--red);color:var(--red);font-size:11px;font-weight:700;line-height:1}
+.wb-sw.c-cf{background:var(--amber-bg);border-color:var(--s2);box-shadow:inset 2px 0 0 #bc4b09;color:#bc4b09;font-size:11px;font-weight:700;line-height:1}
+.wb-sw.c-mi{color:#c48a00;font-weight:600;line-height:1}
+.wb-sw.c-ro{background:var(--bg3);border-color:var(--s2)}
+.wb-keys{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;padding:0 12px;font-size:12px;line-height:18px}
+.wb-keys>span:first-child,.wb-keys>span:nth-child(odd){white-space:nowrap}
+
+/* bulk tool and import dialogs (tools.ts, skipped rows) */
+.wb-tool p{margin:0}
+.wb-fld{display:inline-flex;align-items:center;gap:8px;align-self:flex-start;color:var(--fg2)}
+.wb-ti.bad{color:var(--red)}
+.wb-flags{display:flex;flex-wrap:wrap;gap:8px 20px}
+.wb-pl{border:1px solid var(--s2);border-radius:4px;max-height:260px;overflow:auto;font-size:13px;flex:none}
+.wb-pl>div{padding:6px 12px;border-bottom:1px solid var(--s3);overflow-wrap:anywhere}
+.wb-pl>div:last-child{border-bottom:0}
+.wb-pl small{display:block;font-size:12px;line-height:16px;color:var(--fg3)}
+.wb-pl>small{padding:6px 12px}
+.wb-pl del{color:var(--fg3)}
+.wb-pl ins{text-decoration:none;font-weight:600;color:var(--fg1)}
+.wb-pl ins.bad{color:var(--red)}
+.wb-more{font-size:12px;line-height:24px;color:var(--fg3)}
+
+/* narrow window (docked, small screens; the window panel is the query container): header buttons show
+   only their icons (the text stays for screen readers and in the tooltip), the top bar wraps with
+   "Filter rows" on its own line */
+@container (max-width:859px){
+.wb-head{padding:0 8px 0 12px;gap:4px}
+.wb-head .wb-hb{padding:0 8px}
+.wb-head .wb-bt,.wb-top .wb-tb .wb-bt{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.wb-main{padding:8px;gap:8px}
+.wb-msg{flex-wrap:wrap;padding:6px 8px}
+.wb-tgl{margin-left:auto}
+.wb-top{padding:8px}
+.wb-q{flex:1 0 100%;min-width:0}
+.wb-rows{flex:1 1 140px}
+}
+@container (max-width:479px){
+.wb-top .wb-sp{display:none}
+.wb-nav{margin-left:auto}
+}
+@media (prefers-reduced-motion:reduce){.wb-tab{transition:none}}

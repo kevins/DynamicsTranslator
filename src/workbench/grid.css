@@ -1,0 +1,97 @@
+/* Workbook grid (workbench/grid.ts), laid out like the Easy Translator sheets: 46px row numbers, key columns,
+   Type, one column per language; 52px rows with two lines of text. The cell states keep the old workbook's
+   meaning (green changed, red problem) in the app's colour tokens (ui/styles.css): a light tint with a 2px line on
+   the left edge, the text in its usual colour; a green check for saved and verified; Fluent's warning orange and a
+   "?" for conflicts, apart from the red "!" of a problem. Read-only and "Not loaded" cells are a neutral grey, and a
+   missing translation's dash has the page's missing colour (inspector/overlay.css). The grid fills its parent: a flex
+   item in a column, or a box with a set height. */
+.g{--g-rob:var(--bg3);--g-rot:var(--fg3);--g-mi:#c48a00;--g-cf:#bc4b09;position:relative;flex:1 1 0;height:100%;min-width:0;min-height:0;outline:0;font-size:13px;color:var(--fg1)}
+/* its scrollbars always show, styled with the rest of the Workbench's (workbench.css) */
+.g-s{position:absolute;inset:0;overflow:auto;overscroll-behavior:contain}
+
+/* header */
+.g-h{position:sticky;top:0;z-index:3;display:flex;height:36px;width:var(--tw);min-width:100%;background:var(--bg3);border-bottom:1px solid var(--s1)}
+.g-hc{flex:none;position:relative;display:flex;align-items:center;gap:6px;padding:0 8px;font-size:12px;font-weight:600;color:var(--fg1);background:var(--bg3);border-right:1px solid var(--s2);white-space:nowrap;overflow:hidden;cursor:default;user-select:none}
+.g-hn{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.g-hi{flex:none;font-weight:400;color:var(--fg3)}
+.g-rs{position:absolute;top:0;right:0;bottom:0;width:8px;cursor:col-resize;touch-action:none}
+.g-rs:hover,.g-rs.is-on{background:var(--brand-s)}
+
+/* rows */
+.g-b{position:relative;width:var(--tw);min-width:100%;user-select:none}
+.g-r{position:absolute;top:0;left:0;display:flex;height:52px;width:var(--tw);min-width:100%}
+.g-g,.g .is-st{position:sticky;z-index:1}
+.g .g-h .is-st{z-index:2}
+/* row number: lock when read-only, green line when edited, red when the row has a problem (the cells' look) */
+.g-g{left:0;width:46px;flex:none;display:flex;align-items:center;justify-content:center;gap:2px;font-size:12px;color:var(--fg3);background:var(--bg2);border:solid var(--s2);border-width:0 1px 1px 0;font-variant-numeric:tabular-nums;cursor:default}
+.g-h .g-g{z-index:4;background:var(--bg3);border-bottom:0;font-weight:600;color:var(--fg2)}
+.g-g svg{display:none;flex:none}
+.g-g.is-ro svg{display:block}
+.g-g.is-ed{box-shadow:inset 2px 0 0 var(--green)}
+.g-g.is-er{color:var(--red);font-weight:600;background:var(--red-bg);box-shadow:inset 2px 0 0 var(--red)}
+
+/* cells */
+.g-c{flex:none;position:relative;display:flex;align-items:center;height:52px;padding:7px 8px;line-height:18px;background:var(--bg1);border:solid var(--s2);border-width:0 1px 1px 0;overflow:hidden;cursor:cell}
+.g-v{min-width:0;max-width:100%;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;overflow-wrap:anywhere;white-space:normal}
+.g-k,.g-y{font-size:12px;color:var(--fg2)}
+.g-k .g-v,.g-y .g-v{display:block;white-space:nowrap;text-overflow:ellipsis}
+.g-m{font-family:var(--mono);font-size:11px;color:var(--fg3)}
+.g-c.is-st{box-shadow:1px 0 0 var(--s1)}
+/* the row under the pointer, so a long row is easy to follow (state colours keep their own background) */
+.g-r:hover>.g-c:not(.is-ed):not(.is-er):not(.is-cf):not(.is-ro):not(.is-sel){background-color:var(--bg2)}
+.g-r:hover>.g-g:not(.is-er){background:var(--bg4)}
+/* changed, not saved yet: a light green tint and a green line on the left edge */
+.g-c.is-ed{background-color:var(--green-bg);box-shadow:inset 2px 0 0 var(--green)}
+.g-c.is-sv{padding-right:26px}
+.g-c.is-sv::after{content:'';position:absolute;right:11px;top:calc(50% - 7px);width:5px;height:10px;border:solid var(--green);border-width:0 2px 2px 0;transform:rotate(45deg)}
+/* not saved (an error, a blank Dataverse refuses) in red, changed by someone else in orange, the same way */
+.g-c.is-er{background-color:var(--red-bg);box-shadow:inset 2px 0 0 var(--red)}
+.g-c.is-cf{background-color:var(--amber-bg);box-shadow:inset 2px 0 0 var(--g-cf);cursor:pointer}
+/* a mark besides the colour: ! for a problem, ? for a conflict (a choice to make) */
+.g-c.is-er,.g-c.is-cf{padding-right:28px}
+.g-c.is-er::after,.g-c.is-cf::after{content:'!';position:absolute;right:7px;top:calc(50% - 8px);width:16px;height:16px;border-radius:50%;font-size:11px;font-weight:700;line-height:16px;text-align:center;color:#fff;background:var(--red)}
+.g-c.is-cf::after{content:'?';background:var(--g-cf)}
+.g-c.is-ro{background-color:var(--g-rob);color:var(--g-rot);cursor:not-allowed}
+.g-c.is-mi .g-v:empty::before{content:'—';color:var(--g-mi);font-weight:600}
+.g-c.is-nl .g-v:empty::before{content:'Not loaded';font-style:italic;font-size:12px}
+/* emptied translations: removed on save (old text struck through), saved as their stand-in where Dataverse can't
+   remove them (the stand-in, muted), or refused (hint: no stand-in, or only spaces) */
+/* the old text and the stand-in are decoration only ("/ ''" keeps them out of what screen readers announce as the
+   value; the cell's title says what saving does); browsers without that syntax use the first declaration */
+.g-c.is-rm .g-v::before{content:attr(data-was);content:attr(data-was) / '';color:var(--fg4);text-decoration:line-through}
+.g-c.is-si .g-v::before{content:attr(data-to);content:attr(data-to) / '';color:var(--fg3);font-style:italic}
+/* a description saved empty on purpose (or to be): a quiet "(empty)", its users see none; the title says so */
+.g-c.is-em .g-v::before{content:attr(data-to);content:attr(data-to) / '';color:var(--fg3);font-style:italic}
+.g-c.is-nc .g-v::before{content:'Can’t be removed — type the text';font-style:italic;font-size:12px}
+.g-c.is-nc.is-sp .g-v::before{content:'Only spaces — type the text'}
+.g-c.is-sel{background-image:linear-gradient(rgba(15,108,189,.13),rgba(15,108,189,.13))}
+.g-c.is-act{outline:2px solid var(--brand);outline-offset:-2px}
+/* while the focus is elsewhere (the filter box, the pending-change navigator's buttons) the active cell keeps a ring in
+   Fluent's accessible neutral stroke, so a cell just revealed stays easy to find on any tint */
+.g:not(:focus-within) .g-c.is-act{outline-color:var(--fg3)}
+/* a revealed cell (pending-change navigator): selected, its outline the selection's 2px brand ring for a moment, fading
+   over a second into the selection's own (grey while the focus is elsewhere, e.g. on the navigator's buttons) */
+.g-c.is-fl{animation:g-fl 1s ease-out}
+@keyframes g-fl{0%,35%{outline:2px solid var(--brand);outline-offset:-2px}}
+
+/* cell editor */
+.g-ed{position:absolute;z-index:2;min-height:52px;max-height:240px;margin:0;padding:5px 6px;border:2px solid var(--brand);border-radius:2px;font:inherit;font-size:13px;line-height:18px;color:var(--fg1);background:var(--bg1);resize:none;outline:0;overflow:auto;box-shadow:var(--sh8);user-select:text}
+.g-ed.is-over,.g-ed.is-nc{border-color:var(--red)}
+/* the look its cell will have once the text is committed (grid.ts edLook): green while it differs, red where saving refuses it */
+.g-ed.is-ed{background:var(--green-bg)}
+.g-ed.is-nc{background:var(--red-bg)}
+
+/* conflict chooser (a popover in the app layer) */
+.g-cfp{padding:12px 14px;max-width:min(360px,calc(100% - 16px));font-size:13px;line-height:18px}
+.g-cf-t{display:flex;align-items:center;gap:6px;margin:0 0 8px;font-weight:600}
+.g-cf-t svg{flex:none;color:#bc4b09}
+.g-cf dl{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 10px;margin:0 0 10px}
+.g-cf dt{color:var(--fg3)}
+.g-cf dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap}
+.g-cf-n{margin:0 0 10px;font-size:12px;color:var(--fg3)}
+.g-cf-a{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
+
+/* the ring shows for the second without fading */
+@media (prefers-reduced-motion:reduce){.g-c.is-fl,.g:not(:focus-within) .g-c.is-fl{animation:none;outline:2px solid var(--brand);outline-offset:-2px}.g-cfp{animation:none}}
+/* High contrast drops tints and box shadows: the state lines become borders, in the system's colours */
+@media (forced-colors:active){.g-c.is-ed,.g-c.is-er,.g-c.is-cf,.g-g.is-ed,.g-g.is-er{border-left:3px solid}}
