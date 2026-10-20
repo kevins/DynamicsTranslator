@@ -1,0 +1,43 @@
+# Only the files listed below are published. Everything else in this folder (dependencies, local test runs, working
+# documents, local settings) stays on this computer: a new file is ignored until it is listed here.
+/*
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/CHANGELOG.md
+!/SECURITY.md
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/src/
+!/tools/
+!/docs/
+
+# The release builds only: never the development and live-test files that tools/dev/build-e2e.mjs writes into dist/.
+!/dist/
+/dist/*
+!/dist/translator.bookmarklet.txt
+!/dist/translator.min.js
+!/dist/translator.debug.js
+
+# Inside docs: the guides, the design notes, the findings log and their pictures.
+/docs/*
+!/docs/developer-guide.md
+!/docs/ARCHITECTURE.md
+!/docs/LIVE-FINDINGS.md
+!/docs/*.docx
+!/docs/images/
+!/docs/gallery/
+
+# A safety net inside the published folders.
+node_modules/
+.env*
+*.log
+*.local*
+.DS_Store
+Thumbs.db
+.vscode/
+.vs/
+# Lock files that Microsoft Office creates while a document is open
+~$*

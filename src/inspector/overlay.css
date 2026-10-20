@@ -1,0 +1,42 @@
+:host{all:initial}
+[hidden]{display:none!important}
+.W{position:fixed;inset:0;overflow:hidden;pointer-events:none}
+.L{position:absolute;inset:0}
+/* One label: --c = state colour (hover border, badge), --f = fill, --b / --s = border colour / style, --r = flash ring. */
+.g{display:contents;--c:#0f6cbd;--f:rgba(15,108,189,.1);--b:rgba(15,108,189,.55);--s:dashed;--r:rgba(15,108,189,.3)}
+.g.is-missing{--c:#c48a00;--f:rgba(255,185,0,.22);--b:#c48a00;--r:rgba(196,138,0,.3)}
+/* Changed, not published yet: green like the workbook's changed cells, solid and a little thicker, so it stands out from
+   the blue of translated labels at a glance. */
+.g.is-edited{--c:#107c10;--f:rgba(34,197,94,.28);--b:#107c10;--s:solid;--r:rgba(16,124,16,.3)}
+/* Couldn't be published: red and double (its border and an outline, below), so it never differs from a green edited mark
+   by hue alone. */
+.g.is-error{--c:#c4314b;--f:rgba(196,49,75,.14);--b:#c4314b;--s:solid;--r:rgba(196,49,75,.3)}
+/* Text that can't be translated here, Microsoft's built-in text or a read-only label: grey and dotted, no pencil
+   (nothing to edit; the popup says why). */
+.g.is-builtin,.g.is-ro{--c:#616161;--f:rgba(97,97,97,.08);--b:#8a8a8a;--s:dotted;--r:rgba(97,97,97,.25)}
+.is-builtin .pn,.is-ro .pn{display:none}
+/* A mark hugs one line of the label's text. The faint white ring keeps it visible on the dark header. */
+.g>i{position:absolute;left:0;top:0;box-sizing:border-box;border:1px var(--s) var(--b);border-radius:4px;background:var(--f);box-shadow:0 0 0 1px rgba(255,255,255,.45);pointer-events:none}
+/* The second line of edited and failed marks is an outline, drawn outside the mark: a wider border would cross the text,
+   as a mark is padded only 1px above and below it (overlay.ts PAD_Y). The white ring moves out past the edited line. */
+.g.is-edited>i{outline:1px solid var(--b);box-shadow:0 0 0 2px rgba(255,255,255,.45)}
+.g.is-error>i{outline:1px solid var(--b);outline-offset:1px}
+/* Flash, hover and open popup: the same 2px ring in every state (as specific as the rules above, and after them). */
+.g.is-fl>i{border:2px solid var(--c);outline:0;box-shadow:0 0 0 3px var(--r);animation:dxt-fl .25s ease-out}
+.g.is-hv>i,.g.is-act>i{border:2px solid var(--c);outline:0}
+/* Found from "All labels on this page": the mark pulses three times so the eye finds it. */
+.g.is-pl>i{border:2px solid var(--c);outline:0;animation:dxt-pl .6s ease-out 3}
+.pn{position:absolute;left:0;top:0;z-index:1;box-sizing:border-box;border-radius:50%;background:var(--c) center/10px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M12.5 4.5l3 3L7 16H4v-3l8.5-8.5Z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/></svg>");box-shadow:0 0 0 1px #fff,0 1px 3px rgba(0,0,0,.3);pointer-events:none}
+/* "1 choice changed" after a form field (pill.ts): the edited mark's green, red when one failed to publish; its count
+   alone (.is-n) where the text doesn't fit. It takes no events, like the marks: the page under it keeps its hover and
+   the wheel, and the overlay finds the pointer on it by position (overlay.ts pillHit), so it shows its own tooltip. */
+.pill{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 6px;border-radius:8px;background:#107c10;color:#fff;font:600 11px/16px "Segoe UI","Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;white-space:nowrap;text-align:center;box-shadow:0 0 0 1px rgba(255,255,255,.7),0 1px 2px rgba(0,0,0,.2);user-select:none}
+.pill.is-n{padding:0}
+.pill.is-error{background:#c4314b}
+.ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px "Segoe UI","Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px rgba(0,0,0,.25)}
+.is-alt .L{opacity:.25}
+.is-alt .pn,.is-alt .pill,.is-alt .ptip{display:none}
+@keyframes dxt-fl{from{box-shadow:0 0 0 10px transparent}}
+@keyframes dxt-pl{from{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}
+@media (prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}
+@media (forced-colors:active){.g>i,.pn{forced-color-adjust:none}.g>i{background:none;box-shadow:none;border-color:Highlight}.g.is-edited>i{outline-color:Highlight;box-shadow:none}.is-missing>i,.g.is-error>i{border-color:LinkText;outline-color:LinkText}.g.is-fl>i,.g.is-hv>i,.g.is-act>i,.g.is-pl>i{border-color:Highlight;box-shadow:none}.g.is-pl>i{animation:none}.pn{background-color:Highlight;box-shadow:none}.pill{forced-color-adjust:none;background:Highlight;color:HighlightText;box-shadow:none}.pill.is-error{background:LinkText;color:Canvas}.ptip{forced-color-adjust:none;background:Canvas;color:CanvasText;border:1px solid CanvasText;box-shadow:none}}
