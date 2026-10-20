@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><title>Translator dev bridge</title>
+<!--
+  Dev only, served by tools/serve.mjs (tools/dev/build-e2e.mjs copies it to dist/bridge.html). Loads builds of this
+  folder into window.name ("dxt-dev:" + their code), then opens the Dynamics page to run them on:
+    http://127.0.0.1:8765/bridge.html?f=translator.debug.js,e2e-page.js&back=<a page of your Dynamics environment>
+  `f`: file names of this folder only (letters, digits, . _ -, ending in .js). `back`: an https page of a Dynamics
+  environment (*.dynamics.com); there is no default, and nothing else is ever opened.
+-->
+<p id="s">Loading build…</p>
+<script>
+(async () => {
+  const s = document.getElementById('s');
+  const p = new URLSearchParams(location.search);
+  const files = (p.get('f') || 'translator.debug.js').split(',');
+  if (!files.every((f) => /^[\w.-]+\.js$/.test(f) && !f.startsWith('.'))) return void (s.textContent = 'Error: f names files of this folder only, e.g. f=translator.debug.js,e2e-page.js');
+  let back = null;
+  try {
+    back = new URL(p.get('back') || '');
+  } catch {}
+  if (!back || back.protocol !== 'https:' || !/\.dynamics\.com$/i.test(back.hostname))
+    return void (s.textContent = 'Error: add &back=<the Dynamics page to open>, an https://<org>.crm.dynamics.com/… address.');
+  try {
+    let code = '';
+    for (const f of files) {
+      const r = await fetch(f + '?' + Date.now(), { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${f}: HTTP ${r.status}`);
+      code += (await r.text()) + '\n;\n';
+    }
+    window.name = 'dxt-dev:' + code;
+    s.textContent = 'Loaded ' + code.length + ' chars; returning…';
+    location.href = back.href;
+  } catch (e) {
+    s.textContent = 'Error: ' + e.message;
+  }
+})();
+</script>

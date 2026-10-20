@@ -1,0 +1,24 @@
+{
+  "name": "dynamics-translator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Edge bookmarklet that translates Dynamics 365 / Dataverse model-driven apps where you see them: every label on the page, plus a spreadsheet workbench with Excel and CSV",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kevins/DynamicsTranslator.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "tsc --noEmit -p .",
+    "test": "node tools/test.mjs"
+  },
+  "devDependencies": {
+    "@gfx/zopfli": "^1.0.15",
+    "@xmldom/xmldom": "^0.9.12",
+    "esbuild": "^0.25.12",
+    "terser": "^5.51.2",
+    "typescript": "5.6"
+  }
+}

@@ -1,0 +1,7 @@
+# Text files keep LF line endings in the repository; the built links and the minified code are one long line each.
+* text=auto eol=lf
+*.png binary
+*.gif binary
+*.jpg binary
+*.mp4 binary
+*.docx binary

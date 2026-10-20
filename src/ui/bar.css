@@ -1,0 +1,66 @@
+/* The translation-mode bar (ui/bar.ts): a slim floating Fluent toolbar. Positions are set by bar.ts (left/top/width
+   in px); the bar is a size container, so its items collapse as it narrows. State: data-tone / data-drag
+   attributes, aria-disabled on the primary button, and the is-pulse class. */
+.tbx{position:absolute;inset:0;z-index:11;pointer-events:none}
+.tbx[data-drag],.tbx[data-drag] .tb-grip{cursor:grabbing}
+.tbx[data-drag] .tb{user-select:none}
+
+.tb{position:absolute;left:0;top:0;width:min(1040px,calc(100% - 32px));display:flex;align-items:center;gap:2px;height:48px;padding:0 6px 0 9px;overflow:hidden;background:var(--bg1);border:1px solid var(--s2);border-radius:8px;box-shadow:var(--sh8);pointer-events:auto;white-space:nowrap;container:tb/inline-size;animation:rise .18s var(--ease)}
+.tb .btn{height:32px;padding:0 8px;gap:6px;font-weight:400}
+.tb .btn.icon{width:32px;padding:0}
+.tb .tb-pub{padding:0 12px;margin:0 6px;font-weight:600}
+/* No changes yet: looks disabled, still answers ("Nothing to publish yet"). */
+.tb .tb-pub[aria-disabled=true],.tb .tb-pub[aria-disabled=true]:hover,.tb .tb-pub[aria-disabled=true]:active{background:#f0f0f0;color:#bdbdbd;cursor:default}
+.tb-ps{display:none}
+.tb-grip{cursor:grab;touch-action:none;margin-right:6px}
+.tb-title{font-weight:600;padding-right:6px;flex:none}
+.tb-lang{display:inline-flex;align-items:center;gap:4px;flex:none;padding:0 8px;font-weight:600;color:var(--fg1)}
+.tb .btn.tb-lang{font-weight:600;color:var(--fg1);gap:4px}
+.tb-lang svg{color:var(--fg3);flex:none}
+.tb-ls{display:none}
+.tb-div{width:1px;height:24px;margin:0 6px;background:var(--s2);flex:none}
+
+/* status: one of loading (spinner), a load problem (+ Try again), the number of changes (a link), the hint */
+.tb-stw{flex:1 1 auto;min-width:0;display:flex;align-items:center;gap:10px;padding:0 6px 0 2px;overflow:hidden}
+.tb-st{display:flex;align-items:center;gap:6px;min-width:0;color:var(--fg2)}
+.tb-ic{display:grid;place-items:center;flex:none;color:var(--brand)}
+.tb-ic:empty{display:none}
+.tb-ic .spin{width:14px;height:14px}
+.tb-tx{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tb-sa{display:flex;align-items:center;flex:none}
+.tb-sa:empty{display:none}
+.tb-sa .link{font-weight:600}
+.tb .tb-cnt{font-weight:600;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.tb-stw[data-tone=error] .tb-ic,.tb-stw[data-tone=error] .tb-tx{color:var(--red)}
+/* The hint is the first-run tip: muted, up to two lines. */
+.tb-stw[data-tone=""] .tb-tx{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;white-space:normal;font-size:12px;line-height:16px;color:var(--fg3)}
+
+/* narrower bars: the title goes, languages show codes, button labels collapse to icons (still read by screen
+   readers), then "Review and publish" becomes "Publish" */
+@container tb (max-width:939px){
+  .tb-title{display:none}
+  .tb-ln{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .tb-ls{display:inline}
+}
+@container tb (max-width:799px){
+  .tb .tb-c1{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+}
+@container tb (max-width:639px){
+  .tb-pl{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .tb-ps{display:inline}
+  .tb .tb-pub{margin:0 2px}
+  .tb-div{margin:0 2px}
+}
+@container tb (max-width:479px){
+  .tb-div,span.tb-lang{display:none}
+  .tb-grip{margin-right:2px}
+}
+
+/* bookmark clicked again while the bar is open */
+@keyframes tbPulse{0%{box-shadow:0 0 0 0 rgba(15,108,189,.55),var(--sh8)}100%{box-shadow:0 0 0 12px rgba(15,108,189,0),var(--sh8)}}
+.tb.is-pulse{animation:tbPulse .65s ease-out 2}
+
+@media (prefers-reduced-motion:reduce){
+  .tb{animation:none}
+  .tb.is-pulse{animation:none;box-shadow:0 0 0 2px var(--brand),var(--sh8)}
+}
