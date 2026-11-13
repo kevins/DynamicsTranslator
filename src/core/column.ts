@@ -1,6 +1,7 @@
 // The column a form cell shows. Pure, on the slot alone, so the save rules of core (model.ts standIn: an emptied
 // field label Dataverse can't remove is written as its column's name) use it without importing the inspector;
-// inspector/column.ts re-exports it for the page's and the editor card's code.
+// inspector/column.ts re-exports it for the page's and the editor card's code. The form writer uses it too: it posts a
+// column's cell without labels where a save changes none (providers/formxml.ts sparseCell).
 
 import type { Slot } from './model';
 
@@ -9,7 +10,7 @@ import type { Slot } from './model';
  * `header_` / `footer_` + those). A quick view control is bound to its lookup column too (datafieldname =
  * the lookup) under a name of its own: it shows a quick view form, not that column's label or tooltip.
  */
-function columnCell(r: any): boolean {
+export function columnCell(r: any): boolean {
   const df = String(r.datafield || '').toLowerCase();
   const id = String(r.controlId || '')
     .toLowerCase()

@@ -4,7 +4,7 @@ import { isLogicalName } from '../core/http';
 import type { Kind, Slot } from '../core/model';
 import { appSitemapId, loadSitemap, loadSitemapsScope, sitemapWriter } from './sitemap';
 import { bpfWriter, loadBpfLabels, loadBpfScope, loadBpfStored } from './bpf';
-import { formXmlWriter, loadFormXml, loadFormsScope } from './formxml';
+import { carryOwnLabels, formXmlWriter, knownOwnLabels, loadFormXml, loadFormsScope, loadOwnLabels, pageOwnLabels } from './formxml';
 import { listTables, loadMetadataScope, loadTables, metadataWriters, solutionTables } from './metadata';
 import { findCommands, getForm, listSolutions, loadRecords, loadRecordsScope, recordsWriter, viewQuery } from './records';
 import { loadRibbonLabels, loadRibbonScope, ribbonControls, ribbonWriter } from './ribbon';
@@ -40,6 +40,10 @@ export const providers: ProvidersApi = {
   loadRecords,
   findCommands,
   loadFormXml,
+  pageOwnLabels,
+  knownOwnLabels,
+  loadOwnLabels,
+  carryOwnLabels,
   getForm,
   viewQuery,
   appSitemapId,

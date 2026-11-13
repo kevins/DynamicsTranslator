@@ -290,6 +290,7 @@ export function register(t: Kit): void {
       const store = new Store();
       const providers = {
         loadFormXml: async () => (calls.push('form'), read),
+        pageOwnLabels: async () => [],
         loadRecords: async () => [],
         loadTables: async (_c: unknown, ts: string[], kinds: Set<string>) => {
           calls.push(`tables ${ts.join()} ${[...kinds].join()}`);

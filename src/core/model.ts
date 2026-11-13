@@ -77,6 +77,12 @@ export interface Change {
    * not whatever a reload brought since. The writers compare it with a fresh read and report a conflict when they differ.
    */
   before: string;
+  /**
+   * Another text the server may hold that is no conflict either: the column's name this same run gives a form label that
+   * showed it (core/saver.ts run, LIVE-FINDINGS 103), or the text a save replaced, which a read of its column may still
+   * show when Publish again writes that save's text again (providers/metadata.ts againAttribute, 118).
+   */
+  alsoBefore?: string;
   /** Value to write. */
   after: string;
   /**
@@ -84,7 +90,7 @@ export interface Change {
    * its checks and the writers): where that text comes from, and the blank text the staged edit held (`typed`), so the
    * store drops that edit once the stand-in is saved.
    */
-  standIn?: { from: StandInFrom; typed: string };
+  standIn?: { from: StandInFrom; typed: string; follow?: true };
   /**
    * An Undo that puts back no translation at all (the publish added this one where there was none: its journal item has
    * `before` '' without `empty`, core/saver.ts undoChange). Emptied where it would be saved empty (savesEmpty), it gets
@@ -189,17 +195,50 @@ export const slotKey = (kind: Kind, id: string, prop: Prop): string => `${kind}|
 /**
  * Why a label of a component that comes from a managed solution is read-only, whatever its managed properties allow:
  * any change to it here would be an unmanaged customization layered on top of the solution's component, which this
- * tool never makes: such texts are translated in the environment where the solution is developed. Every loader, writer,
- * the saver and the store give these same words.
+ * tool makes only where this session allows changes to managed labels (Ctx.managedEdits): such texts are translated in
+ * the environment where the solution is developed. Every loader, writer, the saver and the store give these same words.
  */
 export const MANAGED = 'From a managed solution: a translation here would add an unmanaged layer on top of it. Translate it where its solution is developed.';
 
 /**
+ * Said under a label from a managed solution that this session may change (Ctx.managedEdits): what saving it does.
+ */
+export const MANAGED_OPEN = 'From a managed solution: a change here adds an unmanaged layer on top of it, which stays until removed in Power Apps.';
+
+/**
+ * Why a classic command bar label from a managed solution stays read-only while this session allows changes to managed
+ * labels (Ctx.managedEdits): the setting doesn't open those (providers/ribbon.ts), and says so instead of MANAGED.
+ */
+export const MANAGED_RIBBON = "From a managed solution: Allow changes to managed labels doesn't cover the classic command bar. Translate it where its solution is developed.";
+
+/**
  * Whether a slot's component comes from a managed solution: `ref.managed`, which every loader sets from the component's
  * own ismanaged / IsManaged (a form's or dashboard's for its tabs, sections, cells and navigation items, a sitemap's
- * for its items, a process's for its stages and steps). Such a label is never staged, saved or undone.
+ * for its items, a process's for its stages and steps). Such a label is never staged, saved or undone, unless this
+ * session allows changes to managed labels and its loader said it may be (managedSlot, managedReadOnly).
  */
 export const isManaged = (s: Slot): boolean => s.ref?.managed === true;
+
+/**
+ * A label of a managed solution's component as its loader gives it: read-only by `held` (MANAGED, or what locks it for
+ * good anyway) unless this session allows changes to managed labels (`allow`, Ctx.managedEdits), then by `lock`, the
+ * reason it would have as an unmanaged one ('' where its managed properties allow customizing it). Both go on its ref, so
+ * the store can switch between them when the setting changes (Store.setManagedEdits). Classic command labels give
+ * MANAGED_RIBBON as `lock`: read-only whatever the setting, with the reason that says so while it is on.
+ */
+export function managedSlot(s: Slot, allow: boolean | undefined, lock: string, held: string = MANAGED): Slot {
+  return { ...s, readOnly: allow ? lock : held, ref: { ...s.ref, lock, held } };
+}
+
+/**
+ * Why a label from a managed solution is read-only now ('' = it can be changed), as managedSlot() set it up: `ref.lock`
+ * while this session allows changes to managed labels (`allow`), else `ref.held`; MANAGED for one its loader didn't set up.
+ */
+export const managedReadOnly = (s: Slot, allow: boolean | undefined): string =>
+  allow && typeof s.ref?.lock === 'string' ? s.ref.lock : typeof s.ref?.held === 'string' ? s.ref.held : MANAGED;
+
+/** A label from a managed solution that stays read-only now (managedReadOnly): never staged, saved, published or undone. */
+export const managedHeld = (s: Slot, allow: boolean | undefined): boolean => isManaged(s) && !!managedReadOnly(s, allow);
 
 /**
  * Whether a non-base translation can be removed (saving '' or only whitespace removes it, so users of that
@@ -347,6 +386,12 @@ export interface StandIn {
   unloaded?: true;
   /** It is the text it replaces already (only spaces count as no text): writing it changes nothing. */
   same?: true;
+  /**
+   * The label's cell is left with no label of its own in any language (freesAll): written on a new label key with no
+   * label at all (LIVE-FINDINGS 105), so that it follows its column in each, as a field just added to the form does;
+   * `text` is the column's name it shows then. Never `same`: the text may read the same, but the label then follows.
+   */
+  follow?: true;
 }
 
 /** Only spaces count as no text, as the writers compare texts. */
@@ -370,6 +415,12 @@ const bare = (t: string): string => (t.trim() ? t : '');
  * preview, the Publish and Undo dialogs and the Workbench all use this one rule.
  */
 export function standIn(s: Slot, l: Lcid, base: Lcid, before: string, after: string, text: TextOf, untranslated?: boolean): StandIn | undefined {
+  // The cell's last label of its own emptied, the base language's too: it follows its column in every language after.
+  if (!after.trim() && before !== '' && freesAll(s, l, text)) {
+    const t = filledIn(s, l, base, text);
+    if (t === undefined) return { text: '', from: 'column', why: "its column's names aren't loaded", unloaded: true };
+    return { text: t, from: text(columnKey(s), l)?.trim() ? 'column' : 'columnBase', follow: true };
+  }
   if (l === base || after.trim() || (before === '' && !untranslated) || canClear(s, l) || savesEmpty(s, l, base, untranslated)) return undefined;
   const got = (x: StandIn): StandIn => (bare(x.text) === bare(before) ? { ...x, same: true } : x);
   const k = columnKey(s);
@@ -385,11 +436,64 @@ export function standIn(s: Slot, l: Lcid, base: Lcid, before: string, after: str
   return b.trim() ? got({ text: b, from: 'base' }) : { text: '', from: 'base', why: `its ${lcidName(base)} text is empty` };
 }
 
-/** The column's DisplayName slot whose name a form or dashboard cell's label stands in for (standIn); '' for any other label. */
-const columnKey = (s: Slot): string => {
+/**
+ * Whether emptying a main form's field label in `l` leaves its cell with no label of its own in any language, so that it
+ * can follow its column in each, as a field just added to the form does, which form designer saves keep (LIVE-FINDINGS
+ * 105, 109): a column's cell of a main form (`ref.sparse`) read in every language, each other language of which is
+ * emptied too, or follows its column as GetClientMetadata tells (`ref.own` false there) and is left as loaded. Not where
+ * one of them isn't known: a label of its own there would be lost. `text` reads the texts as the save leaves them.
+ */
+export const freesAll = (s: Slot, l: Lcid, text: TextOf): boolean => {
+  if (s.kind !== 'field' || !s.ref?.sparse || s.ref.partial || s.readOnly || !columnKey(s) || !(l in s.labels)) return false;
+  return Object.keys(s.labels).every((k) => {
+    const x = Number(k);
+    const t = text(s.key, x);
+    if (t === undefined) return false;
+    if (!t.trim()) return true;
+    return x !== l && s.ref.own?.[x] === false && t === s.labels[x];
+  });
+};
+
+/**
+ * The column's DisplayName slot whose name a form or dashboard cell's label stands in for (standIn), and a read fills in
+ * where the label has no text of its own (filledIn); '' for any other label.
+ */
+export const columnKey = (s: Slot): string => {
   const c = (s.kind === 'field' || s.kind === 'dfield') && s.prop === 'Label' ? columnOf(s) : null;
   return c ? `attribute|${c.entity}.${c.attr}|DisplayName` : '';
 };
+
+/**
+ * What a form field label shows in `l` with no text of its own there: its column's name, else its base-language name
+ * (LIVE-FINDINGS 42, 103); undefined while those aren't loaded, or for any other label.
+ */
+export const filledIn = (s: Slot, l: Lcid, base: Lcid, text: TextOf): string | undefined => {
+  const k = columnKey(s);
+  const own = k ? text(k, l) : undefined;
+  const b = k ? text(k, base) : undefined;
+  return own === undefined || b === undefined ? undefined : own.trim() ? own : b;
+};
+
+/**
+ * Whether a main form field label's text in `l` as loaded (`loaded`) is the one a read fills in there (filledIn,
+ * LIVE-FINDINGS 103): a label of the form's own worded so, or none at all, which only GetClientMetadata tells apart
+ * (follows). False on a read-only label, and while the column's names aren't loaded. `text` reads the server's texts.
+ */
+export const fillsIn = (s: Slot, l: Lcid, base: Lcid, loaded: string, text: TextOf): boolean => !s.readOnly && loaded === filledIn(s, l, base, text);
+
+/**
+ * Whether a main form's field label follows its column in `l`: GetClientMetadata, read in `l`, lists no label of the
+ * cell's own there (`ref.own`, providers/formxml.ts; LIVE-FINDINGS 114), and its text there as loaded (`loaded`) is the
+ * one a read fills in (fillsIn). That answer is the published form's: a text of the form's own that isn't published yet
+ * differs from what a read fills in. False where it isn't known (not read, or that read failed), and on a read-only
+ * label: such a label shows as before. The popup and the editor card show a label that follows empty, while nothing is
+ * typed in it, with what shows in its place as the placeholder; emptying it again changes nothing (nothing is staged, so
+ * its column's name is never written there as its stand-in). With `user`, the user's language, a language not known yet
+ * takes the user's answer, as most fields follow their column in every language or in none: shown that way until its
+ * own answer comes, and an input emptied there stages by it too (ui/editor.ts typedText), as it shows.
+ */
+export const follows = (s: Slot, l: Lcid, base: Lcid, loaded: string, text: TextOf, user?: Lcid): boolean =>
+  (s.ref?.own?.[l] ?? (user === undefined ? undefined : s.ref?.own?.[user])) === false && fillsIn(s, l, base, loaded, text);
 
 /**
  * The texts a stand-in (`from`) is made of, as `key`/`lcid`: the label's own base-language text, or its column's name
@@ -402,6 +506,17 @@ export function standInSources(s: Slot, l: Lcid, base: Lcid, from: StandInFrom):
   const k = columnKey(s);
   if (from === 'base' || !k) return [{ key: s.key, lcid: base }];
   return from === 'column' ? [{ key: k, lcid: l }] : [{ key: k, lcid: l }, { key: k, lcid: base }];
+}
+
+/**
+ * The names a column goes by in a run, per language of `langs`: each text of `texts` (the store's as loaded, the run's
+ * as it leaves them, a name read again since) that is not empty, and where one has none in a language, its
+ * base-language one: what a form read fills in there while that text is the column's (LIVE-FINDINGS 42, 103), so a run
+ * that gives a column its first French name goes by its English one in French too. `key`: the column's DisplayName slot.
+ */
+export function columnNames(key: string, langs: readonly Lcid[], base: Lcid, ...texts: TextOf[]): Record<number, string[]> {
+  const of = (l: Lcid) => [...new Set(texts.map((t) => t(key, l) || t(key, base) || ''))].filter((x) => x !== '');
+  return Object.fromEntries(langs.map((l) => [l, of(l)]));
 }
 
 /** A text a stand-in is made of (standInSources), as the start of a sentence: "Its English text", "Its column's French name". */
@@ -426,6 +541,36 @@ export const sourceUnsaved = (s: Slot, src: { key: string; lcid: Lcid }): string
 /** Why a stand-in wasn't written: a text it is made of couldn't be read again to check it (core/saver.ts). */
 export const sourceUnread = (s: Slot, src: { key: string; lcid: Lcid }, why: string): string =>
   `${sourceName(s, src)} couldn't be read to check it before writing (${why.trim().replace(/[.!]+$/, '')}), so nothing was written. Try again.`;
+
+/**
+ * The check after a form write wrote back labels Dataverse dropped (providers/formxml.ts nothingElse), a notice of the
+ * save: "Dataverse dropped 1 label of the form “Information” that this save did not change. It was written back; check
+ * the form." `form`: the form's name. `raced`: the write that put them back can't rule out having replaced a save someone
+ * else made at the same moment (providers/repair.ts settle), a warning of the save: "…It was written back, but that may
+ * have replaced a save someone else made at the same moment; check the form." Neither asks for a Try again: that writes
+ * only the save's own changes, and the Publish dialog shows none once they are all saved.
+ */
+export const droppedBack = (form: string, n: number, raced = false): string =>
+  `Dataverse dropped ${n} label${n === 1 ? '' : 's'} of the form “${form}” that this save did not change. ${n === 1 ? 'It was' : 'They were'} written back${raced ? ', but that may have replaced a save someone else made at the same moment' : ''}; check the form.`;
+
+/**
+ * …and the ones it could not put back, a warning of the save with their texts (a language name and the text, three at
+ * most), so they can be typed again: "1 label of the form “Information” that this save did not change was changed on the
+ * server while it saved and could not be put back (English “Own name”): check the form."
+ */
+export const droppedLeft = (form: string, lost: ReadonlyArray<{ lang: string; text: string }>): string => {
+  const n = lost.length;
+  const some = lost.slice(0, 3).map((x) => `${x.lang} “${x.text}”`).join(', ');
+  return `${n} label${n === 1 ? '' : 's'} of the form “${form}” that this save did not change ${n === 1 ? 'was' : 'were'} changed on the server while it saved and could not be put back (${some}${n > 3 ? ` and ${n - 3} more` : ''}): check the form.`;
+};
+
+/**
+ * Why a write was not made: the read right before it still showed the component as it was before a save this page made
+ * of it, after every wait (LIVE-FINDINGS 66), and a write from that read would put back what that save changed (the
+ * metadata writers, providers/metadata.ts; the form writer, providers/formxml.ts). `what`: the component, as the end of
+ * "this …": "column", "form".
+ */
+export const behindText = (what: string): string => `Not saved: Dataverse doesn't show your last change to this ${what} yet, and saving now could undo it. Try again in a minute.`;
 
 /** Why a translation can't be removed, as the start of a sentence. */
 const unremovable = (s: Slot, l: Lcid): string => (stays(s, l) ? `Dynamics keeps a ${s.kind}'s translation` : "Dataverse can't remove a translation");

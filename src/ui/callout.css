@@ -32,6 +32,7 @@
 .co-empty{font-size:13px;line-height:18px;color:var(--fg3)}
 .co-ro{display:flex;align-items:flex-start;gap:4px;font-size:12px;line-height:16px;color:var(--fg3)}
 .co-ro svg{flex:none;margin-top:2px}
+.co-ro.is-warn{color:var(--amber)}
 
 /* one text: its heading, then one row per language (base first) */
 .co-blk{display:flex;flex-direction:column;gap:6px;min-width:0}

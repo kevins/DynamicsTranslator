@@ -1,9 +1,9 @@
 // Unit tests for the whole-document writers (providers/sitemap.ts, bpf.ts, formxml.ts) against someone else saving
 // the same document while a save runs, a write Dataverse turned away (throttled) and a write whose answer was lost.
 // The sitemap and process writers run on the real Http over a fake fetch (its retries are part of what is tested); the
-// form writer on a fake LangSession hold. register() is called by tools/dev/unit.ts.
+// form writer on the fake form of formlabels.ts. register() is called by tools/dev/unit.ts.
 import { readHistory } from '../../../src/core/history';
-import { DvError, Http, type BatchPart, type PartResult } from '../../../src/core/http';
+import { Http } from '../../../src/core/http';
 import { baseNameFirst, MANAGED, PublishSet, type Change, type ChangeResult, type Lcid, type Slot } from '../../../src/core/model';
 import { createSaver } from '../../../src/core/saver';
 import { Store } from '../../../src/core/store';
@@ -12,6 +12,7 @@ import { bpfWriter } from '../../../src/providers/bpf';
 import { formXmlWriter } from '../../../src/providers/formxml';
 import { sitemapWriter } from '../../../src/providers/sitemap';
 import { changeId, type SaveOptions } from '../../../src/providers/types';
+import { addTab, formFake, FORM } from './formlabels';
 import type { Kit } from './kit';
 import { fast } from './lang';
 
@@ -22,7 +23,6 @@ const API = `${ORIGIN}/api/data/v9.2/`;
 const SM = '0b6f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d';
 const WF = '9a6faaaa-0000-4000-8000-0000000000b1';
 const STAGE = '15322a8f-0000-4000-8000-000000000054';
-const FORM = '5e07410a-0000-4000-8000-000000000071';
 const LANGS = [
   { lcid: EN, name: 'English', isBase: true },
   { lcid: FR, name: 'French', isBase: false },
@@ -243,60 +243,24 @@ const stageSlot = (): Slot => ({
 // ---- the form (formxml.ts writes through a LangSession hold; this one never switches) ----
 
 const LABEL = (l: Lcid, t: string) => `<label description="${t}" languagecode="${l}" />`;
-const formXml = (extraTab = '') =>
+const formXml = () =>
   `<form><tabs><tab id="{a1}" name="general"><labels>${LABEL(EN, 'General')}</labels><columns><column width="100%"><sections><section id="{b1}" name="details"><labels>${LABEL(EN, 'Details')}</labels>` +
-  `<rows><row><cell id="{c1}"><labels>${LABEL(EN, 'Name')}${LABEL(FR, 'Nom')}</labels><control id="name" datafieldname="name" /></cell></row></rows></section></sections></column></columns></tab>${extraTab}</tabs></form>`;
+  `<rows><row><cell id="{c1}"><labels>${LABEL(EN, 'Name')}${LABEL(FR, 'Nom')}</labels><control id="name" datafieldname="name" /></cell></row></rows></section></sections></column></columns></tab></tabs></form>`;
 
 /**
- * A form on a fake Dataverse: a PATCH replaces the whole unpublished definition and moves its versionnumber on; If-Match
- * is compared with the published row (LIVE-FINDINGS 22), so a save of someone else's draft does not change it.
- * `between` runs once a batch that writes arrives, before any of its parts: someone else's save landing between the
- * writer's read and its write. `lose`: the next batches that write run, then their answer is lost (a network failure).
- * `patch`: the status every PATCH part is answered with: 0 runs it and answers nothing for it (a batch answer cut
- * short), 403 and 412 refuse it.
+ * The form on the fake Dataverse of formlabels.ts (formFake): a column cell's labels kept per label key, a read filling
+ * in the column's name where the key holds none (LIVE-FINDINGS 103, 104); If-Match compared with the published row
+ * (LIVE-FINDINGS 22), so a save of someone else's draft does not change it. `F.xml = …` is someone else's save of the
+ * whole form. `between` runs once a batch that writes arrives, before any of its parts: someone else's save landing
+ * between the writer's read and its write. `lose`: the next batches that write run, then their answer is lost (a network
+ * failure). `patch`: the status every PATCH part is answered with: 0 runs it and answers nothing for it (a batch answer
+ * cut short), 403 and 412 refuse it.
  */
 function formServer() {
-  const F = { xml: formXml(), v: 7, vpub: 7, etag: 'W/"100"', batches: [] as string[][], between: undefined as undefined | (() => void), lose: 0, patch: undefined as undefined | number };
-  const ok = (data: unknown = null, status = 200): PartResult => ({ ok: true, status, data, headers: {} });
-  const exec = (p: BatchPart): PartResult => {
-    if (p.method === 'GET' && p.url.startsWith(`systemforms(${FORM})/Microsoft.Dynamics.CRM.RetrieveUnpublished()`)) return ok({ formxml: F.xml, versionnumber: F.v });
-    if (p.method === 'GET' && p.url.startsWith(`systemforms(${FORM})?`)) return ok({ formid: FORM, versionnumber: F.vpub, '@odata.etag': F.etag });
-    if (p.method === 'PATCH' && p.url === `systemforms(${FORM})`) {
-      if (F.patch === 403) return { ok: false, status: 403, data: null, error: 'You do not have permission to do this.', headers: {} };
-      if (F.patch === 412 || p.headers?.['If-Match'] !== F.etag) return { ok: false, status: 412, data: null, error: 'The version of the existing record does not match.', headers: {} };
-      F.xml = (p.body as { formxml: string }).formxml;
-      F.v++;
-      if (F.patch === 0) return { ok: false, status: 0, data: null, error: 'Dataverse sent no answer for this part of the request.', headers: {} };
-      return ok(null, 204);
-    }
-    return { ok: false, status: 404, data: null, error: 'Resource not found for the segment.', headers: {} };
-  };
-  const h = {
-    async batch(_l: Lcid, parts: BatchPart[]) {
-      await new Promise((r) => setTimeout(r, 0));
-      F.batches.push(parts.map((p) => `${p.method} ${p.url.split('?')[0]}${p.url.includes('$select=versionnumber') ? ' (version)' : ''}`));
-      const writes = parts.some((p) => p.method === 'PATCH');
-      if (writes) {
-        const b = F.between;
-        F.between = undefined;
-        b?.();
-      }
-      const results = parts.map(exec);
-      if (writes && F.lose > 0) {
-        F.lose--;
-        throw new DvError('Could not reach Dataverse (network error).', 0, 'network');
-      }
-      return { inLang: true, results };
-    },
-    window: <T>(fn: () => Promise<T>) => fn(),
-  };
+  const { F, designerSave, lang, ctx } = formFake(formXml(), { cols: { name: { [EN]: 'Name', [FR]: 'Nom' }, emailaddress1: { [EN]: 'Email', [FR]: 'Courriel' } } });
   /** Another maker saves the form in the designer: a tab added (a whole definition PATCH, so a new version). */
-  const maker = () => {
-    F.xml = F.xml.replace('</tabs>', `<tab id="{a2}" name="theirs"><labels>${LABEL(EN, 'Theirs')}</labels></tab></tabs>`);
-    F.v++;
-  };
-  const lang = { hold: <T>(fn: (x: typeof h) => Promise<T>) => fn(h), run: <T>(_l: Lcid, fn: () => Promise<T>) => fn(), quiet: <T>(fn: () => Promise<T>) => fn(), restore: async () => {} };
-  return { F, maker, lang: lang as never, ctx: ctxOf(null) };
+  const maker = () => designerSave((d) => addTab(d, 'a2', 'theirs', 'Theirs'));
+  return { F, maker, lang, ctx };
 }
 
 const fieldSlot = (): Slot => ({
@@ -456,6 +420,18 @@ export function register(t: Kit): void {
       t.eq(outcomes(await sitemapWriter.save(ctx, [ch(areaSlot(), FR, 'Ventes', 'Ventes 2'), ch(areaSlot(), EN, 'Sales', 'Sales 2')], o2)), [['error', MANAGED], ['error', MANAGED]]);
       t.eq([f.W.writes.length, o2.publish.sitemaps.size, S.un], [0, 0, sitemapXml('Ventes')], 'no PATCH, nothing published, the sitemap as it was');
       t.ok(f.W.log.every((e) => e.startsWith('GET')), f.W.log.join(' | '));
+    });
+  });
+
+  t.test('doc writes: a sitemap from a managed solution where this session allows changes to managed labels (Ctx.managedEdits): written, as loaded and as read right before the write, and published', async () => {
+    const { S, f, ctx } = sitemapServer();
+    (ctx as { managedEdits?: boolean }).managedEdits = true;
+    S.managed = true;
+    await withWeb(f, async () => {
+      const loaded = { ...areaSlot(), ref: { ...areaSlot().ref, managed: true, lock: '', held: MANAGED } };
+      const o = opts();
+      t.eq(outcomes(await sitemapWriter.save(ctx, [ch(loaded, FR, 'Ventes', 'Ventes 2')], o)).map((x) => x[0]), ['saved']);
+      t.eq([f.W.writes.length > 0, o.publish.sitemaps.size], [true, 1], 'the PATCH sent, the sitemap published');
     });
   });
 

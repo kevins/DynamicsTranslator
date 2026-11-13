@@ -5,6 +5,7 @@
 import { DvError, Http, type BatchPart, type PartResult } from '../../../src/core/http';
 import { MANAGED, PublishSet, type Change, type ChangeResult, type Kind, type Lcid, type Slot } from '../../../src/core/model';
 import { loadRecords, loadRecordsScope, recordsWriter } from '../../../src/providers/records';
+import { loadRibbonLabels } from '../../../src/providers/ribbon';
 import type { Kit } from './kit';
 import { fast } from './lang';
 
@@ -429,5 +430,52 @@ export function register(t: Kit): void {
     ok(scoped.length > 0 && scoped.every((x) => x.ref.id === U && !x.readOnly), 'only ours without read-only labels');
     const all = await loadRecordsScope(ctx, { entities: ['account'], kinds, includeReadOnly: true }, lo());
     ok(all.some((x) => x.ref.id === M && x.readOnly === MANAGED), 'the managed ones, read-only, when asked for');
+  });
+
+  test("records where this session allows changes to managed labels (Ctx.managedEdits): a managed solution's record loads editable where it is customizable (an app has no such property), else read-only with that reason, both reasons kept; the Workbench brings the editable ones; its label is written without asking whether it is managed", async () => {
+    const lab = { Label: { LocalizedLabels: [{ Label: 'Name', LanguageCode: EN }, { Label: 'Nom', LanguageCode: FR }] } };
+    const M = 'aaaaaaaa-0000-4000-8000-00000000000a';
+    const N = 'cccccccc-0000-4000-8000-00000000000c';
+    const row = (id: string, customizable?: boolean) => ({ savedqueryid: id, appmoduleid: id, name: id === M ? 'Managed' : 'Fixed', ismanaged: true, ...(customizable === undefined ? {} : { iscustomizable: { Value: customizable } }), querytype: 0, returnedtypecode: 'account' });
+    const http = {
+      reads: { max: 4, run: () => Promise.reject(new Error('no $batch in unit tests')) },
+      fn: (name: string, p: { EntityMoniker: { '@odata.id': string }; AttributeName: string }) => `${name}(${p.EntityMoniker['@odata.id']},${p.AttributeName})`,
+      get: async (u: string) => (u.startsWith('RetrieveLocLabels(') ? lab : { value: [] }),
+      all: async (u: string) => (u.startsWith('appmodules') ? [row(M)] : [row(M, true), row(N, false)]),
+    };
+    const lo = () => ({ signal: new AbortController().signal, progress() {} });
+    const on = { http, base: EN, user: FR, langs: [], managedEdits: true } as never;
+    const views = await loadRecords(on, 'view', [M, N], lo());
+    const NOT = "This view is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.";
+    eq([...new Set(views.map((x) => `${x.ref.id === M ? 'customizable' : 'not'}: ${x.readOnly || 'editable'} ${x.ref.managed} ${x.ref.held === MANAGED}`))].sort(), ['customizable: editable true true', `not: ${NOT} true true`]);
+    const apps = await loadRecords(on, 'app', [M], lo());
+    ok(apps.length > 0 && apps.every((x) => !x.readOnly && x.ref.managed), 'an app: no customizable property, editable');
+    const off = await loadRecords({ http, base: EN, user: FR, langs: [] } as never, 'view', [M, N], lo());
+    ok(off.every((x) => x.readOnly === MANAGED), 'off: MANAGED, as before');
+    const scoped = await loadRecordsScope(on, { entities: ['account'], kinds: new Set<Kind>(['view']) }, lo());
+    eq([...new Set(scoped.map((x) => x.ref.id))], [M], 'the Workbench: the customizable one');
+    // At save: written, with no read of whether it is managed.
+    const { S, ctx } = server(START);
+    (ctx as { managedEdits?: boolean }).managedEdits = true;
+    S.managed = true;
+    const slot = { ...view(START), ref: { ...view(START).ref, managed: true, lock: '', held: MANAGED } };
+    const res = await save(ctx, slot, FR, 'Comptes actifs', 'Comptes ouverts');
+    eq([res.map((r) => r.outcome), S.managedReads, S.sent], [['saved'], 0, [[{ Label: 'Comptes ouverts', LanguageCode: FR }]]]);
+  });
+
+  test("records, classic command bar labels: the table name in their path is the user's language also when Dataverse answers in another one (a read that lands in a language switch window, whose UserLocalizedLabel follows it)", async () => {
+    const V = 'cccccccc-0000-4000-8000-00000000000c';
+    // Dataverse during a switch to French: UserLocalizedLabel is French, LocalizedLabels has every language.
+    const table = { LogicalName: 'account', DisplayName: { LocalizedLabels: [{ Label: 'Account', LanguageCode: EN }, { Label: 'Compte', LanguageCode: FR }], UserLocalizedLabel: { Label: 'Compte', LanguageCode: FR } } };
+    const diff = { diffid: 'd1', entity: 'account', ismanaged: false, difftype: 3, rdx: `<LocLabel Id="new.Button.Label"><Titles><Title languagecode="${EN}" description="Go"/></Titles></LocLabel>` };
+    const http = {
+      reads: { max: 4, run: () => Promise.reject(new Error('no $batch in unit tests')) },
+      fn: (name: string, p: { EntityMoniker: { '@odata.id': string }; AttributeName: string }) => `${name}(${p.EntityMoniker['@odata.id']},${p.AttributeName})`,
+      get: async (u: string) => (u.startsWith('RetrieveLocLabels(') ? { Label: { LocalizedLabels: [{ Label: 'Active accounts', LanguageCode: EN }] } } : u.startsWith('EntityDefinitions?') ? { value: [table] } : { value: [] }),
+      all: async (u: string) => (u.startsWith('EntityDefinitions?') ? [table] : u.startsWith('ribbondiffs') ? [diff] : [{ savedqueryid: V, name: 'Active accounts', ismanaged: false, querytype: 0, returnedtypecode: 'account' }]),
+    };
+    const ctx = { http, base: EN, user: EN, langs: [] } as never;
+    const lo = () => ({ signal: new AbortController().signal, progress() {} });
+    eq([(await loadRecords(ctx, 'view', [V], lo()))[0].path, (await loadRibbonLabels(ctx, ['account'], lo()))[0].path], [['Account'], ['Account', 'Command bar (classic)']]);
   });
 }

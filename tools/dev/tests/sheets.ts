@@ -7,6 +7,7 @@ import { Store } from '../../../src/core/store';
 import { loadMetadataScope, loadTables } from '../../../src/providers/metadata';
 import type { Scope } from '../../../src/providers/types';
 import type { AppApi } from '../../../src/ui/types';
+import { blockedWhy, clearing, textOf } from '../../../src/workbench/grid';
 import { createSetup, listKey, loadState, saveState, scopeOf, waitsForList } from '../../../src/workbench/scope';
 import { fold, inLabelMode, kindsOf, rowsLabel, rowsTest, searchText, SETUP_GROUPS, sheetOf, SHEETS, sortSlots, typeTip } from '../../../src/workbench/sheets';
 import type { SheetCtx, SheetDef, WbState } from '../../../src/workbench/types';
@@ -370,6 +371,9 @@ export function register(t: Kit): void {
     t.ok(!rowsTest('problems', store, base, target, langs)(field), 'saved as the French base text: no problem');
     store.set(field.key, 1036, ' ');
     t.ok(rowsTest('problems', store, base, target, langs)(field), 'blocked blank');
+    // The English cell itself, apart from its French one (a form cell's base-language label, blocked on its own): nothing
+    // stands in for it once the French base text is gone.
+    t.eq([clearing(store, field, target, base), blockedWhy(field, target, base, 'Name', '', textOf(store))], ['blocked', "Dataverse can't remove this translation, and its French text is empty: type the text instead."]);
     t.ok(!rowsTest('problems', store, base, target, langs)(done), 'no problem');
     // Read-only rows only show under All rows…
     for (const m of ['same', 'sameOrBlank', 'blank', 'pending', 'problems'] as const) t.ok(!rowsTest(m, store, base, target, langs)(ro), `read-only under ${m}`);

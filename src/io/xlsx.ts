@@ -5,7 +5,7 @@
 // #DIV/0!, …) is listed apart (Sheet.errors), so an import never takes its text for a translation; two rows or two cells
 // at one address are a damaged file, not a choice between them, and so is a cell whose address names another row.
 
-import { fromUtf8, openZip, utf8, zip, type ZipFile } from '../core/zip';
+import { openZip, utf8, zip, type ZipFile } from '../core/zip';
 
 export type Cell = string | number | null;
 export interface Sheet {
@@ -28,6 +28,17 @@ export interface XlsxOptions {
 const OX = 'http://schemas.openxmlformats.org/';
 const MAIN = OX + 'spreadsheetml/2006/main';
 const REL = OX + 'officeDocument/2006/relationships';
+/** The namespaces of a sheet's r:id: transitional, and strict. */
+const RELS = [REL, 'http://purl.oclc.org/ooxml/officeDocument/relationships'];
+/**
+ * The part a relationship's Type names (officeDocument, worksheet, …), by the whole Type: the format's, transitional or
+ * strict, or Excel's own for macro sheets. Another URI ending the same way names no part here; '' for it.
+ */
+const ROLES = new Map([
+  ...['officeDocument', 'sharedStrings', 'worksheet', 'chartsheet', 'dialogsheet'].flatMap((k) => RELS.map((ns): [string, string] => [`${ns}/${k}`, k])),
+  ...['xlMacrosheet', 'xlIntlMacrosheet'].map((k): [string, string] => [`http://schemas.microsoft.com/office/2006/relationships/${k}`, k]),
+]);
+const role = (type: string): string => ROLES.get(type) ?? '';
 const CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.';
 const DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 
@@ -121,24 +132,35 @@ export async function writeXlsx(sheets: Sheet[], o: XlsxOptions = {}): Promise<B
   return new Blob([bytes], { type: CT + 'sheet' });
 }
 
-// Namespace-agnostic lookups: strict OOXML and prefixed (x:row) documents use other names.
-const all = (n: Document | Element, tag: string): Element[] => Array.from(n.getElementsByTagNameNS('*', tag));
-function child(el: Element, tag: string): Element | null {
-  let c = el.firstElementChild;
-  while (c && c.localName !== tag) c = c.nextElementSibling;
-  return c;
+/** SpreadsheetML's namespaces: transitional, and strict (a prefixed document, x:row, uses one of them too). */
+const MAINS = [MAIN, 'http://purl.oclc.org/ooxml/spreadsheetml/main'];
+/** The namespace of relationship parts, strict files' too. */
+const PKG = [OX + 'package/2006/relationships'];
+const isEl = (el: Element | null | undefined, tag: string, ns = MAINS): el is Element => !!el && el.localName === tag && ns.includes(el.namespaceURI || '');
+/**
+ * The child elements of `el` that are `tag` of the format: what a part holds is read only where the format puts it
+ * (workbook/sheets/sheet, worksheet/sheetData/row/c, si/r/t), so another namespace's elements (an extension's, ones
+ * Excel ignores) are never a sheet, a cell or text.
+ */
+function kids(el: Element, tag: string, ns = MAINS): Element[] {
+  const out: Element[] = [];
+  for (let c = el.firstElementChild; c; c = c.nextElementSibling) if (isEl(c, tag, ns)) out.push(c);
+  return out;
 }
-// Text of a string item: a single <t>, or rich text runs (phonetic hints in rPh excluded).
+const child = (el: Element, tag: string): Element | null => kids(el, tag)[0] ?? null;
+/** The text an element holds itself: an element inside it is no text of it. */
+const chars = (el: Element): string => Array.from(el.childNodes, (n) => (n.nodeType === 3 || n.nodeType === 4 ? n.nodeValue || '' : '')).join('');
+// Text of a string item: its <t>, then its rich text runs' (phonetic hints in rPh excluded).
 function text(el: Element): string {
-  const t = el.firstElementChild;
-  return unesc(
-    t?.localName === 't' && !t.nextElementSibling
-      ? t.textContent || ''
-      : all(el, 't')
-          .filter((x) => (x.parentNode as Element).localName !== 'rPh')
-          .map((x) => x.textContent || '')
-          .join(''),
-  );
+  let s = '';
+  for (let c = el.firstElementChild; c; c = c.nextElementSibling) {
+    if (isEl(c, 't')) s += chars(c);
+    else if (isEl(c, 'r')) {
+      const t = child(c, 't');
+      if (t) s += chars(t);
+    }
+  }
+  return unesc(s);
 }
 function normPath(p: string): string {
   const out: string[] = [];
@@ -164,42 +186,85 @@ export async function readXlsx(file: Blob): Promise<Sheet[]> {
     if (parts.has(k)) throw new Error(`The workbook is damaged (it holds ${f.name} twice).`);
     parts.set(k, f.read);
   }
-  /** A part as XML; `what` names it in the error when it is damaged (a sheet by its tab's name). */
+  const damaged = (what: string) => new Error(`The workbook is damaged (${what} could not be read).`);
+  /**
+   * A part as XML; `what` names it in the error when it is damaged (a sheet by its tab's name). Its text is UTF-8, or
+   * UTF-16 after its byte order mark, the encodings a package's XML may be in. Bytes that aren't, or that a declaration
+   * of another encoding would read otherwise (any but ASCII), make a damaged part: never a text with other characters
+   * than the file's (U+FFFD for each byte that isn't UTF-8).
+   */
   const doc = async (path: string, what = path): Promise<Document | null> => {
     const read = parts.get(path.toLowerCase());
     if (!read) return null;
-    const d = new DOMParser().parseFromString(fromUtf8(await read()), 'application/xml');
-    if (d.getElementsByTagName('parsererror').length) throw new Error(`The workbook is damaged (${what} could not be read).`);
+    const b = await read();
+    let xml: string;
+    try {
+      xml = new TextDecoder(b[0] === 0xfe && b[1] === 0xff ? 'utf-16be' : b[0] === 0xff && b[1] === 0xfe ? 'utf-16le' : 'utf-8', { fatal: true }).decode(b);
+    } catch {
+      throw damaged(what);
+    }
+    const named = /^<\?xml[^?]*\sencoding\s*=\s*["']([^"']*)/.exec(xml)?.[1];
+    if (named && !/^utf-?(8|16)/i.test(named) && b.some((x) => x > 0x7f)) throw damaged(what);
+    const d = new DOMParser().parseFromString(xml, 'application/xml');
+    if (d.getElementsByTagName('parsererror').length) throw damaged(what);
     return d;
   };
-  // Relationships of a part: [id, type, resolved target path].
+  // Relationships of a part: [id, type, resolved target path], the path '' for a target outside the file
+  // (TargetMode="External"), which is no part of it. An id given twice is a damaged file, not a choice between them.
   const relsOf = async (path: string): Promise<Array<[string, string, string]>> => {
     const dir = path.slice(0, path.lastIndexOf('/') + 1);
-    const d = await doc(`${dir}_rels/${path.slice(dir.length)}.rels`);
-    return d
-      ? all(d, 'Relationship').map((r) => {
-          const t = r.getAttribute('Target') || '';
-          return [r.getAttribute('Id') || '', r.getAttribute('Type') || '', t.startsWith('/') ? t.slice(1) : normPath(dir + t)] as [string, string, string];
+    const at = `${dir}_rels/${path.slice(dir.length)}.rels`;
+    const d = (await doc(at))?.documentElement;
+    if (d && !isEl(d, 'Relationships', PKG)) throw damaged(at);
+    const out = d
+      ? kids(d, 'Relationship', PKG).map((r) => {
+          const t = r.getAttribute('TargetMode') === 'External' ? '' : r.getAttribute('Target') || '';
+          return [r.getAttribute('Id') || '', r.getAttribute('Type') || '', t && (t.startsWith('/') ? t.slice(1) : normPath(dir + t))] as [string, string, string];
         })
       : [];
+    if (new Set(out.map((r) => r[0])).size !== out.length) throw damaged(at);
+    return out;
   };
-  const wbPath = (await relsOf('')).find((r) => r[1].endsWith('/officeDocument'))?.[2] || 'xl/workbook.xml';
-  const wb = await doc(wbPath);
-  if (!wb) throw new Error('This file is not an Excel workbook (.xlsx).');
+  /** The part of the one relationship of a role (role(): two, or one outside the file, are a damaged file). */
+  const one = (rels: Array<[string, string, string]>, type: string, at: string): string | undefined => {
+    const m = rels.filter((r) => role(r[1]) === type);
+    if (m.length > 1 || (m[0] && !m[0][2])) throw damaged(at);
+    return m[0]?.[2];
+  };
+  const wbPath = one(await relsOf(''), 'officeDocument', '_rels/.rels') || 'xl/workbook.xml';
+  const wb = (await doc(wbPath))?.documentElement;
+  if (!isEl(wb, 'workbook')) throw new Error('This file is not an Excel workbook (.xlsx).');
   const wbRels = await relsOf(wbPath);
-  const ss = wbRels.find((r) => r[1].endsWith('/sharedStrings'));
-  const ssDoc = await doc(ss ? ss[2] : 'xl/sharedStrings.xml');
-  const shared = ssDoc ? all(ssDoc, 'si').map(text) : [];
+  const ss = one(wbRels, 'sharedStrings', wbPath);
+  const ssPath = ss || 'xl/sharedStrings.xml';
+  const sst = (await doc(ssPath))?.documentElement;
+  // Named but missing, every text kept in it would read as empty; a part of another kind holds none of them.
+  if ((ss && !sst) || (sst && !isEl(sst, 'sst'))) throw damaged(ssPath);
+  const shared = sst ? kids(sst, 'si').map(text) : [];
+  const lists = kids(wb, 'sheets');
+  if (lists.length !== 1) throw damaged(wbPath);
   const out: Sheet[] = [];
-  for (const s of all(wb, 'sheet')) {
-    const id = Array.from(s.attributes).find((a) => a.localName === 'id' && a.namespaceURI)?.value;
-    const path = wbRels.find((r) => r[0] === id)?.[2];
+  for (const s of kids(lists[0], 'sheet')) {
+    // Its relationship by its r:id only: another namespace's id attribute names nothing here, and two that differ
+    // name no one part.
+    const ids = new Set(RELS.map((ns) => s.getAttributeNS(ns, 'id')).filter(Boolean));
+    const link = ids.size === 1 ? wbRels.find((r) => r[0] === [...ids][0]) : undefined;
+    const path = link?.[2];
     const name = s.getAttribute('name') || '';
     // The tab the owner sees, not the part (sheet7.xml): Excel keeps part numbers when tabs move. Excel's names are
     // at most 31 characters; a damaged file's can be any length.
-    const what = name ? `the ${name.length > 31 ? `${name.slice(0, 31)}…` : name} sheet` : path || '';
-    const d = path ? await doc(path, what) : null;
-    out.push({ name, ...(d ? readSheet(d, shared, what) : { rows: [] }) });
+    const what = name ? `the ${name.length > 31 ? `${name.slice(0, 31)}…` : name} sheet` : path || 'a sheet';
+    // A chart sheet (or a dialog or macro sheet) has no cells to import.
+    const kind = link ? role(link[1]) : '';
+    if (/^(chartsheet|dialogsheet|xl(Intl)?Macrosheet)$/.test(kind)) {
+      out.push({ name, rows: [] });
+      continue;
+    }
+    // A sheet whose part isn't there, or isn't a worksheet (a relationship of another kind, a target outside the file),
+    // is a damaged file: its rows are never taken for none, nor another part's for its own.
+    const d = kind === 'worksheet' && path ? (await doc(path, what))?.documentElement : undefined;
+    if (!isEl(d, 'worksheet')) throw damaged(what);
+    out.push({ name, ...readSheet(d, shared, what) });
   }
   return out;
 }
@@ -212,10 +277,12 @@ const MAX_COLS = 16384;
  * The sheet's cells as sparse arrays: one cell far down or far right must not allocate the rows and cells before it.
  * A cell is read at the whole address its reference gives (r="E3": column E, row 3), which must be inside its row: a
  * cell naming another row, a reference that is not a cell address, or one outside the grid is a damaged workbook, never
- * text put on its row's label. Rows and cells without a reference follow the previous ones. `sheet` names the sheet in
- * errors ("the Attributes sheet").
+ * text put on its row's label. Rows and cells without a reference follow the previous ones. A value Excel can't have
+ * written (a shared string the file doesn't hold, a Boolean neither 1 nor 0, a cell type the format doesn't have, two
+ * values in one cell) is a damaged workbook too, never taken for another text or for an empty cell. `sheet` names the
+ * sheet in errors ("the Attributes sheet").
  */
-function readSheet(d: Document, shared: string[], sheet: string): Pick<Sheet, 'rows' | 'errors'> {
+function readSheet(ws: Element, shared: string[], sheet: string): Pick<Sheet, 'rows' | 'errors'> {
   const rows: Cell[][] = [];
   const errors: Array<[number, number]> = [];
   const damaged = (what: string) => new Error(`The workbook is damaged (${sheet} ${what}).`);
@@ -227,7 +294,10 @@ function readSheet(d: Document, shared: string[], sheet: string): Pick<Sheet, 'r
   const twice = (what: string) => damaged(`holds ${what} twice`);
   const seen = new Set<number>();
   let r = -1;
-  for (const row of all(d, 'row')) {
+  const unread = (c: number) => new Error(`The workbook is damaged (cell ${colName(c)}${r + 1} of ${sheet} could not be read).`);
+  const data = kids(ws, 'sheetData');
+  if (data.length > 1) throw damaged('could not be read');
+  for (const row of data.length ? kids(data[0], 'row') : []) {
     const ra = row.getAttribute('r');
     if (ra && !/^\d+$/.test(ra)) throw damaged(`has a row at "${cut(ra)}", which is not a row number`);
     r = ra ? Number(ra) - 1 : r + 1;
@@ -238,7 +308,7 @@ function readSheet(d: Document, shared: string[], sheet: string): Pick<Sheet, 'r
     const at = new Set<number>();
     let c = -1;
     for (let el = row.firstElementChild; el; el = el.nextElementSibling) {
-      if (el.localName !== 'c') continue;
+      if (!isEl(el, 'c')) continue;
       const ref = el.getAttribute('r');
       if (ref) {
         // Column letters, then the row number (a reference giving only the column takes its row's).
@@ -252,15 +322,23 @@ function readSheet(d: Document, shared: string[], sheet: string): Pick<Sheet, 'r
       if (at.has(c)) throw twice(`cell ${colName(c)}${r + 1}`);
       at.add(c);
       const t = el.getAttribute('t');
-      const v = child(el, 'v')?.textContent ?? null;
+      const vs = kids(el, 'v');
+      // A type the format doesn't have, or two values in one cell, is a damaged cell: never one of them taken for it.
+      if ((t && !/^(b|d|e|inlineStr|n|s|str)$/.test(t)) || vs.length > 1 || kids(el, 'is').length > 1) throw unread(c);
+      const v = vs.length ? chars(vs[0]) : null;
       let val: Cell = null;
       if (t === 'inlineStr') {
         const is = child(el, 'is');
         val = is ? text(is) : null;
       } else if (v === null) val = null;
-      else if (t === 's') val = shared[Number(v)] ?? null;
-      else if (t === 'b') val = v.trim() === '1' ? 'TRUE' : 'FALSE';
-      else if (t === 'str' || t === 'e' || t === 'd') val = unesc(v);
+      else if (t === 's') {
+        const i = v.trim();
+        if (!/^\d+$/.test(i) || Number(i) >= shared.length) throw unread(c);
+        val = shared[Number(i)];
+      } else if (t === 'b') {
+        if (!/^[01]$/.test(v.trim())) throw unread(c);
+        val = v.trim() === '1' ? 'TRUE' : 'FALSE';
+      } else if (t === 'str' || t === 'e' || t === 'd') val = unesc(v);
       else if (v.trim()) val = Number.isNaN(Number(v)) ? v : Number(v);
       // Formatted but empty cells and rows (e.g. a styled row 1048576) must not grow the grid.
       if (val !== null) {

@@ -5,7 +5,8 @@ import type { LangSession } from '../core/langsession';
 import type { Change, ChangeResult, Kind, Lcid, PublishSet, Slot, TextOf } from '../core/model';
 import type { Store } from '../core/store';
 import type { CreatePageMode } from '../inspector/types';
-import type { ProvidersApi, Scope, ServerTexts } from '../providers/types';
+import type { FormWrite, ProvidersApi, Scope, ServerTexts } from '../providers/types';
+import type { MenuItem } from './widgets';
 
 export type ToastKind = 'info' | 'ok' | 'warn' | 'error';
 
@@ -102,6 +103,11 @@ export interface AppApi {
    * automatic (no prompt): always resolves true. Kept so loaders and savers have one place to ask.
    */
   askLangSwitch(): Promise<boolean>;
+  /**
+   * The ⋯ menus' "Allow changes to managed labels" (Ctx.managedEdits, off at every start): turned on after a
+   * confirmation, off at once.
+   */
+  managedMenuItem(): MenuItem;
 
   providers: ProvidersApi;
   saver: SaverApi;
@@ -128,12 +134,19 @@ export interface SaveReport {
   /** Something the user must act on after the save (e.g. their Dynamics language could not be switched back). */
   warning?: string;
   /**
-   * Saved, but the page may not show it yet; nothing to try again or undo (a process could not be updated after its
-   * name was saved, so the page may show the old process name).
+   * Saved, but the page may not show it yet (a process could not be updated after its name was saved, so the page may
+   * show the old process name), or the save had to put back labels Dataverse dropped (providers/formxml.ts): nothing to
+   * try again or undo.
    */
   notice?: string;
   ms: number;
   historyId?: string;
+  /**
+   * What the form writer knew of each form the save wrote, by form id (providers/types.ts FormWrite): whether it had
+   * another change than this save's, its published version before, and what the save left of its field labels of their
+   * own. The Publish dialog keeps the answers of those for the version its publish makes (ui/review.ts keepOwnLabels).
+   */
+  forms?: Map<string, FormWrite>;
 }
 
 export interface Issue {
@@ -253,6 +266,15 @@ export interface SaverApi {
    * (Recent publishes › Undo shows it first). A change whose read failed, or whose writer has no read, maps to an Error.
    */
   current(changes: Change[], signal?: AbortSignal): Promise<ServerTexts>;
+  /**
+   * Writes the texts of saved labels again around `publish` (Writer.again), so that a publish takes them: Publish
+   * again's repair of field labels the check after publishing found missing from the published form while its versions
+   * agree (LIVE-FINDINGS 117), and of column names and tooltips it found not served as saved (118); each writer's in
+   * turn. Nothing is committed or journaled: the texts stay as saved. Each label's result; what the writer tells the user
+   * goes to `warn`. `publish`, given a signal, publishes with that one in place of `signal`. Refused while a save or an
+   * undo runs, and none starts meanwhile.
+   */
+  writeAgain(changes: Change[], publish: (signal?: AbortSignal) => Promise<void>, signal: AbortSignal, warn?: (message: string, level: 'warning' | 'notice') => void): Promise<ChangeResult[]>;
   /**
    * Writes the "before" values of a past save back (same safety checks); a translation it added that Dataverse can't
    * remove is written as its stand-in.

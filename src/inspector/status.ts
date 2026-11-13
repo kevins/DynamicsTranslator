@@ -3,7 +3,7 @@
 
 import { guid } from '../core/http';
 import { lcidName } from '../core/lcid';
-import { MANAGED, namesFirst, PROP_NAMES, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
+import { MANAGED, MANAGED_RIBBON, namesFirst, PROP_NAMES, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
 import { fold } from '../core/search';
 import type { Store } from '../core/store';
 import { notLoaded } from '../ui/editor';
@@ -11,6 +11,7 @@ import type { AppApi } from '../ui/types';
 import { columnOf } from './column';
 import { fallbackOf, navSource } from './fallback';
 import type { Place, Target } from './reveal';
+import { isTimeline } from './scan';
 import type { GroupFn, Look, LookFn, PageGroup, PageItem } from './types';
 
 /** Property order of a component's slots (the editor card's order). */
@@ -58,7 +59,8 @@ const sameText = (a: string, b: string): boolean => a.replace(/\s+/g, ' ').trim(
  * What a label shows in language `l` because it has no text of its own there, when that stands for its own text:
  * a form cell's column name (LIVE-FINDINGS 42), a related menu item's relationship text (its menu label or the
  * listed table's plural name, LIVE-FINDINGS 80), when the label's base-language text is that text's base-language
- * text (as the form designer writes it). '' otherwise: no such text in `l`, or a label worded differently.
+ * text: a label with no text of its own there (a read fills in the column's name, LIVE-FINDINGS 103), or a copy of it.
+ * '' otherwise: no such text in `l`, or a label worded differently.
  */
 export function standsIn(store: Store, s: Slot, l: Lcid, base: Lcid): string {
   const fb = fallbackOf((k) => store.get(k), s);
@@ -91,14 +93,15 @@ export function relatedKeys(store: Store, s: Slot): string[] {
  * without a target text whose stand-in (its column's name, its relationship's text) can be edited looks as that does.
  */
 /**
- * The look of a read-only text: 'ro' for a managed solution's label (MANAGED: its popup says why, no unmanaged
- * layer); grey 'builtin' when it is already there in every installed language (Microsoft's own texts: a system column
- * that can't be renamed), so there is nothing to translate; else 'ro', grey too: its popup gives the reason.
+ * The look of a read-only text: 'ro' for a managed solution's label (MANAGED, or MANAGED_RIBBON for a classic command
+ * label while changes to managed labels are allowed: its popup says why, no unmanaged layer); grey 'builtin' when it is
+ * already there in every installed language (Microsoft's own texts: a system column that can't be renamed), so there is
+ * nothing to translate; else 'ro', grey too: its popup gives the reason.
  */
 export function readOnlyLook(app: Pick<AppApi, 'store' | 'ctx'>, s: Slot): Look {
   // Read-only because it comes from a managed solution (no unmanaged layer): "read-only", never "built-in", even with
   // every language there; Microsoft's own locked names (their own reason) stay built-in.
-  if (s.readOnly === MANAGED) return 'ro';
+  if (s.readOnly === MANAGED || s.readOnly === MANAGED_RIBBON) return 'ro';
   return app.ctx.langs.every(({ lcid }) => !notLoaded(s, lcid) && !!app.store.value(s.key, lcid).trim()) ? 'builtin' : 'ro';
 }
 
@@ -119,6 +122,9 @@ export const look: LookFn = (app, comp) => {
         if (o === 'error' || o === 'conflict') return 'error';
       }
   for (const s of all) if (store.isEdited(s.key)) return 'edited';
+  // The timeline's label is never shown (LIVE-FINDINGS 101) and its popup has no input for it (the Workbench has one):
+  // its list row looks as its heading does (mode.ts anchorLook), never as a text to translate here.
+  if (isTimeline(m)) return 'builtin';
 
   const t = prefs.target;
   const base = ctx.base;

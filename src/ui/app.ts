@@ -27,7 +27,7 @@ import { createShell, type ShellState } from './shell';
 import css from './styles.css';
 import type { AppApi, AppDeps, HistoryEntry, LoadUiOptions, Prefs, SaveReport, SaverApi, View } from './types';
 import { bindUndo } from './undo';
-import { btn, closeTop, confirm, emptyState, errMsg, frag, ibtn, link, menu, modal, modalOpen, setLayer, spinner, teardownLayer, toast, tooltip } from './widgets';
+import { btn, closeTop, confirm, emptyState, errMsg, frag, ibtn, link, menu, modal, modalOpen, setLayer, spinner, teardownLayer, toast, tooltip, type MenuItem } from './widgets';
 
 type ViewId = 'page' | 'workbench';
 export interface AppHandle {
@@ -446,6 +446,7 @@ export async function createApp(ctx: Ctx, store: Store, lang: LangSession, deps:
     // destroy() removes the beforeunload guard too, so the reload doesn't ask "Leave site?".
     teardown: () => destroy(),
     restore: () => lang.restore(),
+    switching: () => lang.active && !lang.waiting,
   });
   /** Clears the Dynamics caches and reloads (ui/refresh.ts). One at a time. */
   function refresh(items?: VerifyItem[]): Promise<boolean> {
@@ -564,6 +565,10 @@ export async function createApp(ctx: Ctx, store: Store, lang: LangSession, deps:
       workbench: () => show('workbench'),
       publish: () => void review(),
       history: () => recentPublishes(),
+      select: () => {
+        closeList();
+        m.select(true);
+      },
     });
     L.append(bar.el);
     // The bar moves (dragged, snapped to the top, resized): toasts follow.
@@ -652,6 +657,7 @@ export async function createApp(ctx: Ctx, store: Store, lang: LangSession, deps:
     adoptStyles,
     // Form tab and section labels in other languages are read and written with a brief, automatic language switch.
     askLangSwitch: () => Promise.resolve(true),
+    managedMenuItem,
     providers: deps.providers,
     saver: null as unknown as SaverApi,
     io: deps.io,
@@ -694,9 +700,35 @@ export async function createApp(ctx: Ctx, store: Store, lang: LangSession, deps:
       '-',
       { head: 'Settings' },
       { label: 'Show logical names', checked: prefs.showNames, keep: true, run: () => savePrefs({ showNames: !prefs.showNames }) },
+      managedMenuItem(),
       '-',
       { head: `Dynamics Translator ${__VERSION__}` },
     ], { end: true });
+  }
+
+  /**
+   * ⋯ › Allow changes to managed labels (Ctx.managedEdits): off at every start; turned on after a confirmation, off at
+   * once. The labels loaded already become editable, or read-only again, as they are (Store.setManagedEdits).
+   */
+  function managedMenuItem(): MenuItem {
+    return {
+      label: 'Allow changes to managed labels',
+      checked: !!ctx.managedEdits,
+      run: () =>
+        void (async () => {
+          const on = !ctx.managedEdits;
+          if (on) {
+            const ok = await confirm({
+              title: 'Allow changes to managed labels?',
+              body: "Labels from managed solutions become editable where their solution allows it. Publishing a change to one adds an unmanaged layer on top of it: it stays until removed in Power Apps, and the solution's later updates of that label won't show.",
+              ok: 'Allow',
+            });
+            if (!ok || destroyed) return;
+          }
+          ctx.managedEdits = on;
+          store.setManagedEdits(on);
+        })(),
+    };
   }
 
   function shortcuts(): void {

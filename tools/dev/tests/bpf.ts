@@ -361,4 +361,34 @@ export function register(t: Kit): void {
     W.doc = workflow();
     eq((await scope(false)).map((x) => x.readOnly), ['', '', '']);
   });
+
+  test('a process from a managed solution where this session allows changes to managed labels (Ctx.managedEdits): its labels load editable where it is customizable, else read-only with that reason, both reasons kept; the Workbench brings the customizable one; the writer writes it, and refuses one read as not customizable before anything is written', async () => {
+    const { W, ctx } = server();
+    (ctx as { managedEdits?: boolean }).managedEdits = true;
+    const NOT = "This business process flow is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.";
+    W.doc = { ...workflow(), ismanaged: true };
+    const slots = await loadBpfLabels(ctx, WF, opts());
+    eq(slots.map((x) => [x.readOnly, x.ref.managed, x.ref.lock, x.ref.held]), [['', true, '', MANAGED], ['', true, '', MANAGED], ['', true, '', MANAGED]]);
+    W.doc = { ...workflow(), ismanaged: true, iscustomizable: { Value: false } };
+    eq([...new Set((await loadBpfLabels(ctx, WF, opts())).map((x) => x.readOnly))], [NOT]);
+    // The Workbench: the customizable managed flow comes without read-only labels asked for; a not customizable one doesn't.
+    let customizable = true;
+    (ctx as { http: Record<string, unknown> }).http.all = async (u: string) =>
+      u.startsWith('workflows?') ? [{ workflowid: WF, primaryentity: 'account', ismanaged: true, iscustomizable: { Value: customizable }, businessprocesstype: 0 }] : [];
+    W.doc = { ...workflow(), ismanaged: true };
+    const scope = () => loadBpfScope(ctx, { entities: ['account'], kinds: new Set<Kind>(['stage', 'step']) }, opts());
+    eq((await scope()).map((x) => x.readOnly), ['', '', '']);
+    customizable = false;
+    eq((await scope()).length, 0, 'not customizable: left out');
+    // The writer: a managed one written; one read as not customizable right before the write refused with that reason.
+    const o = (): SaveOptions => ({ signal: new AbortController().signal, publish: new PublishSet(), progress: () => {}, force: new Set(), lang: {} as SaveOptions['lang'], allowPublish: true });
+    W.doc = { ...workflow(), ismanaged: true };
+    const [s0] = await loadBpfLabels(ctx, WF, opts());
+    const r = await bpfWriter.save(ctx, [{ slot: s0, lcid: FR, before: s0.labels[FR] ?? '', after: 'Étape (essai)' }], o());
+    eq(r.map((x) => x.outcome), ['saved'], JSON.stringify(r.map((x) => x.message)));
+    ok(W.doc.xaml.includes('Étape (essai)'), 'written');
+    W.doc = { ...W.doc, iscustomizable: { Value: false } };
+    const no = await bpfWriter.save(ctx, [{ slot: s0, lcid: FR, before: 'Étape (essai)', after: 'Étape (encore)' }], o());
+    eq([no.map((x) => [x.outcome, x.message]), W.doc.xaml.includes('Étape (encore)')], [[['error', NOT]], false]);
+  });
 }

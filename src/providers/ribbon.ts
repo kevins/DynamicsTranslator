@@ -20,9 +20,9 @@
 
 import type { Ctx } from '../core/context';
 import { DvError, abortError, guid, isAbort, pause, q, turnedAway } from '../core/http';
-import { pick } from '../core/labels';
+import { pick, toLabels } from '../core/labels';
 import { lcidName } from '../core/lcid';
-import { CANT_CLEAR_TEXT, MANAGED, PublishSet, canClear, isManaged, slotKey, type Change, type ChangeResult, type Labels, type Lcid, type Slot } from '../core/model';
+import { CANT_CLEAR_TEXT, MANAGED, MANAGED_RIBBON, PublishSet, canClear, isManaged, managedSlot, slotKey, type Change, type ChangeResult, type Labels, type Lcid, type Slot } from '../core/model';
 import { isLockError, publishXml } from '../core/publish';
 import { blank, parseXml, presentLabels, readLabels, xmlAttr } from '../core/xml';
 import { bytesToB64, utf8, zip } from '../core/zip';
@@ -112,6 +112,10 @@ async function readDiffs(ctx: Ctx, entities: string[], signal?: AbortSignal, lat
 
 const latestDiffs = async (ctx: Ctx, e: string, signal?: AbortSignal): Promise<Diffs> => (await readDiffs(ctx, [e], signal, true)).get(e) ?? new Map();
 
+/**
+ * Table display names in the user's language for the labels' paths, picked from every language: UserLocalizedLabel
+ * follows the UI language Dataverse answers in, and this read can land in a language switch window (no lock).
+ */
 async function tableNames(ctx: Ctx, list: string[], signal: AbortSignal): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   const chunks: string[][] = [];
@@ -119,7 +123,7 @@ async function tableNames(ctx: Ctx, list: string[], signal: AbortSignal): Promis
   const pages = await Promise.all(
     chunks.map((c) => ctx.http.all(`EntityDefinitions?$select=LogicalName,DisplayName&$filter=${c.map((e) => `LogicalName eq '${q(e)}'`).join(' or ')}`, { signal }).catch(soft)),
   );
-  for (const r of pages.flatMap((p) => p || [])) m.set(r.LogicalName, r.DisplayName?.UserLocalizedLabel?.Label || r.LogicalName);
+  for (const r of pages.flatMap((p) => p || [])) m.set(r.LogicalName, pick(toLabels(r.DisplayName), ctx.user, ctx.base) || r.LogicalName);
   return m;
 }
 
@@ -130,8 +134,8 @@ export async function loadRibbonLabels(ctx: Ctx, entities: string[], o: LoadOpti
   const [diffs, names] = await Promise.all([readDiffs(ctx, list, o.signal), tableNames(ctx, list.filter((e) => e !== APP), o.signal)]);
   const slots: Slot[] = [];
   for (const [e, m] of diffs)
-    for (const [id, d] of m)
-      slots.push({
+    for (const [id, d] of m) {
+      const s: Slot = {
         key: slotKey('ribbon', `${e}|${id}`, 'Label'),
         kind: 'ribbon',
         prop: 'Label',
@@ -147,7 +151,11 @@ export async function loadRibbonLabels(ctx: Ctx, entities: string[], o: LoadOpti
         max: 0,
         order: d.order,
         ref: { entity: e, locLabelId: id, managed: d.managed },
-      });
+      };
+      // A managed solution's label is read-only whatever the setting: while changes to managed labels are allowed
+      // (Ctx.managedEdits), its reason says the setting doesn't cover it (core/model.ts managedSlot, MANAGED_RIBBON).
+      slots.push(d.managed ? managedSlot(s, ctx.managedEdits, MANAGED_RIBBON) : s);
+    }
   return slots;
 }
 
@@ -221,8 +229,8 @@ function classify(ctx: Ctx, cs: Change[], server: Diffs, force: Set<string>, out
     if (!d) r = fail(c, 'This label no longer exists on the server. Reload and try again.');
     // A translation file names a label by the ribboncustomization row of its layer; only the unmanaged one is written, and
     // never for a label a managed solution defines (as read now, or as loaded), even one with an unmanaged row already:
-    // that would be an unmanaged layer on it.
-    else if (d.managed || isManaged(c.slot)) r = fail(c, MANAGED);
+    // that would be an unmanaged layer on it. Changes to managed labels allowed or not (MANAGED_RIBBON says so).
+    else if (d.managed || isManaged(c.slot)) r = fail(c, ctx.managedEdits ? MANAGED_RIBBON : MANAGED);
     else if (c.lcid === ctx.base && !c.after.trim()) r = fail(c, `The ${lcidName(ctx.base)} label can't be blank: it is the base language.`);
     else if (/[\0-\x08\x0b\x0c\x0e-\x1f]/.test(c.after)) r = fail(c, 'The text contains control characters that a command label cannot store. Remove them and save again.');
     // Refused before any import; the saver already blocks it, this is the writer's own guard.
@@ -937,7 +945,10 @@ export const ribbonWriter: Writer = {
           ? ''
           : `The temporary solution "${sol.name}" could not be deleted. Deleting it removes only the solution, not the table or its command bar: delete it from Solutions in Power Apps, or let the translator remove it automatically during one of your classic command saves an hour or more from now.`;
       await dropStale(ctx).catch(() => {});
-      if (note) results = results.map((r) => ({ ...r, message: r.message ? `${r.message} ${note}` : note }));
+      // Told once after the save, whatever became of the rows: the Publish dialog shows no message of a saved row or a
+      // conflict (only without SaveOptions.warn does each row carry it).
+      if (note && o.warn) o.warn(note, 'notice');
+      else if (note) results = results.map((r) => ({ ...r, message: r.message ? `${r.message} ${note}` : note }));
     }
     return results;
   },

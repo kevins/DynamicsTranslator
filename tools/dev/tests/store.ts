@@ -298,6 +298,23 @@ export function register({ test, eq, ok, slot }: Kit): void {
     eq([s.value('c', FR), s.before('c', FR), s.original('c', FR)], ['Nom 3', 'Name', 'Name']);
   });
 
+  test("store commit: a text saved on a main form field label leaves nothing known of whether that language holds a label of its own (`ref.own`): posted, it is stored as the label's own or not, as its key holds labels (LIVE-FINDINGS 104), its stand-in or a text typed; one that failed keeps what was known", () => {
+    const s = new Store();
+    const cell = (k: string) => ({ ...slot('field', k, { 1033: 'Name', [FR]: 'Nom' }), ref: { sparse: true, own: { 1033: true, [FR]: true } } });
+    s.add([cell('f'), cell('g'), cell('h')]);
+    const stoodIn = (k: string) => ({ slot: s.get(k)!, lcid: FR, before: 'Nom', after: 'Nom du compte', standIn: { from: 'column' as const, typed: '' } });
+    const typed = (k: string) => ({ slot: s.get(k)!, lcid: FR, before: 'Nom', after: 'Nom complet' });
+    s.commit([
+      { change: stoodIn('f'), outcome: 'saved' },
+      { change: typed('g'), outcome: 'saved' },
+      { change: stoodIn('h'), outcome: 'error', message: 'Could not reach Dataverse.' },
+    ]);
+    eq(
+      ['f', 'g', 'h'].map((k) => s.get(k)!.ref.own),
+      [{ 1033: true }, { 1033: true }, { 1033: true, [FR]: true }],
+    );
+  });
+
   test("store freshness: what a load read that started before the store got a newer text (`since`, tick()) never puts its text back, nor drops an edit typed over the newer text because it matches the older; a read made later does; a save, a text read again and a conflict resolved are newer too", () => {
     const s = new Store();
     const col = (en: string, fr: string) => slot('attribute', 'a', { 1033: en, 1036: fr });

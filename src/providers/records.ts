@@ -15,7 +15,7 @@ import type { Ctx } from '../core/context';
 import { DvError, guid, isAbort, mayHaveRun, partError, pause, q, turnedAway, type BatchPart, type PartResult } from '../core/http';
 import { pick, toLabels, type Label } from '../core/labels';
 import { lcidName } from '../core/lcid';
-import { KIND_NAMES, MANAGED, PROP_NAMES, isManaged, slotKey, type Change, type ChangeResult, type Kind, type Labels, type Outcome, type Prop, type Slot } from '../core/model';
+import { KIND_NAMES, MANAGED, PROP_NAMES, managedHeld, managedReadOnly, managedSlot, slotKey, type Change, type ChangeResult, type Kind, type Labels, type Outcome, type Prop, type Slot } from '../core/model';
 import { changeId, check, type CommandInfo, type FormRef, type LoadOptions, type Loader, type ServerTexts, type SolutionInfo, type Writer } from './types';
 
 type RecKind = 'view' | 'chart' | 'form' | 'dashboard' | 'app' | 'bpf' | 'command' | 'envvar' | 'customapi';
@@ -166,9 +166,15 @@ const isGuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
 const locPath = (ctx: Ctx, set: string, id: string, column: string) =>
   ctx.http.fn('RetrieveLocLabels', { EntityMoniker: { '@odata.id': `${set}(${id})` }, AttributeName: column, IncludeUnpublished: true });
 // A record from a managed solution is read-only, whatever its managed properties allow: a translation would be an
-// unmanaged layer on top of it (MANAGED). Managed properties only bind managed layers, so an unmanaged record stays
-// editable in its own org.
+// unmanaged layer on top of it (MANAGED), unless this session allows changes to managed labels (Ctx.managedEdits): then
+// as its managed properties say. Managed properties only bind managed layers, so an unmanaged record stays editable in
+// its own org.
 const locked = (r: any) => r?.ismanaged === true;
+/** Why a managed record's labels stay read-only where changes to managed labels are allowed ('' = they don't). */
+const notCustomizable = (kind: Kind, r: any): string =>
+  r?.iscustomizable?.Value === false
+    ? `This ${kind === 'customapi' ? 'custom API' : KIND_NAMES[kind][0].toLowerCase()} is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.`
+    : '';
 const why = (e: unknown) => {
   const m = (e as Error)?.message || String(e);
   return /0x80071151|Cannot start another/i.test(m) ? 'Dataverse is busy with another customization. Your edits are still pending — try Save again in a minute.' : m;
@@ -286,7 +292,7 @@ export const loadRecordsScope: Loader = async (ctx, scope, o) => {
           : await ctx.http.all(url(), { signal: o.signal });
         // Solution components are matched by id, so new component type codes need no mapping (apps may be listed by either id).
         return rows
-          .filter((r) => (scope.includeReadOnly || !locked(r)) && (!aware || !sol || [d.pk, 'appmoduleidunique'].some((k) => sol.has(guid(r[k])))))
+          .filter((r) => (scope.includeReadOnly || !locked(r) || (!!ctx.managedEdits && !notCustomizable(kind, r))) && (!aware || !sol || [d.pk, 'appmoduleidunique'].some((k) => sol.has(guid(r[k])))))
           .map((r) => [kind, r]);
       } catch (e) {
         if (isAbort(e)) throw e;
@@ -346,32 +352,39 @@ async function build(ctx: Ctx, items: Array<[RecKind, any]>, o: LoadOptions): Pr
       path: r.ent ? [tables.get(r.ent) || r.ent] : [],
       sub,
     };
-    const lock = locked(row) ? MANAGED : '';
-    return r.props.map(
-      ([prop, column, max], j): Slot => ({
+    const managed = locked(row);
+    return r.props.map(([prop, column, max], j): Slot => {
+      const unread = got[j].ok ? '' : `Could not read its translations: ${got[j].error}`;
+      const s: Slot = {
         ...base,
         key: slotKey(kind, r.id, prop),
         prop,
         labels: labels[j],
-        readOnly: lock || (got[j].ok ? '' : `Could not read its translations: ${got[j].error}`),
+        readOnly: (managed ? MANAGED : '') || unread,
         // SetLocLabels is never sent with an empty base-language label, so it can't be cleared here.
         baseRequired: true,
         max,
         order: i * 8 + j,
         ref: { id: r.id, table: r.d.table, entitySet: r.d.set, column, entity: r.ent, type: r.type, managed: !!row.ismanaged, app: guid(row._appmoduleid_value) || undefined } satisfies Ref,
-      }),
-    );
+      };
+      // A managed record's: MANAGED, or where changes to managed labels are allowed, as its managed properties say.
+      return managed ? managedSlot(s, ctx.managedEdits, notCustomizable(kind, row) || unread, MANAGED) : s;
+    });
   });
 }
 
-/** Table display names in the user's language for breadcrumbs (logical names when unavailable). */
+/**
+ * Table display names in the user's language for breadcrumbs (logical names when unavailable), picked from every
+ * language: UserLocalizedLabel follows the UI language Dataverse answers in, and this read can land in a language
+ * switch window (no lock).
+ */
 async function tableNames(ctx: Ctx, entities: string[], signal: AbortSignal): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   await Promise.all(
     chunks(entities, 40).map((c) =>
       ctx.http.get(`EntityDefinitions?$select=LogicalName,DisplayName&$filter=${or('LogicalName', c.map(str))}`, { signal }).then(
         (r) => {
-          for (const e of r.value || []) m.set(e.LogicalName, e.DisplayName?.UserLocalizedLabel?.Label || e.LogicalName);
+          for (const e of r.value || []) m.set(e.LogicalName, pick(toLabels(e.DisplayName), ctx.user, ctx.base) || e.LogicalName);
         },
         (e) => {
           if (isAbort(e)) throw e;
@@ -583,8 +596,8 @@ export const recordsWriter: Writer = {
         put(all, 'skipped', slot.readOnly);
         continue;
       }
-      if (isManaged(slot)) {
-        put(all, 'error', MANAGED);
+      if (managedHeld(slot, ctx.managedEdits)) {
+        put(all, 'error', managedReadOnly(slot, ctx.managedEdits));
         continue;
       }
       // Every other language falls back to the base-language text, so it can never be removed.
@@ -599,17 +612,19 @@ export const recordsWriter: Writer = {
         put(cs, 'skipped', CANCELLED);
         continue;
       }
-      try {
-        if (await fromManaged(r)) {
-          put(cs, 'error', MANAGED);
+      // Where this session allows changes to managed labels (Ctx.managedEdits), the layer is what was asked for: no read.
+      if (!ctx.managedEdits)
+        try {
+          if (await fromManaged(r)) {
+            put(cs, 'error', MANAGED);
+            continue;
+          }
+        } catch (e) {
+          // Not known to be unmanaged: nothing is written.
+          if (isAbort(e)) put(cs, 'skipped', CANCELLED);
+          else put(cs, 'error', `Could not read the current text: ${why(e)}`);
           continue;
         }
-      } catch (e) {
-        // Not known to be unmanaged: nothing is written.
-        if (isAbort(e)) put(cs, 'skipped', CANCELLED);
-        else put(cs, 'error', `Could not read the current text: ${why(e)}`);
-        continue;
-      }
       o.progress(`Saving ${KIND_NAMES[slot.kind][0].toLowerCase()} “${slot.title}” › ${PROP_NAMES[slot.prop]}`);
       // A write turned away unrun is tried again after 2, 4 and 8 s, each time from a new read.
       for (let i = 0; ; i++) {

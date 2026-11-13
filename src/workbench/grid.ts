@@ -55,6 +55,7 @@ export const blockedWhy = (s: Slot, l: Lcid, base: Lcid, before: string, after: 
 export const standInTip = (s: Slot, l: Lcid, base: Lcid, before: string, after: string, text: TextOf): string => {
   const x = standIn(s, l, base, before, after, text);
   if (!x?.text) return '';
+  if (x.follow) return `Shows “${x.text.trim()}”`;
   if (x.same) return standInSays(s, l, base, x);
   return `Becomes “${x.text.trim()}” when you save: ${standInText(s, l, base, x.from)} Was “${before}”.`;
 };
@@ -503,9 +504,11 @@ export function createGrid(app: AppApi, o: GridOptions): GridApi {
     edKey = '',
     edL = 0,
     edStart = '',
-    // The cell's text when the editor opened, and the server text it was measured against (see commit()).
+    // The cell's text when the editor opened, whether that was a pending edit, and the server text it was measured
+    // against (Store.base: null where its language had no label at all; see commit()).
     edFrom = '',
-    edBase = '',
+    edPending = false,
+    edBase: string | null = '',
     clip = 0,
     // Key columns marked `keep` stay in view while scrolling sideways, when there is room for a language beside them.
     pinOn = true,
@@ -903,7 +906,8 @@ export function createGrid(app: AppApi, o: GridOptions): GridApi {
     edKey = s.key;
     edL = l;
     edFrom = store.value(s.key, l);
-    edBase = store.before(s.key, l);
+    edPending = store.isEdited(s.key, l);
+    edBase = store.base(s.key, l);
     ed.value = init ?? edFrom;
     edStart = init === undefined ? ed.value : '\0';
     ed.dir = isRtl(l) ? 'rtl' : 'auto';
@@ -929,13 +933,14 @@ export function createGrid(app: AppApi, o: GridOptions): GridApi {
       s = store.get(key);
     cancel();
     // A reload can replace the slot while the editor is open (setRows commits it after store.add). The text stays
-    // typed over the server text the editor opened on, so saving it over someone else's newer text is a conflict,
-    // and an editor left untouched never puts its old text back. Measured against the server text now only when
-    // that is still what the editor opened on (a reload that brought the pending text itself dropped the edit).
+    // typed over the server text the editor opened on, so saving it over someone else's newer text is a conflict
+    // (a '' stored where its language had no label at all included: edBase null), and an editor left untouched never
+    // puts its old text back. Measured against the server text now only where the editor opened on a pending text
+    // that is now the server's (a reload that brought the pending text itself dropped the edit).
     if (!s || v === edFrom || v === store.value(key, l)) return;
     if (l === base && s.baseRequired && !v.trim()) app.toast(`The ${langName(app, base)} label can't be blank.`, 'warn');
     else {
-      store.set(key, l, v, store.original(key, l) === edFrom ? undefined : edBase);
+      store.set(key, l, v, edPending && store.original(key, l) === edFrom ? undefined : edBase);
       // Say it right away rather than at review time; the cell is marked as an error too.
       if (clearing(store, s, l, base) === 'blocked') app.toast(blockedWhy(s, l, base, store.original(key, l), v, textOf(store)), 'warn', undo);
     }

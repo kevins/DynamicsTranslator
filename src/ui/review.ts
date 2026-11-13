@@ -2,25 +2,30 @@
 // component text ("title · what · where") with a word diff per language and Undo; blocked changes in red (skipped,
 // they stay staged); one sentence about others' unpublished work, and one naming everything else the publish
 // publishes, with what can't be checked (scopeText). Publish runs one save (always publishing),
-// checks, and in translation mode refreshes the page (app.refreshPage, ui/refresh.ts). Failures stay in the
+// checks (unpublishedForms: the forms' versions, the published form's labels of the user's language, and the names and
+// tooltips the save gave its columns as Dataverse serves them), and in
+// translation mode refreshes the page (app.refreshPage, ui/refresh.ts). Failures stay in the
 // dialog: Try again, Keep mine / Use theirs, Publish again, Refresh anyway. Also "Recent publishes": each publish opens
 // to show what it changed in the same rows (changeGroup), Undo first shows what it will do to each label, read from the
 // server, and Publish for a save whose publish failed or whose forms stayed unpublished (so it is never stranded).
 
+import { NOT_CUSTOMIZER } from '../core/context';
 import { markPublished } from '../core/history';
 import { guid, isAbort } from '../core/http';
 import { lcidShort } from '../core/lcid';
-import { canClear, keepsEmpty, KIND_NAMES, PROP_NAMES, PublishSet, refusedBlank, savedEmptyText, savesEmpty, standIn, standInsSaid, standInTag, standInWhat, type Change, type ChangeResult, type Kind, type Lcid, type Outcome, type Prop, type Slot, type StandIn, type TextOf } from '../core/model';
+import { canClear, columnKey, isManaged, keepsEmpty, KIND_NAMES, PROP_NAMES, PublishSet, refusedBlank, savedEmptyText, savesEmpty, standIn, standInsSaid, standInTag, standInWhat, type Change, type ChangeResult, type Kind, type Lcid, type Outcome, type Prop, type Slot, type StandIn, type TextOf } from '../core/model';
 import { isLockError, PartialPublishError, publishXml } from '../core/publish';
 import { friendly, undoChange } from '../core/saver';
 import type { Store } from '../core/store';
 import { cellTitle } from '../inspector/describe';
+import { cellLabels } from '../providers/formxml';
+import { columnLabels, showsWritten } from '../providers/metadata';
 import { changeId, type ServerTexts } from '../providers/types';
 import { writeDetails, writesOf } from '../providers/writelog';
 import { h, icon, plural, put, type IconName } from './dom';
 import { langName } from './editor';
 import type { AppApi, HistoryEntry, HistoryItem, Issue, PendingWork, Prepared, SaveReport, SaveRunOptions } from './types';
-import { active, badge, bar, btn, emptyState, errMsg, frag, link, modal, modalOpen, note, spinner } from './widgets';
+import { active, badge, bar, btn, confirm, emptyState, errMsg, frag, link, modal, modalOpen, note, spinner } from './widgets';
 
 /** The dialog's own rules (on top of the shared .rv/.pl/.pr/.iss/.cf/.wd classes of styles.css). */
 const CSS =
@@ -277,6 +282,8 @@ export function asWritten(app: AppApi, cs: readonly Change[]): Map<string, Chang
 const standInNote = (app: AppApi, s: Slot | undefined, l: Lcid, w: Pick<Change, 'before' | 'after' | 'standIn'> | undefined): HTMLElement | null => {
   const from = w?.standIn?.from;
   if (!s || !from) return null;
+  // The field's last label of its own emptied: it follows its column, as the popup's placeholder says.
+  if (w!.standIn!.follow) return rowNote('note', `Shows “${w!.after.trim()}”`);
   return rowNote('note', bareText(w!.after) === bareText(w!.before) ? `Already ${standInWhat(from, l, app.ctx.base)}: nothing changes` : standInTag(s, l, app.ctx.base, from));
 };
 /** Only spaces counts as no text, as the writers compare texts. */
@@ -356,52 +363,214 @@ export function retryable(app: AppApi, results: readonly ChangeResult[]): Change
   return app.store.changes().filter((c) => ids.has(changeId(c)) && app.store.cellStatus(c.slot.key, c.lcid)?.outcome !== 'conflict');
 }
 
-/** Publishes what these saved changes need (Publish again) and marks their journal entries published. */
-export async function publishAgain(app: AppApi, saved: Change[], historyIds: string[], signal?: AbortSignal, onRetry?: (m: string) => void): Promise<void> {
+/** What Publish again did besides publishing (publishAgain). */
+export interface Republished {
+  /** The labels it didn't write again because someone else saved over them since, by change id: theirs to publish. */
+  theirs: Set<string>;
+  /** What those writes told the user (SaveOptions.warn), as a save's report says it. */
+  warning?: string;
+  notice?: string;
+}
+/**
+ * What the writes of a run of publishAgain told (SaveOptions.warn), by level: its caller's, so it outlives a run that
+ * fails, which says nothing more (a label Dataverse dropped that could not be put back is still told).
+ */
+export interface Told {
+  warning: string[];
+  notice: string[];
+}
+/** What a run told (Told), as Republished says it. */
+const toldOf = (t: Told): Omit<Republished, 'theirs'> => ({
+  ...(t.warning.length ? { warning: t.warning.join(' ') } : {}),
+  ...(t.notice.length ? { notice: t.notice.join(' ') } : {}),
+});
+/** Two runs of Publish again as one (Recent publishes › Publish, then its repair): the labels left to others, and what both told. */
+const both = (a: Republished, b: Republished): Republished => {
+  const t = (k: 'warning' | 'notice') => [a[k], b[k]].filter(Boolean).join(' ');
+  return { theirs: new Set([...a.theirs, ...b.theirs]), ...(t('warning') ? { warning: t('warning') } : {}), ...(t('notice') ? { notice: t('notice') } : {}) };
+};
+
+/**
+ * Publishes what these saved changes need (Publish again, Recent publishes › Publish) and marks their journal entries
+ * published. As a save publishes (core/saver.ts): while no UI-language switch window is open (LangSession.quiet), one open
+ * waited for, and none starting meanwhile. The field labels `missing` (saved but not in the published form while its
+ * versions agree: unpublishedForms) and column names and tooltips (saved but not served as saved) are written again
+ * around that publish so that it takes them (SaverApi.writeAgain, LIVE-FINDINGS 117, 118); one whose write failed fails
+ * it, once its publishes have run. The repair's own publish that takes its MARK away again is given a signal that never
+ * aborts (formxml.ts rewrite): Stop doesn't end it. What the writes tell goes to `told`, also when it fails.
+ */
+export async function publishAgain(app: AppApi, saved: Change[], historyIds: string[], signal?: AbortSignal, onRetry?: (m: string) => void, missing: readonly Change[] = [], told: Told = { warning: [], notice: [] }): Promise<Republished> {
   const set = app.saver.publishTargets(saved);
-  if (!set.empty) await publishXml(app.ctx, set, signal, onRetry);
+  const publish = (s = signal) => (set.empty ? Promise.resolve() : app.lang.quiet(() => publishXml(app.ctx, set, s, onRetry), s));
+  const rs = missing.length ? await app.saver.writeAgain([...missing], publish, signal ?? new AbortController().signal, (m, level) => void told[level].push(m)) : (await publish(), []);
+  const bad = rs.find((r) => r.outcome === 'error' || r.outcome === 'skipped');
+  if (bad) throw new Error(bad.message || "A label couldn't be written again.");
   await markPublished(app.ctx, historyIds);
+  return { theirs: new Set(rs.filter((r) => r.outcome === 'conflict').map((r) => changeId(r.change))), ...toldOf(told) };
 }
 
-/** What the forms check after publishing found, by form name. */
+/** What the forms check after publishing found, by form name, and by table name ("Account (table)") for its columns. */
 export interface FormsCheck {
-  /** Forms whose unpublished version is still newer: not published. */
+  /**
+   * Forms not published: their unpublished version is still newer, or they don't show a label as it was saved. Tables
+   * with a column Dataverse doesn't serve a saved name or tooltip of as it was saved (LIVE-FINDINGS 118).
+   */
   left: string[];
-  /** Forms it couldn't read (a read failed, or showed no version): whether they are published is not known. */
+  /** Forms and columns it couldn't read (a read failed, or showed no version): whether they are published is not known. */
   unread: string[];
+  /**
+   * The saved field labels of the user's language that a form of `left` doesn't show as saved while its versions agree,
+   * and the saved column names and tooltips not served as saved: no publish takes them, so Publish again writes them
+   * again first (publishAgain, LIVE-FINDINGS 117, 118).
+   */
+  missing: Change[];
+  /** The published versionnumber of each form found published, by form id. */
+  published: Map<string, string>;
 }
 
 /**
- * The forms among these saved changes that are still unpublished after publishing: their unpublished
- * versionnumber differs from the published one (both are equal once PublishXml has run). One cheap
- * GET pair per form, asked again once after `wait` ms. A form that can't be read is `unread`, never taken for
- * published. Never rejects.
+ * The forms among these saved changes that are still unpublished after publishing: their unpublished versionnumber
+ * differs from the published one (both are equal once PublishXml has run), or, their versions equal, the published form
+ * read in the user's language (LIVE-FINDINGS 52) doesn't show a field label of a column's cell these changes saved in that
+ * language as the save left it, the text written. Seen on a large main form (117): no publish took those labels, with the
+ * versions equal. Labels of other languages can't be read without a switch: their forms are judged
+ * by their versions alone, and so is a label someone else saved over since (`theirs`, by change id: Publish again found
+ * it so), theirs to publish. One cheap GET pair per form, the published one with the definition. With them, one GET per
+ * column whose name or tooltip these changes saved (LIVE-FINDINGS 118: every metadata read of a renamed column kept its
+ * old name after the publish): every language of those it saved served as the save left it (the text written, as its
+ * writer measures it), but for theirs. Each asked again once after `wait` ms. A form's GET pair is sent while no
+ * UI-language switch window of the translator is open, in this tab or another (LangSession.quiet): one answered inside
+ * such a window would carry that window's language only. A form or column that can't be read (a read that fails, or is
+ * stopped while it waits) is `unread`, never taken for published. Never rejects.
  */
-export async function unpublishedForms(app: AppApi, saved: readonly Change[], signal?: AbortSignal, wait = 1000): Promise<FormsCheck> {
+export async function unpublishedForms(app: AppApi, saved: readonly Change[], signal?: AbortSignal, wait = 1000, theirs: ReadonlySet<string> = new Set()): Promise<FormsCheck> {
+  const { user, base } = app.ctx;
   const forms = new Map<string, string>();
-  for (const { slot: s } of saved) if (FORMISH.test(s.kind) && s.ref?.formId) forms.set(guid(s.ref.formId), s.path[1] || 'A form');
-  const differs = async (id: string) => {
-    const [pub, un] = await Promise.all([
-      app.ctx.http.get(`systemforms(${id})?$select=versionnumber`, { signal }),
-      app.ctx.http.get(`systemforms(${id})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=versionnumber`, { signal }),
-    ]);
+  /** Per form, the saved labels of the user's language whose published text it checks. */
+  const labels = new Map<string, Change[]>();
+  /** Per column (`table|column`), its saved names and tooltips whose served texts it checks. */
+  const cols = new Map<string, Change[]>();
+  for (const c of saved) {
+    const s = c.slot;
+    if (s.kind === 'attribute' && s.ref?.entity && s.ref.attribute && !theirs.has(changeId(c))) {
+      const k = `${s.ref.entity}|${s.ref.attribute}`;
+      (cols.get(k) ?? cols.set(k, []).get(k)!).push(c);
+    }
+    if (!FORMISH.test(s.kind) || !s.ref?.formId) continue;
+    const id = guid(s.ref.formId);
+    forms.set(id, s.path[1] || 'A form');
+    if (s.kind === 'field' && c.lcid === user && s.ref.elId && columnKey(s) && !theirs.has(changeId(c))) (labels.get(id) ?? labels.set(id, []).get(id)!).push(c);
+  }
+  /** Whether the published text `t` of a label in the user's language shows `c` as its save left it. */
+  const shows = (c: Change, t: string | undefined): boolean => (t ?? '') === (c.after.trim() ? c.after : '');
+  /** A form as published now: null while its versions differ, else its published version and the labels it doesn't show as saved. */
+  const read = async (id: string): Promise<{ v: string; off: Change[] } | null> => {
+    const [pub, un] = await app.lang.quiet(
+      () =>
+        Promise.all([
+          app.ctx.http.get(`systemforms(${id})?$select=formxml,versionnumber`, { signal }),
+          app.ctx.http.get(`systemforms(${id})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=versionnumber`, { signal }),
+        ]),
+      signal,
+    );
     if (pub?.versionnumber == null || un?.versionnumber == null) throw new Error('No version number.');
-    return String(pub.versionnumber) !== String(un.versionnumber);
+    if (String(pub.versionnumber) !== String(un.versionnumber)) return null;
+    const ls = labels.get(id) ?? [];
+    if (!ls.length) return { v: String(pub.versionnumber), off: [] };
+    const cells = cellLabels(pub.formxml);
+    if (!cells) throw new Error('No form definition.');
+    // A label whose cell is no longer on the form shows nowhere: nothing to publish.
+    return { v: String(pub.versionnumber), off: ls.filter((c) => cells.has(c.slot.ref.elId) && !shows(c, cells.get(c.slot.ref.elId)![user])) };
+  };
+  /** A column as Dataverse serves it now: its saved names and tooltips it doesn't serve as saved. */
+  const column = async (cs: Change[]): Promise<Change[]> => {
+    const got = await columnLabels(app.ctx, cs[0].slot.ref.entity, cs[0].slot.ref.attribute, signal);
+    return cs.filter((c) => !showsWritten(got[c.slot.prop] ?? {}, c, base));
+  };
+  /** `get`, asked again once after `wait` while `done` says it doesn't show the save yet; 'unread' when a read fails. */
+  const twice = async <T>(get: () => Promise<T>, done: (r: T) => boolean): Promise<T | 'unread'> => {
+    try {
+      const r = await get();
+      if (done(r)) return r;
+      await sleep(wait);
+      return await get();
+    } catch {
+      return 'unread';
+    }
   };
   const ids = [...forms.keys()];
-  const found = await Promise.all(
-    ids.map(async (id) => {
-      try {
-        if (!(await differs(id))) return 'ok';
-        await sleep(wait);
-        return (await differs(id)) ? 'left' : 'ok';
-      } catch {
-        return 'unread';
-      }
-    }),
-  );
-  const named = (x: string) => [...new Set(ids.filter((_, i) => found[i] === x).map((id) => forms.get(id)!))];
-  return { left: named('left'), unread: named('unread') };
+  const keys = [...cols.keys()];
+  // The columns beside the forms: one served as saved costs its one GET, and no wait.
+  const [found, served] = await Promise.all([
+    Promise.all(ids.map((id) => twice(() => read(id), (r) => !!r && !r.off.length))),
+    Promise.all(keys.map((k) => twice(() => column(cols.get(k)!), (off) => !off.length))),
+  ]);
+  const named = (x: (r: (typeof found)[number]) => boolean) => [...new Set(ids.filter((_, i) => x(found[i])).map((id) => forms.get(id)!))];
+  const tables = (x: (r: (typeof served)[number]) => boolean) => keys.filter((_, i) => x(served[i])).map((k) => `${tableName(app, cols.get(k)![0].slot.ref.entity)} (table)`);
+  const left = (r: (typeof found)[number]) => r === null || (r !== 'unread' && r.off.length > 0);
+  return {
+    left: [...new Set([...named(left), ...tables((r) => r !== 'unread' && r.length > 0)])],
+    unread: [...new Set([...named((r) => r === 'unread'), ...tables((r) => r === 'unread')])],
+    missing: [...found.flatMap((r) => (r && r !== 'unread' ? r.off : [])), ...served.flatMap((r) => (r === 'unread' ? [] : r))],
+    published: new Map(ids.flatMap((id, i) => {
+      const r = found[i];
+      return r && r !== 'unread' && !r.off.length ? [[id, r.v] as const] : [];
+    })),
+  };
+}
+
+/**
+ * Keeps, for each form the save `rep` wrote and the check after its publish found published (`published`: by form id, its
+ * published version), the answers of which of its field labels are its own for that version (providers/formxml.ts
+ * carryOwnLabels, LIVE-FINDINGS 114), so that a reload after the translator's own publish reads none of them again, and
+ * its labels show right as it starts. Only where those are exact: the form had no other change than this save's
+ * (SaveReport.forms), every change of the save on it went through, and the version the save started from is the one its
+ * labels were loaded at.
+ */
+export function keepOwnLabels(app: AppApi, rep: SaveReport, published: ReadonlyMap<string, string>): void {
+  for (const [id, w] of rep.forms ?? []) {
+    const v = published.get(guid(id));
+    if (!v || w.pending || !w.sent) continue;
+    if (rep.results.some((r) => guid(r.change.slot.ref?.formId) === guid(id) && r.outcome !== 'saved' && r.outcome !== 'unchanged')) continue;
+    const at = [...app.store.slots.values()].find((s) => s.ref?.formVersion && guid(s.ref.formId) === guid(id))?.ref.formVersion;
+    if (at === w.version) app.providers.carryOwnLabels(app.ctx, id, w.version, v, [...w.cells.values()]);
+  }
+}
+
+/** What the Checking step found once it had repaired what it could (checkRepaired). */
+export interface Checked {
+  /** The check after the repair, else the one before it (nothing needed a repair, or the repair failed). */
+  found: FormsCheck;
+  /** The repair ran: the forms and columns were written again and published since the save. */
+  repaired: boolean;
+  /** What the repair's writes told and the labels it left to someone else's save since (publishAgain). */
+  said: Republished;
+  /** Why the repair failed, as Publish again says it (pubFail); '' where it didn't. */
+  error: string;
+}
+
+/**
+ * The Checking step after a publish of these saved changes (unpublishedForms), repairing once, at once, what it finds not
+ * published or not served as saved, before anything is said: Publish again's repair (publishAgain: the labels found
+ * missing written again with MARK after them, a publish of the forms and columns these changes saved, the texts as they
+ * are, a publish, LIVE-FINDINGS 117, 118), then the check again. Only the second check's answer is told, so only what is
+ * still not published after that leaves its form or table "Saved, but not published", with Publish again. `steps` shows it
+ * on the run's steps: `repair` as the publish starts again, `now` for its messages (PublishXml's retries), `check` as the
+ * check starts again. A label someone else saved over since (`theirs`, and those the repair finds so) is theirs to
+ * publish, never written over. Never rejects.
+ */
+export async function checkRepaired(app: AppApi, saved: readonly Change[], historyIds: string[], signal: AbortSignal | undefined, steps: { repair(): void; now(m: string): void; check(): void }, theirs: ReadonlySet<string> = new Set()): Promise<Checked> {
+  const found = await unpublishedForms(app, saved, signal, undefined, theirs);
+  if (!found.left.length) return { found, repaired: false, said: { theirs: new Set() }, error: '' };
+  steps.repair();
+  const told: Told = { warning: [], notice: [] };
+  try {
+    const said = await publishAgain(app, saved.filter((c) => FORMISH.test(c.slot.kind) || c.slot.kind === 'attribute'), historyIds, signal, steps.now, found.missing, told);
+    steps.check();
+    return { found: await unpublishedForms(app, saved, signal, undefined, new Set([...theirs, ...said.theirs])), repaired: true, said, error: '' };
+  } catch (e) {
+    return { found, repaired: true, said: { theirs: new Set(), ...toldOf(told) }, error: pubFail(e) };
+  }
 }
 
 /** Names for "Publishing …": the tables, apps, dashboards and global choices these changes publish, and the processes updated. */
@@ -733,12 +902,16 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
     /** Saved but not published yet (the publish failed, or the forms check found them unpublished), and their journal entries. */
     needPub: [] as Change[],
     needHist: [] as string[],
+    /** Those of them the forms check found missing from the published form while its versions agree, or not served as saved by their column: written again (publishAgain). */
+    stuck: [] as Change[],
     /** Something was published (the page needs a refresh to show it). */
     published: false,
+    /** The check after a publish wrote or published again what a form or column didn't serve (checkRepaired): never "nothing was written". */
+    repaired: false,
     /** Rows that failed or conflicted. */
     probs: [] as ChangeResult[],
     pubErr: '',
-    /** Published, but the forms check couldn't read some forms: not known to be published (they are in needPub). */
+    /** Published, but the forms check couldn't read some forms or columns: not known to be published (they are in needPub). */
     chkErr: '',
     warning: '',
     /** Saved, but the page may not show it yet (a process could not be updated): said, never tried again. */
@@ -767,6 +940,25 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
 
     /** Short reasons of the changes the plan skipped (they stay staged), by change id. */
     const blockedWhy = new Map<string, string>();
+
+    /**
+     * Undo all: every change of the list, those past the ones shown too, after a confirmation, as one undo step (Ctrl+Z
+     * brings them all back). The dialog closes with its last change, as after the Undo of the last row.
+     */
+    const undoAll = async (b: HTMLButtonElement, e: MouseEvent): Promise<void> => {
+      if (e.detail > 1 || st.busy) return;
+      const go = await confirm({
+        title: 'Undo all changes?',
+        body: `All ${plural(store.changes(filter).length, 'change')} in this list go back to the text they had before. Nothing is published. Ctrl+Z brings them back.`,
+        ok: 'Undo all',
+        cancel: 'Not now',
+        danger: true,
+      });
+      if (!go || st.busy || !dlg.isConnected) return keepFocus(b.isConnected ? b : undefined);
+      const all = store.changes(filter);
+      store.group(() => all.forEach((c) => store.revert(c.slot.key, c.lcid)));
+      render();
+    };
 
     // ---- the list of changes ----
     /**
@@ -805,7 +997,8 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
         return {
           lang: ln,
           before: c.before,
-          after: w.after,
+          // The field's last label of its own emptied: empty, as typed; its note says what shows (standInNote).
+          after: w.standIn?.follow ? '' : w.after,
           blankBefore: missingSide(app, c, w),
           tone: why !== undefined ? 'bad' : '',
           end: undo,
@@ -838,13 +1031,15 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
         return { ...row(c), end: all };
       }));
       const rest = gs.slice(CAP).reduce((a, cg) => a + cg.reduce((b, g) => b + g.length, 0), 0);
+      // Without either role (Ctx.customizer) the list is only shown: no Publish, and nothing is checked for it.
+      const may = app.ctx.customizer !== false;
       // What else publishing publishes, checked while the user reads the list, said next to Publish.
       // Publish never outruns it: a click before it answers waits, and goes on by itself only when there is nothing to
       // say; else the sentence (others' work, or that it couldn't check) is read first and the next click publishes.
       const others = h('p', { class: 'pd-o', role: 'status', hidden: true });
       // The whole publish scope, with what can't be checked: shown from the start, so it never needs another click.
-      const scope = plan.send.length ? scopeText(app, plan.send) : '';
-      const checked = plan.send.length ? othersNote(app, plan.send, signal) : Promise.resolve('');
+      const scope = may && plan.send.length ? scopeText(app, plan.send) : '';
+      const checked = may && plan.send.length ? othersNote(app, plan.send, signal) : Promise.resolve('');
       /** The check's sentence once it has answered ('' for nothing to say); null while it runs. */
       let said: string | null = null;
       void checked.then((t) => {
@@ -858,31 +1053,42 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
         for (const [id, m] of plan.blocked) blockedWhy.set(id, m);
         void run(plan.send);
       };
-      const cancel = btn('Cancel', () => close());
-      const pub = btn('Publish', (e) => {
-        if (e.detail > 1 || waiting) return; // a double-click publishes once
-        if (said !== null) return go();
-        waiting = true;
-        put(others, h('span', { class: 'wait' }, spinner(), 'Checking for other unpublished changes…'));
-        others.hidden = false;
-        void checked.then(() => {
-          waiting = false;
-          if (!signal.aborted && said === '') go();
-        });
-      }, 'primary');
-      pub.setAttribute('aria-keyshortcuts', 'Control+Enter');
-      pub.disabled = !plan.send.length;
-      (pub.disabled ? cancel : pub).dataset.af = '';
+      const cancel = may ? btn('Cancel', () => close()) : btn('Close', () => close(), 'primary');
+      // One change has its own Undo; Undo all is there from two.
+      const undoB: HTMLButtonElement | null = changes.length > 1 ? btn('Undo all', (e) => void undoAll(undoB!, e)) : null;
+      const pub = may
+        ? btn('Publish', (e) => {
+            if (e.detail > 1 || waiting) return; // a double-click publishes once
+            if (said !== null) return go();
+            waiting = true;
+            put(others, h('span', { class: 'wait' }, spinner(), 'Checking for other unpublished changes…'));
+            others.hidden = false;
+            void checked.then(() => {
+              waiting = false;
+              if (!signal.aborted && said === '') go();
+            });
+          }, 'primary')
+        : null;
+      if (pub) {
+        pub.setAttribute('aria-keyshortcuts', 'Control+Enter');
+        pub.disabled = !plan.send.length;
+      }
+      (pub && !pub.disabled ? pub : cancel).dataset.af = '';
       ctrlEnter = pub;
       const top = ui.querySelector('.dlg-body')?.scrollTop ?? 0;
+      // Changes to labels from managed solutions (this session allows them, Ctx.managedEdits): what publishing them does.
+      const mg = may ? plan.send.filter((c) => isManaged(c.slot)).length : 0;
       put(ui,
         h('div', { class: 'dlg-body' },
-          h('p', { class: 'pd-sub' }, page ? "They're saved and published, then the page refreshes so you see them." : "They're saved and published."),
+          may ? h('p', { class: 'pd-sub' }, page ? "They're saved and published, then the page refreshes so you see them." : "They're saved and published.") : note('warn', NOT_CUSTOMIZER, 'amb'),
+          mg
+            ? note('warn', mg === 1 ? '1 change is to a label from a managed solution: it adds an unmanaged layer on top of its solution.' : `${mg} changes are to labels from managed solutions: each adds an unmanaged layer on top of its solution.`, 'amb')
+            : null,
           plan.notes.length ? h('div', { class: 'pd-gn' }, plan.notes.map((n) => h('div', { class: 'iss note' }, icon('info'), h('span', null, n)))) : null,
           gs.slice(0, CAP).map((cg) => changeGroup({ ...header(app, cg), rows: rows(cg) })),
-          rest ? h('p', { class: 'quiet' }, `and ${plural(rest, 'more change')}. They're published too.`) : null,
+          rest ? h('p', { class: 'quiet' }, may ? `and ${plural(rest, 'more change')}. They're published too.` : `and ${plural(rest, 'more change')}.`) : null,
         ),
-        h('div', { class: 'dlg-actions' }, h('div', { class: 'pd-ow' }, others, scope ? h('p', { class: 'pd-sc' }, scope) : null), cancel, pub),
+        h('div', { class: 'dlg-actions' }, may ? h('div', { class: 'pd-ow' }, others, scope ? h('p', { class: 'pd-sc' }, scope) : null) : null, undoB, cancel, pub),
       );
       const body = ui.querySelector('.dlg-body');
       if (body) body.scrollTop = top;
@@ -922,41 +1128,81 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
       keepFocus();
     };
 
-    /** Publishes what earlier runs saved but could not publish. */
-    const republish = async (p: Progress, signal: AbortSignal): Promise<void> => {
-      if (!S.needPub.length) return;
+    /**
+     * Publishes what earlier runs saved but could not publish, writing again first the labels the check found missing
+     * from the published form or not served by their column (S.stuck). The labels someone else saved over since, which
+     * it left alone, by change id.
+     */
+    const republish = async (p: Progress, signal: AbortSignal): Promise<ReadonlySet<string>> => {
+      if (!S.needPub.length) return new Set();
       S.chkErr = ''; // its forms are published and checked again
       p.pub?.set('run');
+      const told: Told = { warning: [], notice: [] };
       try {
-        await publishAgain(app, S.needPub, S.needHist, signal, (m) => p.pub?.now(m));
+        const r = await publishAgain(app, S.needPub, S.needHist, signal, (m) => p.pub?.now(m), S.stuck, told);
         S.published = true;
         S.needPub = [];
         S.needHist = [];
+        S.stuck = [];
         S.pubErr = '';
+        if (r.warning) S.warning = [S.warning, r.warning].filter(Boolean).join(' ');
+        if (r.notice) S.notice = [S.notice, r.notice].filter(Boolean).join(' ');
         if (last) last = { ...last, published: true, publishError: undefined };
+        return r.theirs;
       } catch (e) {
         S.pubErr = pubFail(e);
+        // What its writes told before it failed.
+        const t = toldOf(told);
+        if (t.warning) S.warning = [S.warning, t.warning].filter(Boolean).join(' ');
+        if (t.notice) S.notice = [S.notice, t.notice].filter(Boolean).join(' ');
+        return new Set();
       }
     };
 
     /**
-     * The Checking step: what the saver verified, and that the forms really are published. Forms still unpublished,
-     * or that it couldn't read (never taken for published), make their changes "saved, not published" again, journal
-     * entries (`ids`) included, so Publish again (and Recent publishes › Publish once this dialog is closed) can
-     * publish and check them.
+     * The Checking step: what the saver verified, and that the forms and the columns really are published. After a publish
+     * the user started (`o.repair`: Publish, Try again), what it finds not published or not served as saved is repaired
+     * at once, once, on the Publishing and Checking steps, and checked again (checkRepaired); Publish again is that repair
+     * itself, so its check only says what it finds. Forms and columns still unpublished, or that it couldn't read (never
+     * taken for published), make their changes "saved, not published" again, journal entries (`ids`) included, so
+     * Publish again (and Recent publishes › Publish once this dialog is closed) can publish and check them; the labels a
+     * form or column doesn't show as saved are written again then (S.stuck). `o.theirs`: labels Publish again left to
+     * someone else's save (unpublishedForms). After the save `o.rep`, the forms found published keep the answers of which
+     * field labels are their own (keepOwnLabels), but after a repair: the labels it wrote again are not the save's alone,
+     * so the page reads those answers again.
      */
-    const check = async (p: Progress, cs: Change[], ids: string[], signal: AbortSignal): Promise<void> => {
+    const check = async (p: Progress, cs: Change[], ids: string[], signal: AbortSignal, o: { theirs?: ReadonlySet<string>; rep?: SaveReport; repair?: boolean } = {}): Promise<void> => {
       p.chk.set('run');
-      const { left, unread } = await unpublishedForms(app, cs, signal);
-      if (left.length) S.pubErr = `${and(left)} still ${left.length === 1 ? 'has' : 'have'} unpublished changes.`;
+      const steps = {
+        repair: () => {
+          p.chk.set('wait');
+          p.pub?.set('run');
+        },
+        now: (m: string) => p.pub?.now(m),
+        check: () => {
+          p.pub?.set('ok');
+          p.chk.set('run');
+        },
+      };
+      const { found, repaired, said, error } = o.repair
+        ? await checkRepaired(app, cs, ids, signal, steps, o.theirs)
+        : { found: await unpublishedForms(app, cs, signal, undefined, o.theirs), repaired: false, said: { theirs: new Set<string>() }, error: '' };
+      const { left, unread, missing, published } = found;
+      if (repaired) S.repaired = true;
+      if (repaired && !error) S.published = true;
+      if (said.warning) S.warning = [S.warning, said.warning].filter(Boolean).join(' ');
+      if (said.notice) S.notice = [S.notice, said.notice].filter(Boolean).join(' ');
+      if (left.length) S.pubErr = error || `${and(left)} still ${left.length === 1 ? 'has' : 'have'} unpublished changes.`;
       if (unread.length) S.chkErr = unreadText(unread, 'Publish again to publish');
       if (left.length || unread.length) {
-        S.needPub.push(...cs.filter((c) => FORMISH.test(c.slot.kind)));
+        S.needPub.push(...cs.filter((c) => FORMISH.test(c.slot.kind) || c.slot.kind === 'attribute'));
         S.needHist.push(...ids);
+        S.stuck.push(...missing);
         await markPublished(app.ctx, ids, false);
         if (left.length) p.pub?.set('bad');
         p.chk.set('bad');
       } else p.chk.set('ok');
+      if (o.rep && !repaired) keepOwnLabels(app, o.rep, published);
     };
 
     const run = async (cs: Change[]): Promise<void> => {
@@ -1026,21 +1272,31 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
         S.needHist.push(...hist);
         p.pub?.set('bad');
       } else {
-        if (rep?.published && doneNow.length) S.published = true;
-        // What an earlier run saved but could not publish goes out now too, and is checked with the rest.
-        const prev = { cs: S.needPub, ids: S.needHist };
-        if (!ac.signal.aborted) await republish(p, ac.signal);
-        const repub = S.needPub.length ? { cs: [], ids: [] } : prev;
-        if (S.pubErr) p.pub?.set('bad');
-        else if (S.published) p.pub?.set('ok');
-        if (!S.pubErr && (doneNow.length || repub.cs.length)) await check(p, [...doneNow, ...repub.cs], [...hist, ...repub.ids], ac.signal);
-        else if (!S.pubErr && !bad.length) p.chk.set('ok'); // nothing new to check: already on the server
+        // Publishing holds the org's customization lock until the check and its repair are over, as Publish again does: no
+        // other save starts meanwhile, and the page's read of which field labels are the form's own (inspector/pageload.ts)
+        // opens no language switch window before then. Taken as the save ends, before anything else runs; one a save
+        // running elsewhere holds (the saver refused this one) is left to it.
+        const held = !store.busy;
+        if (held) store.setBusy(true, 'Publishing');
+        try {
+          if (rep?.published && doneNow.length) S.published = true;
+          // What an earlier run saved but could not publish goes out now too, and is checked with the rest.
+          const prev = { cs: S.needPub, ids: S.needHist };
+          const theirs = ac.signal.aborted ? undefined : await republish(p, ac.signal);
+          const repub = S.needPub.length ? { cs: [], ids: [] } : prev;
+          if (S.pubErr) p.pub?.set('bad');
+          else if (S.published) p.pub?.set('ok');
+          if (!S.pubErr && (doneNow.length || repub.cs.length)) await check(p, [...doneNow, ...repub.cs], [...hist, ...repub.ids], ac.signal, { theirs, rep: rep ?? undefined, repair: true });
+          else if (!S.pubErr && !bad.length) p.chk.set('ok'); // nothing new to check: already on the server
+        } finally {
+          if (held) store.setBusy(false);
+        }
       }
       busy(false);
       void settle(p);
     };
 
-    /** Publish again: publishes what was saved but not published, then checks. */
+    /** Publish again: publishes what was saved but not published (republish), then checks. */
     const again = async (): Promise<void> => {
       if (store.busy) return app.toast('Publishing can start once the save running now has finished. Try again in a moment.', 'warn');
       busy(true);
@@ -1050,17 +1306,18 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
       const ids = S.needHist;
       const p = progress(null, cs);
       showProgress(p, null);
-      // Publishing holds the org's customization lock: no other save starts meanwhile.
+      // Publishing holds the org's customization lock: no other save starts meanwhile. Held through the check too, so the
+      // page's read of which field labels are the form's own opens no language switch window before it is over.
       store.setBusy(true, 'Publishing');
       try {
-        await republish(p, ac.signal);
+        const theirs = await republish(p, ac.signal);
+        if (S.pubErr) p.pub?.set('bad');
+        else {
+          p.pub?.set('ok');
+          await check(p, cs, ids, ac.signal, { theirs });
+        }
       } finally {
         store.setBusy(false);
-      }
-      if (S.pubErr) p.pub?.set('bad');
-      else {
-        p.pub?.set('ok');
-        await check(p, cs, ids, ac.signal);
       }
       busy(false);
       void settle(p);
@@ -1087,7 +1344,7 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
       const said = n
         ? `Done. Published ${plural(n, 'change')}.${already ? ` ${already}, so Undo of this publish leaves ${f === 1 ? 'it' : 'them'} alone.` : ''}`
         : already
-          ? `Done. ${already}: nothing was written.`
+          ? `Done. ${already}${S.repaired ? '.' : ': nothing was written.'}`
           : 'Done. Nothing needed publishing.';
       if (page && S.published && auto) {
         h3.textContent = 'Published';
@@ -1132,7 +1389,7 @@ export async function openReview(app: AppApi, filter?: (s: Slot) => boolean): Pr
         return {
           lang: langName(app, c.lcid),
           before: c.before,
-          after: w.after,
+          after: w.standIn?.follow ? '' : w.after,
           blankBefore: missingSide(app, c, w),
           tone: conflict || msg ? 'bad' : '',
           // A failed metadata row: what this page sent and Dataverse answered for its component, for support.
@@ -1468,6 +1725,30 @@ function undoRunner(app: AppApi, ui: HTMLElement, dlg: HTMLElement, close: () =>
           }
         },
       });
+      // Said live only once checked, as Publish here does (checkRepaired): what a form or column doesn't serve as the undo
+      // saved it (LIVE-FINDINGS 117, 118) is repaired at once, once; still not, or not known, the undo's entry stays "Not
+      // published", so its Publish can publish and check it again.
+      const cs = rep.published && !rep.publishError ? rep.results.filter((r) => r.outcome === 'saved' || r.outcome === 'unchanged').map((r) => r.change) : [];
+      if (cs.length) {
+        const ids = rep.historyId ? [rep.historyId] : [];
+        const held = !app.store.busy;
+        if (held) app.store.setBusy(true, 'Publishing');
+        try {
+          pub.set('run');
+          const steps = { repair: () => pub.set('run'), now: (m: string) => pub.now(m), check: () => pub.set('run') };
+          const { found, said, error } = await checkRepaired(app, cs, ids, ac.signal, steps);
+          const { left, unread } = found;
+          const problem = error
+            ? `Publishing failed: ${error}`
+            : [left.length ? `${and(left)} still ${left.length === 1 ? 'has' : 'have'} unpublished changes.` : '', unread.length ? unreadText(unread, 'Publish') : ''].filter(Boolean).join(' ');
+          if (problem) await markPublished(app.ctx, ids, false);
+          pub.set(problem ? 'bad' : 'ok');
+          const join = (a?: string, b?: string) => [a, b].filter(Boolean).join(' ') || undefined;
+          rep = { ...rep, ...(problem ? { publishError: problem } : {}), warning: join(rep.warning, said.warning), notice: join(rep.notice, said.notice) };
+        } finally {
+          if (held) app.store.setBusy(false);
+        }
+      }
     } catch (e) {
       err = e;
     } finally {
@@ -1789,21 +2070,39 @@ function undoRunner(app: AppApi, ui: HTMLElement, dlg: HTMLElement, close: () =>
     dlg.focus();
     pub.set('run');
     let err = '';
-    let found: FormsCheck = { left: [], unread: [] };
+    let found: FormsCheck = { left: [], unread: [], missing: [], published: new Map() };
+    let said: Republished = { theirs: new Set() };
+    const told: Told = { warning: [], notice: [] };
+    let back = false;
     // Publishing holds the org's customization lock: no other save starts meanwhile.
     app.store.setBusy(true, 'Publishing');
     try {
-      await publishAgain(app, cs, [e.id], ac.signal, (m) => pub.now(m));
+      // The labels the check after this save found missing from the published form while its versions agree, or not
+      // served as saved by their column, are written again around the publish (LIVE-FINDINGS 117, 118): found first, by
+      // the same check without its wait.
+      const { missing } = await unpublishedForms(app, cs, ac.signal, 0);
+      said = await publishAgain(app, cs, [e.id], ac.signal, (m) => pub.now(m), missing, told);
+      back = true;
       pub.set('ok');
       chk.set('run');
-      found = await unpublishedForms(app, cs, ac.signal);
-      // Still unpublished, or not known to be published: the entry stays "Not published", so this can be tried again later.
-      const stays = found.left.length + found.unread.length > 0;
+      // What the check still finds not published or not served is repaired at once, once, before anything is said, as the
+      // Publish dialog does (checkRepaired).
+      const steps = { repair: () => (chk.set('wait'), pub.set('run')), now: (m: string) => pub.now(m), check: () => (pub.set('ok'), chk.set('run')) };
+      const r = await checkRepaired(app, cs, [e.id], ac.signal, steps, said.theirs);
+      found = r.found;
+      said = both(said, r.said);
+      err = r.error;
+      if (err) pub.set('bad');
+      // Still unpublished, not known to be published, or its repair failed: the entry stays "Not published", so this can be
+      // tried again later.
+      const stays = !!err || found.left.length + found.unread.length > 0;
       if (stays) await markPublished(app.ctx, [e.id], false);
       chk.set(stays ? 'bad' : 'ok');
     } catch (x) {
       err = pubFail(x);
       pub.set('bad');
+      // What the labels written again told before publishAgain failed.
+      if (!back) said = { ...said, ...toldOf(told) };
     } finally {
       app.store.setBusy(false);
       busy(false);
@@ -1820,6 +2119,9 @@ function undoRunner(app: AppApi, ui: HTMLElement, dlg: HTMLElement, close: () =>
       h('div', { class: 'dlg-body' },
         list,
         ok ? h('p', { class: 'pd-done', role: 'status' }, 'Done. Refresh the page to see the changes.') : note('warn', problem, 'amb'),
+        // What the labels written again told (publishAgain), as the Publish dialog says a save's.
+        said.warning ? note('error', said.warning, 'bad') : null,
+        said.notice ? note('warn', said.notice, 'amb') : null,
       ),
       h('div', { class: 'dlg-actions' }, tryB, ok ? btn('Refresh page', () => void app.refreshPage()) : null, closeB),
     );
@@ -1878,19 +2180,21 @@ export function openHistory(app: AppApi): void {
     };
     // The details' ids are unique in the shadow root the other dialogs share.
     const uid = 'pd' + Math.random().toString(36).slice(2, 8);
+    // Without either role (Ctx.customizer) the publishes are only shown: no Publish, no Undo.
+    const may = app.ctx.customizer !== false;
     const row = (e: HistoryEntry, i: number) => {
       const at = when(e.at);
       const titles = [...new Set(e.items.map((x) => x.title))];
       // A publish that only named sitemap items has nothing Undo could write (namings): no Undo, a line says why.
       const fixed = namings(e.items, app.ctx.base);
       const only = fixed.size > 0 && e.items.every((it) => fixed.has(itemId(it)));
-      const undo = only ? null : btn('Undo', () => void R.undoEntry(e), 'sm');
+      const undo = only || !may ? null : btn('Undo', () => void R.undoEntry(e), 'sm');
       if (undo) {
         undo.disabled = !!e.undoneAt || !e.items.length;
         undo.setAttribute('aria-label', `Undo the publish of ${at}`);
       }
       // Saved, but its publish failed (or its forms stayed unpublished): publish it from here.
-      const pub = !e.undoneAt && !e.published && e.items.length ? btn('Publish', () => void R.publishEntry(e), 'sm') : null;
+      const pub = may && !e.undoneAt && !e.published && e.items.length ? btn('Publish', () => void R.publishEntry(e), 'sm') : null;
       if (pub) pub.setAttribute('aria-label', `Publish the ${plural(e.items.length, 'label')} saved ${at}`);
       const panel = h('div', { class: 'pd-hd', id: `${uid}-${i}`, role: 'region', 'aria-label': `What the publish of ${at} changed`, hidden: true });
       const open = h('button', { class: 'pd-ht', type: 'button', 'aria-expanded': 'false', 'aria-controls': panel.id },
@@ -1911,7 +2215,7 @@ export function openHistory(app: AppApi): void {
       );
     };
     put(ui,
-      h('div', { class: 'dlg-body' }, list.length ? list.map(row) : emptyState('history', 'No publishes yet', 'What you publish with the translator in this environment is listed here, so you can see it and undo it.')),
+      h('div', { class: 'dlg-body' }, may ? null : note('warn', NOT_CUSTOMIZER, 'amb'), list.length ? list.map(row) : emptyState('history', 'No publishes yet', 'What you publish with the translator in this environment is listed here, so you can see it and undo it.')),
       h('div', { class: 'dlg-actions' }, btn('Close', () => close(), 'primary')),
     );
     return ui;

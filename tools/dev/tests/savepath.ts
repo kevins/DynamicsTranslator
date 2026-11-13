@@ -5,15 +5,16 @@
 // what the dialog does after a run (Try again, Publish again, the forms check) and the refresh (ui/refresh.ts:
 // the purge of every cache that holds labels or the language, the reload without the warm boot, the questions
 // before reloading, "Show Dynamics in", the check after it).
+import { NOT_CUSTOMIZER } from '../../../src/core/context';
 import { readHistory } from '../../../src/core/history';
 import { DvError, type BatchPart, type PartResult } from '../../../src/core/http';
 import { toLabels } from '../../../src/core/labels';
-import { canClear, keepsEmpty, MANAGED, PublishSet, savesEmpty, sourceUnsaved, type Change, type ChangeResult, type Kind, type Lcid, type Slot } from '../../../src/core/model';
-import { publishTargets } from '../../../src/core/publish';
+import { canClear, keepsEmpty, MANAGED, managedSlot, PublishSet, savesEmpty, sourceUnsaved, type Change, type ChangeResult, type Kind, type Lcid, type Prop, type Slot } from '../../../src/core/model';
+import { publishTargets, publishXml } from '../../../src/core/publish';
 import { createSaver } from '../../../src/core/saver';
 import { Store } from '../../../src/core/store';
 import { shownLanguage } from '../../../src/core/uilang';
-import { changeId, type SaveOptions, type Writer } from '../../../src/providers/types';
+import { changeId, type FormWrite, type SaveOptions, type Writer } from '../../../src/providers/types';
 import { createIo } from '../../../src/io/workbook';
 import { bpfWriter } from '../../../src/providers/bpf';
 import { metadataWriters } from '../../../src/providers/metadata';
@@ -59,6 +60,19 @@ export interface Rig {
   unreadable?: string;
   /** versionnumber per form id: [published, unpublished]; a form missing here can't be read. */
   versions: Map<string, [number, number]>;
+  /** The published definition of a form by id, as the forms check reads it in the user's language (none: its read brings no formxml). */
+  published: Map<string, string>;
+  /** A column's names and tooltips by language as Dataverse serves them, by `table|column` (none: its read fails); each read of one as `table|column` and its Consistency header. */
+  columns: Map<string, { DisplayName: Record<number, string>; Description: Record<number, string> }>;
+  columnReads: string[];
+  /** Each Writer.again call (Publish again's repair): the change ids it was given. `onAgain` runs between its two publishes; `againSays`, what it tells the user. */
+  again: string[][];
+  onAgain?: () => void;
+  againSays?: string;
+  /** What a save()'s writer tells the user after the save (SaveOptions.warn, a notice). */
+  saveSays?: string;
+  /** What the writer tells the saver of the forms it writes (SaveOptions.forms). */
+  forms?: Map<string, FormWrite>;
   /** Which of a save()'s writes a change goes out in (Writer.pass); unset, every change of a group is in one write. */
   pass?: Writer['pass'];
   add(kind: Kind, key: string, labels: Record<number, string>, o?: Partial<Slot>): Slot;
@@ -76,6 +90,10 @@ export function rig(t: Kit): Rig {
   const failOnce = new Set<string>();
   const landOnce = new Set<string>();
   const versions = new Map<string, [number, number]>();
+  const published = new Map<string, string>();
+  const columns: Rig['columns'] = new Map();
+  const columnReads: string[] = [];
+  const labelOf = (l: Record<number, string>) => ({ LocalizedLabels: Object.entries(l).map(([k, v]) => ({ Label: v, LanguageCode: Number(k) })) });
   let running = 0;
   // The journal lives in localStorage (absent in Node): a private one for this rig.
   const g = globalThis as { localStorage?: unknown };
@@ -96,11 +114,22 @@ export function rig(t: Kit): Rig {
       if (R.unreadable) throw new Error(R.unreadable);
       return new Map(cs.map((c) => [changeId(c), server.get(changeId(c)) ?? ''] as const));
     },
+    // Publish again's repair: what it was given, a publish, `onAgain`, a publish; every label written.
+    async again(_ctx, cs: Change[], o: SaveOptions, publish: () => Promise<void>): Promise<ChangeResult[]> {
+      R.again!.push(cs.map(changeId));
+      await publish();
+      R.onAgain?.();
+      if (R.againSays) o.warn?.(R.againSays, 'notice');
+      await publish();
+      return cs.map((change) => ({ change, outcome: 'saved' }));
+    },
     async save(_ctx, cs: Change[], o: SaveOptions): Promise<ChangeResult[]> {
       running++;
       t.ok(running === 1, 'two writes at once');
       try {
+        for (const [id, w] of R.forms ?? []) o.forms?.set(id, w);
         for (const m of R.say ?? []) o.progress(m);
+        if (R.saveSays) o.warn?.(R.saveSays, 'notice');
         await tick();
         if (cs.some((c) => c.slot.kind === 'ribbon') && !o.allowPublish)
           return cs.map((change) => ({ change, outcome: 'error', message: 'Classic button labels can only be saved with publishing turned on.' }));
@@ -148,24 +177,35 @@ export function rig(t: Kit): Rig {
     },
   });
   const writers = [writer(['attribute', 'field', 'tab', 'entity', 'command'], 'metadata'), writer(['ribbon'], 'ribbon')];
-  const R: Partial<Rig> = { publishFails: 0 };
+  const R: Partial<Rig> = { publishFails: 0, again: [] };
+  /** quiet() jobs running (the LangSession stand-in): every publish runs in one, so no language switch starts meanwhile. */
+  let quiet = 0;
   const http = {
     stats: {},
     post: async (fn: string, body: { ParameterXml?: string }) => {
       t.ok(running === 0, 'publishing while a write runs');
       if (fn !== 'PublishXml') return;
+      t.ok(quiet > 0, 'publishing outside a quiet() job: a language switch could start meanwhile');
       if (R.publishFails! > 0) {
         R.publishFails!--;
         throw new Error('The publish failed on the server.');
       }
       posts.push(body.ParameterXml || '');
     },
-    get: async (url: string) => {
-      // The Publish dialog's forms check: published and unpublished versionnumber.
-      const m = /^systemforms\(([^)]+)\)(\/Microsoft\.Dynamics\.CRM\.RetrieveUnpublished\(\))?\?\$select=versionnumber$/.exec(url);
+    get: async (url: string, o?: { headers?: Record<string, string> }) => {
+      // The check after publishing: a column as Dataverse serves it.
+      const col = /^EntityDefinitions\(LogicalName='(\w+)'\)\/Attributes\(LogicalName='(\w+)'\)\?\$select=DisplayName,Description$/.exec(url);
+      if (col) {
+        columnReads.push(`${col[1]}|${col[2]} ${o?.headers?.Consistency ?? ''}`);
+        const x = columns.get(`${col[1]}|${col[2]}`);
+        if (!x) throw new Error('404 ' + url);
+        return { DisplayName: labelOf(x.DisplayName), Description: labelOf(x.Description) };
+      }
+      // The Publish dialog's forms check: the published versionnumber with the definition, and the unpublished one.
+      const m = /^systemforms\(([^)]+)\)(?:\?\$select=formxml,versionnumber|(\/Microsoft\.Dynamics\.CRM\.RetrieveUnpublished\(\))\?\$select=versionnumber)$/.exec(url);
       const v = m && versions.get(m[1]);
       if (!v) throw new Error('404 ' + url);
-      return { versionnumber: m![2] ? v[1] : v[0] };
+      return m![2] ? { versionnumber: v[1] } : { versionnumber: v[0], ...(published.has(m![1]) ? { formxml: published.get(m![1]) } : {}) };
     },
     all: async (url: string) => {
       // The saver's pending-work check: unpublished forms of the tables (RetrieveUnpublishedMultiple).
@@ -177,8 +217,18 @@ export function rig(t: Kit): Rig {
   };
   const ctx = { base: EN, user: EN, orgId: 'savepath', langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }], http };
   const prefs = { target: FR, shown: [EN, FR] };
-  const app = { ctx, store, prefs, toast() {} } as unknown as AppApi;
-  const lang = { restore: async () => {}, quiet: <T>(fn: () => Promise<T>) => fn() };
+  const lang = {
+    restore: async () => {},
+    quiet: async <T>(fn: () => Promise<T>) => {
+      quiet++;
+      try {
+        return await fn();
+      } finally {
+        quiet--;
+      }
+    },
+  };
+  const app = { ctx, store, prefs, toast() {}, lang } as unknown as AppApi;
   app.saver = createSaver(app.ctx, store, lang as unknown as AppApi['lang'], (k) => writers.find((w) => w.kinds.includes(k)));
 
   return Object.assign(R, {
@@ -191,6 +241,9 @@ export function rig(t: Kit): Rig {
     failOnce,
     landOnce,
     versions,
+    published,
+    columns,
+    columnReads,
     add(kind: Kind, key: string, labels: Record<number, string>, o: Partial<Slot> = {}) {
       const s = { ...t.slot(kind, key, { ...labels }), entity: 'acc', group: key, ref: {}, baseRequired: true, ...o } as Slot;
       for (const [l, v] of Object.entries(labels)) server.set(`${key}#${l}`, v);
@@ -282,7 +335,10 @@ function processes(t: Kit, r: Rig): Procs {
     },
     post: async (fn: string, body: { ParameterXml?: string; EntityMoniker?: Record<string, string>; AttributeName?: string; Labels?: Array<{ Label: string; LanguageCode: number }> }) => {
       await tick();
-      if (fn === 'PublishXml') return void (P.log.push('publish'), r.posts.push(body.ParameterXml || ''));
+      if (fn === 'PublishXml') {
+        t.ok(quiet > 0, 'publishing outside a quiet() job: a language switch could start meanwhile');
+        return void (P.log.push('publish'), r.posts.push(body.ParameterXml || ''));
+      }
       if (fn !== 'SetLocLabels') return;
       const k = `${body.EntityMoniker!.workflowid ?? body.EntityMoniker!.savedqueryid}|${body.AttributeName}`;
       const now = { ...P.labels.get(k) };
@@ -335,7 +391,8 @@ function processes(t: Kit, r: Rig): Procs {
     },
   };
   const writers = [recordsWriter, bpfWriter];
-  r.app.saver = createSaver(r.app.ctx, r.store, lang as unknown as AppApi['lang'], (k) => writers.find((w) => w.kinds.includes(k)));
+  r.app.lang = lang as unknown as AppApi['lang'];
+  r.app.saver = createSaver(r.app.ctx, r.store, r.app.lang, (k) => writers.find((w) => w.kinds.includes(k)));
   const rec = (kind: Kind, id: string, prop: 'Name' | 'Description', table: string, entitySet: string, title: string) => {
     const column = prop.toLowerCase();
     return {
@@ -1007,10 +1064,11 @@ export function register(t: Kit): void {
     r.versions.set('f1', [10, 12]);
     r.versions.set('f2', [20, 20]);
     const cs = [a, b, c, d].map((slot) => ({ slot, lcid: FR, before: '', after: 'x' }));
-    t.eq(await unpublishedForms(r.app, cs, undefined, 0), { left: ['Main form'], unread: ['Card form'] });
+    const said = (x: Awaited<ReturnType<typeof unpublishedForms>>) => [x.left, x.unread, x.missing.length, [...x.published]];
+    t.eq(said(await unpublishedForms(r.app, cs, undefined, 0)), [['Main form'], ['Card form'], 0, [['f2', '20']]]);
     r.versions.set('f1', [13, 13]);
     r.versions.set('f3', [5, 5]);
-    t.eq(await unpublishedForms(r.app, cs, undefined, 0), { left: [], unread: [] });
+    t.eq(said(await unpublishedForms(r.app, cs, undefined, 0)), [[], [], 0, [['f1', '13'], ['f2', '20'], ['f3', '5']]]);
     // Refused (403), throttled past Http's own retries (429), unreachable, or answered without a version.
     const http = r.app.ctx.http as unknown as { get: (url: string) => Promise<unknown> };
     for (const fail of [new DvError('You do not have permission to do this.', 403), new DvError('Rate limit exceeded.', 429), new DvError('Could not reach Dataverse (network error).', 0, 'network'), null]) {
@@ -1019,8 +1077,62 @@ export function register(t: Kit): void {
         if (fail) throw fail;
         return {};
       };
-      t.eq(await unpublishedForms(r.app, cs, undefined, 0), { left: [], unread: ['Quick form'] }, String(fail?.status ?? 'no version'));
+      t.eq(said(await unpublishedForms(r.app, cs, undefined, 0)).slice(0, 2), [[], ['Quick form']], String(fail?.status ?? 'no version'));
     }
+  });
+
+  run("the forms check, the versions equal: a form whose published definition, read in the user's language, doesn't show a field label of a column's cell saved in that language as the save left it is not published (LIVE-FINDINGS 117), the label named for Publish again; other languages, a label someone else saved over since and a cell no longer on the form are left to the versions; a definition it can't read is not known", async (r) => {
+    r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }, { prop: 'DisplayName' });
+    const cell = (id: string, en: string) => r.add('field', `field|f1|${id}|Label`, { [EN]: en, [FR]: 'Nom' }, { path: ['Account', 'Main form'], ref: { formId: 'f1', elId: id, datafield: 'name', controlId: 'name' } });
+    const [c1, c3] = [cell('c1', 'Name'), cell('c3', 'Name')];
+    const typed: Change = { slot: c1, lcid: EN, before: 'Name', after: 'Client' };
+    const french: Change = { slot: c3, lcid: FR, before: 'Nom', after: 'Nom client' };
+    const shows = (c1en: string, c2en: string, more = '') =>
+      `<form><tabs><tab id="{t1}"><columns><column><sections><section id="{s1}"><rows>${[['c1', c1en], ['c2', c2en], ['c3', 'Name']].map(([id, en]) => `<row><cell id="{${id}}"><labels><label description="${en}" languagecode="1033" /></labels><control id="name" datafieldname="name" /></cell></row>`).join('')}${more}</rows></section></sections></column></columns></tab></tabs></form>`;
+    r.versions.set('f1', [6, 6]);
+    const check = async (cs: Change[], theirs?: Set<string>) => {
+      const x = await unpublishedForms(r.app, cs, undefined, 0, theirs);
+      return [x.left, x.unread, x.missing.map(changeId)];
+    };
+    r.published.set('f1', shows('Name', 'Name'));
+    t.eq(await check([typed, french]), [['Main form'], [], [`${c1.key}#${EN}`]], 'the typed text missing');
+    t.eq(await check([typed], new Set([`${c1.key}#${EN}`])), [[], [], []], 'someone else saved over it since: theirs');
+    r.published.set('f1', shows('Client', 'Nom complet'));
+    t.eq(await check([typed, french]), [[], [], []], 'published; French is left to the versions');
+    r.published.set('f1', shows('Client', 'Name').replace(/<row><cell id="\{c1\}">.*?<\/row>/, ''));
+    t.eq(await check([typed]), [[], [], []], 'a cell no longer on the form: nothing to publish');
+    r.versions.set('f1', [6, 7]);
+    t.eq(await check([typed]), [['Main form'], [], []], 'the versions differ: no label read');
+    r.versions.set('f1', [7, 7]);
+    r.published.set('f1', '<form');
+    t.eq(await check([typed]), [[], ['Main form'], []], "a definition it can't read");
+    t.eq(await check([french]), [[], [], []], 'nothing of the user’s language to read it for');
+  });
+
+  run("the check reads each column a save renamed or gave a tooltip once, strong, every language (LIVE-FINDINGS 118): a name or tooltip Dataverse doesn't serve as the save left it (the text written; one saved empty only as a '' stored) is not published, its table named and the label named for Publish again; one served as saved, or someone else's since, is; a read that fails is not known", async (r) => {
+    r.add('entity', 'entity|acc|DisplayName', { [EN]: 'Account' }, { title: 'Account' });
+    const col = (prop: Prop, labels: Record<number, string>) => r.add('attribute', `attribute|acc.name|${prop}`, labels, { prop, ref: { entity: 'acc', attribute: 'name' } });
+    const dn = col('DisplayName', { [EN]: 'Name', [FR]: 'Nom' });
+    const tip = col('Description', { [EN]: 'The name', [FR]: 'Le nom' });
+    const renamed: Change = { slot: dn, lcid: EN, before: 'Name', after: 'Account name' };
+    const emptied: Change = { slot: tip, lcid: FR, before: 'Le nom', after: '' };
+    const serve = (en: string, frTip?: string) => r.columns.set('acc|name', { DisplayName: { [EN]: en, [FR]: 'Nom' }, Description: { [EN]: 'The name', ...(frTip === undefined ? {} : { [FR]: frTip }) } });
+    const check = async (cs: Change[], theirs?: Set<string>) => {
+      const x = await unpublishedForms(r.app, cs, undefined, 0, theirs);
+      return [x.left, x.unread, x.missing.map(changeId)];
+    };
+    serve('Name', '');
+    t.eq(await check([renamed, emptied]), [['Account (table)'], [], [`${dn.key}#${EN}`]], 'the old name served; the tooltip stored empty');
+    t.eq(r.columnReads, ['acc|name Strong', 'acc|name Strong'], 'one read of the column, asked again once');
+    serve('Account name');
+    t.eq(await check([renamed, emptied]), [['Account (table)'], [], [`${tip.key}#${FR}`]], 'no French tooltip at all: French users still see the English one');
+    serve('Account name', '');
+    r.columnReads.length = 0;
+    t.eq([await check([renamed, emptied]), r.columnReads.length], [[[], [], []], 1], 'published: one read, no wait');
+    serve('Name', '');
+    t.eq([await check([renamed], new Set([`${dn.key}#${EN}`])), r.columnReads.length], [[[], [], []], 1], "someone else's since: nothing read");
+    r.columns.clear();
+    t.eq(await check([renamed]), [[], ['Account (table)'], []], 'a read that fails: not known');
   });
 
   // ---- the Publish dialog itself (ui/review.ts) on the fake DOM of the popup tests ----
@@ -1118,6 +1230,58 @@ export function register(t: Kit): void {
     t.ok(d.text().includes('Done. Refreshing the page…'), d.text());
   });
 
+  dialog('changes to labels from managed solutions, where this session allows them (Ctx.managedEdits): one amber line says what publishing them does, for one change and for several; they are published', async (r, d) => {
+    const ref = { managed: true, lock: '', held: MANAGED };
+    const m = r.add('attribute', 'attribute|acc.m|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }, { ref }).key;
+    const m2 = r.add('attribute', 'attribute|acc.m2|DisplayName', { [EN]: 'Code', [FR]: 'Code' }, { ref }).key;
+    r.app.ctx.managedEdits = true;
+    r.store.setManagedEdits(true);
+    r.store.set(m, FR, 'Nom 2');
+    d.open();
+    t.ok(d.text().includes('1 change is to a label from a managed solution: it adds an unmanaged layer on top of its solution.'), d.text());
+    d.click('Cancel');
+    r.store.set(m2, FR, 'Code 2');
+    d.open();
+    t.ok(d.text().includes('2 changes are to labels from managed solutions: each adds an unmanaged layer on top of its solution.'), d.text());
+    t.eq(d.actions(), ['Undo all', 'Cancel', 'Publish']);
+    await tick();
+    d.click('Publish');
+    await d.until('refreshed', () => d.refreshed > 0);
+    t.eq([r.store.pendingCount(), readHistory(r.app.ctx)[0].items.length], [0, 2], 'both published');
+  });
+
+  dialog('Undo all: there from two changes (one has its own Undo); its question first, where Not now changes nothing; then every change of the list goes back, those past the 300 shown too, as one undo step: the dialog closes with its last change, nothing is written, and Ctrl+Z (Store.undo) brings them all back', async (r, d) => {
+    const ks = Array.from({ length: 302 }, (_, i) => r.add('attribute', `attribute|acc.c${i}|DisplayName`, { [EN]: `Col ${i}`, [FR]: `Col ${i}` }).key);
+    r.store.set(ks[0], FR, 'Un');
+    d.open();
+    t.eq(d.actions(), ['Cancel', 'Publish'], 'one change: its own Undo only');
+    d.click('Cancel');
+    await tick();
+    ks.forEach((k, i) => r.store.set(k, FR, `Colonne ${i}`));
+    r.store.set(ks[1], EN, 'Column 1');
+    const n = r.store.pendingCount();
+    t.eq(n, 303);
+    d.open();
+    t.eq([d.title(), d.actions()], [`Publish ${n} changes`, ['Undo all', 'Cancel', 'Publish']]);
+    t.ok(d.text().includes('and 2 more changes'), 'the list shows 300 of its groups');
+    d.click('Undo all');
+    const q = d.dlg();
+    t.eq([d.title(), d.actions()], ['Undo all changes?', ['Undo all', 'Not now']]);
+    t.ok(d.text().includes(`All ${n} changes in this list go back to the text they had before. Nothing is published. Ctrl+Z brings them back.`), d.text());
+    const [yes, no] = q.querySelectorAll('.dlg-actions button');
+    t.ok(yes.className.includes('danger') && no.dataset.af !== undefined, 'Undo all red, Not now the one focused');
+    d.click('Not now');
+    await tick();
+    t.eq([d.title(), r.store.pendingCount()], [`Publish ${n} changes`, n], 'Not now: nothing undone, the list as it was');
+    d.click('Undo all');
+    d.click('Undo all');
+    await tick();
+    t.eq([r.store.pendingCount(), dom.layer.querySelectorAll('.dialog').length, r.posts.length], [0, 0, 0], 'every change undone, the dialog closed, nothing written or published');
+    t.eq(r.store.get(ks[301])!.labels[FR], 'Col 301', 'the store keeps what it read');
+    r.store.undo();
+    t.eq([r.store.pendingCount(), r.store.value(ks[301], FR), r.store.value(ks[1], EN)], [n, 'Colonne 301', 'Column 1'], 'Ctrl+Z: every change back in one step');
+  });
+
   dialog('a write whose answer was lost: Try again finds it already saved, publishes it, checks and refreshes', async (r, d) => {
     const k = r.add('field', 'field|f1|c1|Label', { [EN]: 'Client', [FR]: 'Client' }, { path: ['Account', 'Main form'], ref: { formId: 'f1' } }).key;
     r.store.set(k, FR, 'Client FR');
@@ -1168,7 +1332,7 @@ export function register(t: Kit): void {
     }
   });
 
-  dialog('a write whose answer was lost, found already as asked by Try again on a form still unpublished: journaled as not published, and Recent publishes › Publish publishes it', async (r, d) => {
+  dialog('a write whose answer was lost, found already as asked by Try again on a form still unpublished, also once the Checking step has published it once more: journaled as not published, and Recent publishes › Publish publishes it', async (r, d) => {
     const k = r.add('field', 'field|f1|c1|Label', { [EN]: 'Client', [FR]: 'Client' }, { path: ['Account', 'Main form'], ref: { formId: 'f1' } }).key;
     r.store.set(k, FR, 'Client FR');
     r.landOnce.add(`${k}#${FR}`);
@@ -1179,7 +1343,7 @@ export function register(t: Kit): void {
     t.ok(d.text().includes('1 of 1 needs attention'), `never "not saved" over a row that may say the change was accepted: ${d.text()}`);
     d.click('Try again');
     await d.until('the check', () => d.actions().includes('Publish again'));
-    t.eq([d.title(), r.posts.length, readHistory(r.app.ctx).map((e) => e.published)], ['Saved, but not published', 1, [false]], 'Recent publishes shows it as not published');
+    t.eq([d.title(), r.posts.length, readHistory(r.app.ctx).map((e) => e.published)], ['Saved, but not published', 2, [false]], 'published, once more by the Checking step; Recent publishes shows it as not published');
     d.click('Close');
     await d.closed;
     t.eq(d.toasts, ['Your translations are saved, but not published yet. Publish them from Recent publishes.']);
@@ -1188,7 +1352,7 @@ export function register(t: Kit): void {
     t.ok(d.text().includes('Not published'), d.text());
     d.click('Publish');
     await d.until('published', () => d.title() === 'Published');
-    t.eq([r.posts.length, readHistory(r.app.ctx)[0].published], [2, true]);
+    t.eq([r.posts.length, readHistory(r.app.ctx)[0].published], [3, true]);
   });
 
   /**
@@ -1236,8 +1400,7 @@ export function register(t: Kit): void {
         return out;
       },
     });
-    const lang = { restore: async () => {}, quiet: <T>(fn: () => Promise<T>) => fn() } as unknown as AppApi['lang'];
-    const saver = createSaver(r.app.ctx, r.store, lang, (k) => (k === 'view' ? recordsWriter : undefined));
+    const saver = createSaver(r.app.ctx, r.store, r.app.lang, (k) => (k === 'view' ? recordsWriter : undefined));
     const save = saver.save;
     saver.save = async (cs, o) => {
       const rep = await save(cs, o);
@@ -1557,14 +1720,14 @@ export function register(t: Kit): void {
     t.eq([r.posts.length, readHistory(r.app.ctx)[0].published], [1, true]);
   });
 
-  dialog("forms still unpublished after publishing: no refresh, journaled as not published; Close says so; Recent publishes › Publish publishes them", async (r, d) => {
+  dialog("forms still unpublished after publishing, and after the Checking step has published them once more: no refresh, journaled as not published; Close says so; Recent publishes › Publish publishes them", async (r, d) => {
     const f = r.add('field', 'field|f1|c1|Label', { [EN]: 'Client', [FR]: 'Client' }, { path: ['Account', 'Main form'], ref: { formId: 'f1' } }).key;
     r.store.set(f, FR, 'Client FR');
     r.versions.set('f1', [10, 12]); // PublishXml did not take: the unpublished version stays newer
     d.open();
     d.click('Publish');
     await d.until('the check', () => d.actions().includes('Close'));
-    t.eq([d.title(), d.actions(), d.refreshed], ['Saved, but not published', ['Publish again', 'Refresh anyway', 'Close'], 0]);
+    t.eq([d.title(), d.actions(), d.refreshed, r.posts.length], ['Saved, but not published', ['Publish again', 'Refresh anyway', 'Close'], 0, 2]);
     t.ok(d.text().includes('Main form still has unpublished changes.'), d.text());
     t.eq(readHistory(r.app.ctx)[0].published, false, 'Recent publishes shows it as not published');
     d.click('Close');
@@ -1576,7 +1739,175 @@ export function register(t: Kit): void {
     t.ok(d.text().includes('Not published'), d.text());
     d.click('Publish');
     await d.until('published', () => d.title() === 'Published');
-    t.eq([r.posts.length, readHistory(r.app.ctx)[0].published, d.actions()], [2, true, ['Refresh page', 'Close']]);
+    t.eq([r.posts.length, readHistory(r.app.ctx)[0].published, d.actions()], [3, true, ['Refresh page', 'Close']]);
+  });
+
+  /** A main form whose name field's English label the forms check reads as `en` in the published form (ref: the field's). */
+  const shown = (en: string) =>
+    `<form><tabs><tab id="{t1}"><columns><column><sections><section id="{s1}"><rows><row><cell id="{c1}"><labels><label description="${en}" languagecode="1033" /></labels><control id="name" datafieldname="name" /></cell></row></rows></section></sections></column></columns></tab></tabs></form>`;
+  /** The name field of that form, its English label edited to "Client"; the published form shows its column's name until Publish again writes it again. */
+  const stuck = (r: Rig) => {
+    r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }, { prop: 'DisplayName' });
+    const k = r.add('field', 'field|f1|c1|Label', { [EN]: 'Name', [FR]: 'Nom' }, { path: ['Account', 'Main form'], ref: { formId: 'f1', elId: 'c1', datafield: 'name', controlId: 'name' } }).key;
+    r.versions.set('f1', [10, 10]);
+    r.published.set('f1', shown('Name'));
+    r.onAgain = () => r.published.set('f1', shown('Client'));
+    r.store.set(k, EN, 'Client');
+    return k;
+  };
+
+  dialog("a field label the published form doesn't show as saved while its versions agree (LIVE-FINDINGS 117) is repaired by the Checking step at once, with no click: written again around two publishes (each inside a quiet() job), checked again, published, and the page refreshed", async (r, d) => {
+    const k = stuck(r);
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('refreshed', () => d.refreshed > 0);
+    t.eq([r.again, r.posts.length, readHistory(r.app.ctx)[0].published], [[[`${k}#${EN}`]], 3, true], 'written again around two publishes');
+  });
+
+  dialog("in the Workbench, Done for a publish whose only label was found already on the server, which the Checking step then wrote again and published (LIVE-FINDINGS 117), never says nothing was written", async (r, d) => {
+    const k = stuck(r);
+    r.server.set(`${k}#${EN}`, 'Client');
+    d.view = 'workbench';
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('done', () => d.actions().includes('Close'));
+    t.eq([r.again, d.actions()], [[[`${k}#${EN}`]], ['Refresh page', 'Close']], 'repaired, published');
+    t.ok(d.text().includes('Done. 1 change was already on the server.') && !d.text().includes('nothing was written'), d.text());
+  });
+
+  dialog("a field label the Checking step's repair still can't get published: Saved, but not published, as for a form left unpublished, no refresh; Publish again writes it again around its publishes, checks again and refreshes", async (r, d) => {
+    const k = stuck(r);
+    const shows = r.onAgain;
+    r.onAgain = undefined;
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('the check', () => d.actions().includes('Publish again'));
+    t.eq([d.title(), d.actions(), d.refreshed, r.posts.length, r.again], ['Saved, but not published', ['Publish again', 'Refresh anyway', 'Close'], 0, 3, [[`${k}#${EN}`]]], 'repaired once, in vain');
+    t.ok(d.text().includes('Main form still has unpublished changes.'), d.text());
+    t.eq(readHistory(r.app.ctx)[0].published, false, 'Recent publishes shows it as not published');
+    r.onAgain = shows;
+    d.click('Publish again');
+    await d.until('refreshed', () => d.refreshed > 0);
+    t.eq([r.again.length, r.posts.length, readHistory(r.app.ctx)[0].published], [2, 5, true]);
+  });
+
+  dialog("Recent publishes › Publish of a save whose field label the published form doesn't show while its versions agree: the check finds it first, so it is written again around the publish, then checked; what those writes tell is said", async (r, d) => {
+    const k = stuck(r);
+    const shows = r.onAgain;
+    r.onAgain = undefined;
+    d.view = 'workbench';
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('the check', () => d.actions().includes('Publish again'));
+    d.click('Close');
+    await d.closed;
+    r.onAgain = shows;
+    r.againSays = 'Dataverse dropped 1 label of the form “Main form” that this save did not change. It was written back; check the form.';
+    openHistory(r.app);
+    d.click('Publish');
+    await d.until('published', () => d.title() === 'Published');
+    t.eq([r.again, r.posts.length, readHistory(r.app.ctx)[0].published], [[[`${k}#${EN}`], [`${k}#${EN}`]], 5, true]);
+    t.ok(d.text().includes(r.againSays), d.text());
+  });
+
+  run("the forms check reads each form's published definition and its versions in a quiet() job, so that no language switch window of the translator, in this tab or another, is open while Dataverse answers them in the user's language (LIVE-FINDINGS 52); a read stopped while it waits for one leaves the form not known, never a label missing", async (r) => {
+    stuck(r);
+    const cs = r.store.changes();
+    const lang = r.app.lang;
+    let open = 0;
+    r.app.lang = {
+      ...lang,
+      quiet: async <T>(fn: () => Promise<T>) => {
+        open++;
+        try {
+          return await fn();
+        } finally {
+          open--;
+        }
+      },
+    } as unknown as AppApi['lang'];
+    const seen: string[] = [];
+    const http = r.app.ctx.http as unknown as { get: (url: string, o?: unknown) => Promise<unknown> };
+    const get = http.get;
+    http.get = (url, o) => (url.startsWith('systemforms(') && seen.push(`${url.split('?')[0]}${open ? '' : ' (outside quiet())'}`), get(url, o));
+    const said = (x: Awaited<ReturnType<typeof unpublishedForms>>) => [x.left, x.unread, x.missing.map(changeId)];
+    t.eq(said(await unpublishedForms(r.app, cs, undefined, 0)), [['Main form'], [], [`${cs[0].slot.key}#${EN}`]], 'the label missing');
+    t.eq(seen, ['systemforms(f1)', 'systemforms(f1)/Microsoft.Dynamics.CRM.RetrieveUnpublished()', 'systemforms(f1)', 'systemforms(f1)/Microsoft.Dynamics.CRM.RetrieveUnpublished()'], 'read, and read again, each pair in a quiet() job');
+    // A switch window open (another tab's): the check waits for it; stopped meanwhile, the form is not known.
+    seen.length = 0;
+    r.app.lang = { ...lang, quiet: (_fn: unknown, signal?: AbortSignal) => new Promise((_, no) => signal?.addEventListener('abort', () => no(new DOMException('The operation was cancelled.', 'AbortError')))) } as unknown as AppApi['lang'];
+    const ac = new AbortController();
+    const x = unpublishedForms(r.app, cs, ac.signal, 0);
+    await tick();
+    ac.abort();
+    t.eq([said(await x), seen], [[[], ['Main form'], []], []], 'stopped while it waits: not known, nothing read');
+  });
+
+  dialog("Publish keeps Store.busy ('Publishing') from the end of the save through the Checking step and its repair, as Recent publishes › Publish does, so the page's read of which field labels are the form's own (inspector/pageload.ts) opens no language switch window meanwhile; it is released before the page refreshes", async (r, d) => {
+    stuck(r);
+    let label = '';
+    r.store.on((e) => void (e.type === 'busy' && (label = e.label ?? '')));
+    const seen: string[] = [];
+    const now = (what: string) => void seen.push(`${what}: ${r.store.busy ? label : 'not busy'}`);
+    const http = r.app.ctx.http as unknown as { get: (url: string, o?: unknown) => Promise<unknown> };
+    const get = http.get;
+    http.get = (url, o) => (url.startsWith('systemforms(') && now('check'), get(url, o));
+    const shows = r.onAgain!;
+    r.onAgain = () => (now('repair'), shows());
+    const refresh = r.app.refreshPage;
+    r.app.refreshPage = () => (now('refresh'), refresh());
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('refreshed', () => d.refreshed > 0);
+    t.eq([...new Set(seen)], ['check: Publishing', 'repair: Publishing', 'refresh: not busy']);
+  });
+
+  dialog("stopped during the Checking step's repair, Publish releases Store.busy all the same and says publishing was cancelled; Publish again keeps it through its own check too, and releases it before the page refreshes", async (r, d) => {
+    stuck(r);
+    const shows = r.onAgain!;
+    r.onAgain = () => d.click('Stop'); // between the repair's two publishes
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('stopped', () => d.actions().includes('Publish again'));
+    t.eq([d.title(), r.store.busy], ['Saved, but not published', false]);
+    t.ok(d.text().includes('Publishing was cancelled.'), d.text());
+    r.onAgain = shows;
+    const seen: boolean[] = [];
+    const http = r.app.ctx.http as unknown as { get: (url: string, o?: unknown) => Promise<unknown> };
+    const get = http.get;
+    http.get = (url, o) => (url.startsWith('systemforms(') && seen.push(r.store.busy), get(url, o));
+    let atRefresh: boolean | null = null;
+    const refresh = r.app.refreshPage;
+    r.app.refreshPage = () => ((atRefresh = r.store.busy), refresh());
+    d.click('Publish again');
+    await d.until('refreshed', () => d.refreshed > 0);
+    t.eq([[...new Set(seen)], atRefresh], [[true], false], "busy through Publish again's check; released before the refresh");
+  });
+
+  dialog("once the check confirms a form the save wrote with no other change of it (SaveReport.forms), the answers of which of its field labels are its own are kept for the version its publish made (keepOwnLabels); not for a form that had another one", async (r, d) => {
+    const k = r.add('field', 'field|f1|c1|Label', { [EN]: 'Name', [FR]: 'Nom' }, { path: ['Account', 'Main form'], ref: { formId: 'f1', elId: 'c1', datafield: 'name', controlId: 'name', sparse: true, formVersion: '10' } }).key;
+    r.versions.set('f1', [11, 11]);
+    const calls: unknown[][] = [];
+    Object.assign(r.app, { providers: { carryOwnLabels: (_ctx: unknown, ...a: unknown[]) => void calls.push(a) } });
+    const cells = new Map([[`field|f1|c1`, { key: 'c1', own: { [FR]: true as const } }]]);
+    d.view = 'workbench';
+    for (const pending of [false, true]) {
+      r.forms = new Map([['f1', { pending, version: '10', sent: true, cells }]]);
+      r.store.set(k, FR, pending ? 'Nom 3' : 'Nom 2');
+      d.open();
+      await tick();
+      d.click('Publish');
+      await d.until('done', () => d.title() === 'Published');
+      d.click('Close');
+      await d.closed;
+    }
+    t.eq(calls, [['f1', '10', '11', [{ key: 'c1', own: { [FR]: true } }]]], 'once, for the form with no other change');
   });
 
   dialog('Undo keeps the list where it was and the focus on the row now in its place; a double-click undoes one', async (r, d) => {
@@ -1634,6 +1965,71 @@ export function register(t: Kit): void {
     t.eq(d.title(), 'Publishing 3 changes');
     await d.until('done', () => d.actions().includes('Close'));
     t.ok(d.text().includes('Done. Published 3 changes.'), d.text());
+  });
+
+  run('a user with neither the System Administrator nor the System Customizer role (Ctx.customizer false): a save, an undo, a write again and a publish refuse before anything is sent; the edit stays staged', async (r) => {
+    const k = r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }).key;
+    r.store.set(k, FR, 'Nom 2');
+    const { rep } = await r.publish();
+    t.eq([rep.saved, rep.published, r.writes.length, r.posts.length], [1, true, 1, 1], 'a customizer publishes');
+    r.store.set(k, FR, 'Nom 3');
+    r.app.ctx.customizer = false;
+    const says = (p: Promise<unknown>) => p.then(() => 'ran', (e) => (e as Error).message);
+    const set = new PublishSet();
+    set.entities.add('acc');
+    t.eq(
+      [
+        await says(r.app.saver.save(r.store.changes(), { signal: new AbortController().signal, publish: true, onProgress() {} })),
+        await says(r.app.saver.undo(readHistory(r.app.ctx)[0], { signal: new AbortController().signal, publish: true, onProgress() {} })),
+        await says(r.app.saver.writeAgain(r.store.changes(), async () => {}, new AbortController().signal)),
+        await says(publishXml(r.app.ctx, set)),
+      ],
+      [NOT_CUSTOMIZER, NOT_CUSTOMIZER, NOT_CUSTOMIZER, NOT_CUSTOMIZER],
+    );
+    t.eq([r.writes.length, r.posts.length, r.store.pendingCount(), r.store.busy], [1, 1, 1, false], 'nothing more sent, the edit kept, never busy');
+  });
+
+  dialog('a user with neither role: Review and publish lists the changes, says why there is no Publish, and only closes (Ctrl+Enter publishes nothing); nothing is checked or sent', async (r, d) => {
+    const k = r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }).key;
+    r.store.set(k, FR, 'Nom 2');
+    r.app.ctx.customizer = false;
+    d.open();
+    await tick();
+    t.eq([d.title(), d.actions()], ['Publish 1 change', ['Close']]);
+    t.ok(d.text().includes(NOT_CUSTOMIZER) && d.text().includes('Nom 2') && !/saved and published|Checking for other/.test(d.text()), d.text());
+    fire(d.dlg(), 'keydown', { key: 'Enter', ctrlKey: true });
+    await tick();
+    t.eq(d.title(), 'Publish 1 change');
+    d.click('Close');
+    await d.closed;
+    t.eq([r.writes.length, r.posts.length, r.reads ?? 0, r.store.pendingCount()], [0, 0, 0, 1]);
+  });
+
+  dialog('a user with neither role: Recent publishes lists the publishes and says why, without Publish or Undo', async (r, d) => {
+    const k = r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }).key;
+    r.store.set(k, FR, 'Nom 2');
+    r.publishFails = 1;
+    const { rep } = await r.publish();
+    t.eq([rep.saved, rep.published, readHistory(r.app.ctx)[0].published], [1, false, false], 'saved, not published: a customizer would see Publish and Undo');
+    r.app.ctx.customizer = false;
+    openHistory(r.app);
+    await tick();
+    t.eq([d.title(), d.actions(), d.dlg().querySelectorAll('.pd-he .btn').map((b) => b.textContent)], ['Recent publishes', ['Close'], []]);
+    t.ok(d.text().includes(NOT_CUSTOMIZER) && d.text().includes('Not published'), d.text());
+    d.click('Close');
+    t.eq([r.writes.length, r.posts.length], [1, 0]);
+  });
+
+  dialog("a save that tells something after it (the classic command writer's temporary solution it couldn't delete) says it, and the page isn't refreshed before it is read: Published, the note, Refresh anyway and Close", async (r, d) => {
+    const rb = r.add('ribbon', 'ribbon|acc.btn|Label', { [EN]: 'Run', [FR]: 'Lancer' }, { ref: { entity: 'acc' }, comp: 'ribbon|acc.btn' }).key;
+    r.store.set(rb, FR, 'Lancer le test');
+    r.saveSays = 'The temporary solution "dxt_ribbon_acc_1" could not be deleted. Deleting it removes only the solution, not the table or its command bar.';
+    d.open();
+    await tick();
+    d.click('Publish');
+    await d.until('done', () => d.actions().includes('Close'));
+    t.eq([d.title(), d.actions(), d.refreshed, r.store.pendingCount()], ['Published', ['Refresh anyway', 'Close'], 0, 0]);
+    t.ok(d.text().includes(r.saveSays), d.text());
   });
 
   dialog('in the Workbench: Done with Refresh page and Close, never an automatic refresh', async (r, d) => {
@@ -3115,6 +3511,28 @@ export function register(t: Kit): void {
     const managed = (s: Slot): Change => ({ slot: { ...s, ref: { ...s.ref, managed: true } }, lcid: EN, before: '', after: 'x' });
     const p = publishTargets([managed(P.name(WF2)), managed(P.view), managed(P.stage)]);
     t.eq([p.empty, [...p.processes]], [true, []]);
+    // Where this session allows changes to managed labels, those its loaders set up for that are predicted as published.
+    const open = (s: Slot): Change => ({ slot: { ...s, ref: { ...s.ref, managed: true, lock: '', held: MANAGED } }, lcid: EN, before: '', after: 'x' });
+    const q = publishTargets([open(P.name(WF2)), open(P.view), open(P.stage)], true);
+    t.eq([q.empty, [...q.processes.keys()]], [false, [WF2]]);
+    t.eq(publishTargets([open(P.name(WF2)), open(P.view), open(P.stage)], false).empty, true, 'off: none');
+  });
+
+  run("a process from a managed solution where this session allows changes to managed labels (Ctx.managedEdits): its name, loaded as the records loader sets one up, is saved and published, and the process updated once like any other (base-language name, base-language window, no other language changed); no notice that the page may show the old name", async (r) => {
+    const P = processes(t, r);
+    r.app.ctx.managedEdits = true;
+    r.store.setManagedEdits(true);
+    r.store.add([managedSlot({ ...P.name(WF2), ref: { ...P.name(WF2).ref, managed: true } }, true, '', MANAGED)]);
+    P.managed.add(WF2);
+    r.store.set(P.name(WF2).key, FR, 'Deuxième processus 2');
+    t.eq([r.store.get(P.name(WF2).key)!.readOnly, r.store.isEdited(P.name(WF2).key)], ['', true]);
+    const said: string[] = [];
+    const rep = await P.save(said);
+    t.eq([rep.saved, rep.errors, rep.published, rep.warning, rep.notice], [1, 0, true, undefined, undefined], JSON.stringify(rep.results.map((x) => x.message)));
+    t.eq(P.updates(), [`update ${WF2} "Second flow" in 1033 once`], 'updated once, with its base-language name');
+    t.eq([P.runs, P.ui], [[EN], FR], 'in a base-language window; the UI language back as it was');
+    t.eq(P.labels.get(`${WF2}|name`), { [EN]: 'Second flow', [FR]: 'Deuxième processus 2' }, 'no other language changed');
+    t.ok(said.includes('Updating the process Deuxième processus'), said.join(' | '));
   });
 
   run('no process update for a save of only a stage label, or only a process description', async (r) => {
@@ -3508,6 +3926,7 @@ export function register(t: Kit): void {
         toast: (m: string) => void did.push('toast: ' + m),
         teardown: () => (did.push('teardown'), o.teardown ?? true),
         restore: async () => void did.push('restore'),
+        switching: () => false,
         env: o.env ?? ({ caches: cachesOf(['gcm_1']), local: storage(['uci-state-hint']), session: storage([]), port: () => null } as PurgeEnv),
         storage: store,
         reload: () => void did.push('reload'),
@@ -3537,6 +3956,23 @@ export function register(t: Kit): void {
     // Every purge step hanging or throwing: the page is reloaded all the same.
     const z = opts({ env: { caches: { keys: () => new Promise<string[]>(() => {}), delete: async () => true }, port: () => port(false), sw: () => { throw new Error('x'); } } });
     t.eq([await refreshPage(z.o), z.did.at(-1)], [true, 'reload']);
+  });
+
+  t.test("refresh: waits for the translator's language switch for as long as it runs (a reload in the middle of it makes the next start wait until it can no longer run), and no longer than RESTORE_WAIT once none runs (its answer lost)", async () => {
+    let back!: () => void;
+    const x = opts({});
+    const go = refreshPage({ ...x.o, restore: () => new Promise<void>((r) => (back = r)), switching: () => true, restoreWait: 5 });
+    await tick(60);
+    t.eq([x.did, x.store.getItem(verifyKey('o'))], [['teardown', 'note: Refreshing the page…'], null], 'nothing stored or purged while it runs');
+    back();
+    t.eq([await go, x.did.at(-1), JSON.parse(x.store.getItem(verifyKey('o'))!)], [true, 'reload', { at: 1000, items }]);
+    let on = true;
+    const y = opts({});
+    const lost = refreshPage({ ...y.o, restore: () => new Promise<void>(() => {}), switching: () => on, restoreWait: 5 });
+    await tick(60);
+    t.eq(y.store.getItem(verifyKey('o')), null);
+    on = false;
+    t.eq([await Promise.race([lost, tick(2000)]), y.did.at(-1)], [true, 'reload'], 'its answer lost: the next start waits it out');
   });
 
   t.test('refresh: a prepare step (the language switch) runs once the questions are answered, before the teardown; when it fails nothing is torn down or reloaded', async () => {

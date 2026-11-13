@@ -1,7 +1,7 @@
 // The environment the translator runs in: the page's Xrm, read live (LIVE-FINDINGS 95) and found past frames of other
 // sites, whether its record has unsaved changes (core/context recordDirty, asked about by ui/refresh refreshPage), and how
 // Dataverse's answers read (core/http): a collection that isn't one, and a 503 that says nothing of what ran.
-import { findXrm, liveXrm, recordDirty } from '../../../src/core/context';
+import { customizer, findXrm, liveXrm, recordDirty } from '../../../src/core/context';
 import { DvError, Http, mayHaveRun, partError, turnedAway } from '../../../src/core/http';
 import { refreshPage, type RefreshOptions } from '../../../src/ui/refresh';
 import type { Kit } from './kit';
@@ -23,6 +23,46 @@ async function withFetch<T>(answer: (url: string, init: RequestInit) => Response
 const json = (v: unknown, status = 200, headers: Record<string, string> = {}) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json', ...headers } });
 
 export function register(t: Kit): void {
+  t.test("context: the System Administrator or System Customizer role is the user's own or a team's, found by its template (any business unit's copy, whatever its name); reads refused (403) mean neither, any other failure is thrown unless the other read found one", async () => {
+    const SA = '627090ff-40a3-4053-8790-584edc5be201';
+    const SC = '119f245c-3cc8-4b62-b31c-d1a046ced15d';
+    const one = { value: [{ roleid: 'r1' }] };
+    const none = { value: [] };
+    const down = new DvError('Service unavailable.', 503);
+    const refused = new DvError('Principal user is missing prvReadRole privilege.', 403);
+    /** customizer() with its own-roles read answering `own` and its team-roles read `team` (an Error is thrown). */
+    const ask = async (own: unknown, team: unknown) => {
+      const urls: string[] = [];
+      const http = {
+        get: async (url: string) => {
+          urls.push(decodeURIComponent(url));
+          const a = url.includes('teamroles') ? team : own;
+          if (a instanceof Error) throw a;
+          return a;
+        },
+      };
+      let out: boolean | string;
+      try {
+        out = await customizer(http as never);
+      } catch (e) {
+        out = (e as Error).message;
+      }
+      return { out, urls };
+    };
+    const got = async (own: unknown, team: unknown) => (await ask(own, team)).out;
+    t.eq([await got(one, none), await got(none, one), await got(one, one)], [true, true, true], 'own, through a team, both');
+    t.eq([await got(none, none), await got(refused, refused), await got(refused, none), await got(none, refused)], [false, false, false, false], 'neither, or not allowed to read roles');
+    t.eq([await got(one, down), await got(down, one), await got(one, refused)], [true, true, true], 'one found is enough');
+    t.eq([await got(down, none), await got(none, down), await got(refused, down), await got(down, down)], ['Service unavailable.', 'Service unavailable.', 'Service unavailable.', 'Service unavailable.'], "can't tell: thrown, never taken for neither");
+    t.eq(await got({}, none), false, 'an answer without rows is none');
+    // The two reads: roles of either template, linked to the signed-in user (eq-userid) directly and through team membership.
+    const { urls } = await ask(none, none);
+    t.eq(urls.length, 2);
+    t.ok(urls.every((u) => u.startsWith('roles?fetchXml=<fetch top="1" no-lock="true"><entity name="role">') && u.includes(`<condition attribute="roletemplateid" operator="in"><value>${SA}</value><value>${SC}</value></condition>`) && u.includes('<condition attribute="systemuserid" operator="eq-userid" />')), urls.join('\n'));
+    t.ok(urls[0].includes('<link-entity name="systemuserroles" from="roleid" to="roleid" intersect="true">') && !urls[0].includes('teamroles'), urls[0]);
+    t.ok(urls[1].includes('<link-entity name="teamroles" from="roleid" to="roleid" intersect="true"><link-entity name="teammembership" from="teamid" to="teamid" intersect="true">'), urls[1]);
+  });
+
   t.test("context: Xrm is the page's now (another table's form has its own); while there is none, the last one seen, never the first page's", () => {
     const g = globalThis as unknown as { window?: unknown; document?: unknown };
     const had = { window: g.window, document: g.document };
@@ -107,6 +147,7 @@ export function register(t: Kit): void {
         toast: (m) => void did.push('toast: ' + m),
         teardown: () => (did.push('teardown'), true),
         restore: async () => {},
+        switching: () => false,
         env: {},
         storage: null,
         reload: () => void did.push('reload'),

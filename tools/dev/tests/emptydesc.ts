@@ -157,6 +157,12 @@ export function register(t: Kit): void {
     eq(undoChange(d, it({ before: 'Ancienne', after: '' })), { slot: d, lcid: FR, before: '', after: 'Ancienne' }, 'it emptied one: its earlier text');
     const nm = S('attribute', 'attribute|x', 'DisplayName', { [EN]: 'Name', [FR]: 'Nom' });
     eq(undoChange(nm, it({ key: nm.key, after: 'Nom', before: '  ' })), { slot: nm, lcid: FR, before: 'Nom', after: '  ' }, 'a name: the stand-in rule as ever');
+    // An entry a 1.1.0 development build journaled for a main form's field label may carry fields this version doesn't know
+    // (`removed`, `follows`, `own`): ignored, its text from before written back as for any label (formlabels.ts runs one
+    // through the form writer).
+    const cell2 = S('field', 'field|f|c1', 'Label', { [EN]: 'Customer', [FR]: 'Nom' }, { baseRequired: false, ref: { formId: 'f', elId: 'c1', formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name', sparse: true } });
+    const dev = { key: cell2.key, comp: cell2.comp, kind: 'field', lcid: FR, title: 'Customer', before: 'Client', after: 'Nom', removed: 'column', follows: true, own: true } as unknown as HistoryItem;
+    eq(undoChange(cell2, dev), { slot: cell2, lcid: FR, before: 'Nom', after: 'Client' }, "a 1.1.0 development build's entry: its text from before");
     // As written (withStandIns): to its English text; with none (empty as the undo leaves it), saved empty after all
     // (its users saw no text before the publish), the mark dropped; a name with no English name keeps it (refused).
     const back = undoChange(d, it({}));
@@ -630,5 +636,25 @@ export function register(t: Kit): void {
     // A name emptied: its stand-in, as before.
     x.store.set(NAME, FR, '');
     eq(becomes(x.store, x.store.get(NAME)!, FR, EN, 'French'), "Becomes “Name”: Dataverse can't remove a translation here, so French gets the English text.");
+  });
+
+  test("empty descriptions: beside them, a main form's field label emptied keeps the stand-in rule, as in 1.0.0: the line under the input says it becomes its column's name in that language (its English one where it has none), never saved empty; its English emptied says nothing there (the save does, as ever)", () => {
+    const x = page({ [FR]: 'Tapez le nom.' });
+    // The name column's body cell on a main form, as the loader makes it (sparse, never base-required).
+    const cell = S('field', 'field|f|c1', 'Label', { [EN]: 'Full name', [FR]: 'Nom complet' }, { baseRequired: false, ref: { formId: 'f', elId: 'c1', formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name', sparse: true } });
+    x.store.add([cell]);
+    // French emptied, its English label kept: its stand-in.
+    x.store.set(cell.key, FR, '');
+    eq([becomes(x.store, cell, FR, EN, 'French'), problem(x.store, cell, FR, EN)], ["Becomes “Nom”: Dataverse can't remove a translation here, so French gets the column's French name.", '']);
+    // Both emptied: the cell keeps no label of its own (model.ts freesAll), so it follows its column in each: nothing said.
+    x.store.set(cell.key, EN, '');
+    eq([becomes(x.store, cell, FR, EN, 'French'), problem(x.store, cell, FR, EN), becomes(x.store, cell, EN, EN, 'English'), problem(x.store, cell, EN, EN)], ['', '', '', '']);
+    // The column with no French name (emptied in the same edits), the English label kept: its English name.
+    x.store.set(cell.key, EN, 'Full name');
+    x.store.set(NAME, FR, '');
+    eq(becomes(x.store, cell, FR, EN, 'French'), "Becomes “Name”: Dataverse can't remove a translation here, so French gets the column's English name.");
+    // Its tooltip beside it keeps the rule of descriptions: saved empty.
+    x.store.set(TIP, FR, '');
+    eq(becomes(x.store, x.tip, FR, EN, 'Français'), 'Saved empty: Français users see no tooltip.');
   });
 }

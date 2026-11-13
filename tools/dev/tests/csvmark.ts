@@ -97,4 +97,19 @@ export function register(t: Kit): void {
     const r2 = io.apply(await io.parse(file()), store);
     eq([r2.skipped.map((s) => s.reason), store.isEdited(key(0))], [[`Read-only: ${MANAGED}`], false]);
   });
+
+  test("import where this session allows changes to managed labels (Ctx.managedEdits): a managed solution's label its loader set up for that is staged; one that stays read-only (not customizable) is skipped with that reason, and one its loader didn't set up with the managed one", async () => {
+    const NOT = "This column is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.";
+    const store = new Store();
+    store.add([
+      { ...t.slot('attribute', key(0), { 1033: 'Name', 1036: 'Nom' }), ref: { managed: true, lock: '', held: MANAGED } },
+      { ...t.slot('attribute', key(1), { 1033: 'X', 1036: 'X fr' }), ref: { managed: true, lock: NOT, held: MANAGED } },
+      { ...t.slot('attribute', key(2), { 1033: 'Y', 1036: 'Y fr' }), ref: { managed: true } },
+    ]);
+    store.setManagedEdits(true);
+    const io = createIo();
+    const r = io.apply(await io.parse(csv([`${CSV_KEY},${KEYS}`, `${key(0)},,account,,,Name,Nom 2`, `${key(1)},,account,,,X,X 2`, `${key(2)},,account,,,Y,Y 2`])), store);
+    eq([r.staged, r.skipped.map((s) => [s.key, s.reason])], [1, [[key(1), `Read-only: ${NOT}`], [key(2), `Read-only: ${MANAGED}`]]]);
+    eq(store.changes().map((c) => [c.slot.key, c.after]), [[key(0), 'Nom 2']]);
+  });
 }

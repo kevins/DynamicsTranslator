@@ -7,8 +7,9 @@ import * as csv from '../../src/io/csv';
 import * as xlsx from '../../src/io/xlsx';
 import * as lcid from '../../src/core/lcid';
 import { Store } from '../../src/core/store';
-import { canClear, noStandIn, standIn, standInSays, standInsSaid, standInSources, standInTag, standInText, type Change, type Slot, type TextOf } from '../../src/core/model';
+import { canClear, droppedBack, droppedLeft, filledIn, noStandIn, standIn, standInSays, standInsSaid, standInSources, standInTag, standInText, type Change, type Slot, type TextOf } from '../../src/core/model';
 import { saveText, withStandIns } from '../../src/core/saver';
+import { CHANGED, check } from '../../src/providers/types';
 import type { HistoryItem } from '../../src/ui/types';
 import { fieldOf } from '../../src/inspector/scan';
 import { register as scanTests } from './tests/scan';
@@ -18,6 +19,7 @@ import { register as sheetsTests } from './tests/sheets';
 import { register as gridTests } from './tests/grid';
 import { register as workbookTests } from './tests/workbook';
 import { register as modeTests } from './tests/mode';
+import { register as selectionTests } from './tests/selection';
 import { register as overlayTests } from './tests/overlay';
 import { register as overlayDomTests } from './tests/overlay-dom';
 import { register as savePathTests } from './tests/savepath';
@@ -33,6 +35,7 @@ import { register as layersTests } from './tests/layers';
 import { register as bpfTests } from './tests/bpf';
 import { register as docWritesTests } from './tests/docwrites';
 import { register as docRaceTests } from './tests/docrace';
+import { register as formLabelsTests } from './tests/formlabels';
 import { register as contextTests } from './tests/context';
 import { register as undoTests } from './tests/undo';
 import { register as pageListTests } from './tests/pagelist';
@@ -45,6 +48,7 @@ import { register as bulkTests } from './tests/bulk';
 import { register as fileIoTests } from './tests/fileio';
 import { register as journalTests } from './tests/journal';
 import { register as devServerTests } from './tests/devserver';
+import { register as e2eSuiteTests } from './tests/e2esuite';
 import { register as langDoubtTests } from './tests/langdoubt';
 import { register as pubScopeTests } from './tests/pubscope';
 import { register as csvMarkTests } from './tests/csvmark';
@@ -320,6 +324,38 @@ test("standIn: measured by the texts as the run leaves them on the server: the c
   eq(standIn(f, FR, EN, 'Client', '', u), { text: 'Account Name', from: 'columnBase' });
   eq(standIn(col, FR, EN, 'Nom', '', u), { text: 'Account Name', from: 'base' });
 });
+test("filledIn: what a form read shows where a field label has no text of its own (LIVE-FINDINGS 103): its column's name in that language, else its base-language name; undefined while its column's names aren't loaded, and for a label of no column", () => {
+  const EN = 1033;
+  const FR = 1036;
+  const texts = (m: Record<string, string>): TextOf => (k, l) => m[`${k}#${l}`];
+  const COL = 'attribute|acc.name|DisplayName';
+  const col = { [`${COL}#${EN}`]: 'Account Name', [`${COL}#${FR}`]: 'Nom du compte' };
+  const ref = { formId: 'f', elId: 'c1', formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name', sparse: true };
+  const f = { ...slot('field', 'field|f|c1|Label', { [EN]: 'Customer', [FR]: 'Client' }), entity: 'acc', baseRequired: false, ref } as Slot;
+  eq([filledIn(f, FR, EN, texts(col)), filledIn(f, FR, EN, texts({ ...col, [`${COL}#${FR}`]: '' })), filledIn(f, FR, EN, texts({})), filledIn(slot('tab'), FR, EN, texts(col))], ['Nom du compte', 'Account Name', undefined, undefined]);
+});
+test('texts: droppedBack and droppedLeft, the check after a form write, read as approved', () => {
+  // Labels Dataverse dropped, written back (G2a; a write back that may have replaced a save made at the same moment, a
+  // warning), or left with their texts (G2b, three at most).
+  eq([droppedBack('Information', 1), droppedBack('Information', 3), droppedBack('Information', 1, true)], [
+    'Dataverse dropped 1 label of the form “Information” that this save did not change. It was written back; check the form.',
+    'Dataverse dropped 3 labels of the form “Information” that this save did not change. They were written back; check the form.',
+    'Dataverse dropped 1 label of the form “Information” that this save did not change. It was written back, but that may have replaced a save someone else made at the same moment; check the form.',
+  ]);
+  const lost = ['A', 'B', 'C', 'D', 'E'].map((t, i) => ({ lang: ['English', 'French', 'German'][i % 3], text: t }));
+  eq([droppedLeft('Information', [{ lang: 'English', text: 'Own name' }]), droppedLeft('Information', lost.slice(0, 3)), droppedLeft('Information', lost)], [
+    '1 label of the form “Information” that this save did not change was changed on the server while it saved and could not be put back (English “Own name”): check the form.',
+    '3 labels of the form “Information” that this save did not change were changed on the server while it saved and could not be put back (English “A”, French “B”, German “C”): check the form.',
+    '5 labels of the form “Information” that this save did not change were changed on the server while it saved and could not be put back (English “A”, French “B”, German “C” and 2 more): check the form.',
+  ]);
+});
+test('check: a server text equal to alsoBefore is no conflict; any other is', () => {
+  const c: Change = { slot: slot('field'), lcid: 1036, before: 'Téléphone', after: 'Tél. pro', alsoBefore: 'Téléphone 2' };
+  const none = new Set<string>();
+  eq([check(c, 'Téléphone', none), check(c, 'Téléphone 2', none), check(c, 'Tél. pro', none)?.outcome], [null, null, 'unchanged']);
+  eq(check(c, 'Autre', none), { change: c, outcome: 'conflict', server: 'Autre', message: CHANGED });
+  eq(check({ ...c, alsoBefore: undefined }, 'Téléphone 2', none)?.outcome, 'conflict', 'without it: a conflict');
+});
 
 // ---- store ----
 test('store: set, revert to original drops the edit, undo/redo', () => {
@@ -420,12 +456,13 @@ test('fieldOf: control ids ending in digits, and two copies in one section', () 
 });
 
 // ---- each area's own test file (tools/dev/tests/*.ts) ----
-for (const reg of [scanTests, describeTests, calloutTests, sheetsTests, gridTests, workbookTests, modeTests, overlayTests, overlayDomTests, savePathTests, langTests, storeTests, coldloadTests, partsTests, panesTests, ribbonTests, pillTests, navMenuTests, layersTests, bpfTests, contextTests, undoTests, pageListTests, revealTests, unmarkedTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
+for (const reg of [scanTests, describeTests, calloutTests, sheetsTests, gridTests, workbookTests, modeTests, selectionTests, overlayTests, overlayDomTests, savePathTests, langTests, storeTests, coldloadTests, partsTests, panesTests, ribbonTests, pillTests, navMenuTests, layersTests, bpfTests, contextTests, undoTests, pageListTests, revealTests, unmarkedTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 for (const reg of [recordsTests, gridEditTests, metaRaceTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 for (const reg of [bulkTests, fileIoTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
-for (const reg of [journalTests, devServerTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
+for (const reg of [journalTests, devServerTests, e2eSuiteTests]) reg({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 docWritesTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 docRaceTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
+formLabelsTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 langDoubtTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 pubScopeTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });
 csvMarkTests({ test, eq, ok, slot: (k, key, l) => slot(k, key, l) });

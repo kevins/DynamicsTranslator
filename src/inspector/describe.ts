@@ -6,7 +6,7 @@
 // whether a label is in a menu, whether a stage's flyout is open and whether an item of a selector's list is the
 // current one.
 
-import { isManaged, namesFirst, PROP_NAMES, type Kind, type Prop, type Slot } from '../core/model';
+import { managedHeld, namesFirst, PROP_NAMES, type Kind, type Prop, type Slot } from '../core/model';
 import type { RibbonControl } from '../providers/types';
 import type { IconName } from '../ui/dom';
 import { langName, notLoaded, shownLangs } from '../ui/editor';
@@ -152,7 +152,7 @@ function duplicates(app: AppApi, m: Slot): Block['also'] {
   const mb = cellBase(app, m);
   const others: Slot[] = [];
   for (const s of store.slots.values()) {
-    if (s.kind !== m.kind || s.prop !== 'Label' || s.key === m.key || s.ref?.formId !== r.formId || s.readOnly || isManaged(s) || notLoaded(s, t)) continue;
+    if (s.kind !== m.kind || s.prop !== 'Label' || s.key === m.key || s.ref?.formId !== r.formId || s.readOnly || managedHeld(s, store.managedEdits) || notLoaded(s, t)) continue;
     if (columnOf(s)?.attr !== col.attr) continue;
     const sb = cellBase(app, s);
     if (mb !== null && sb !== null && sb !== mb) continue;
@@ -562,9 +562,8 @@ export const FIELD_NOTES = {
 const QUICK_VIEW = 6;
 
 /**
- * A form cell. A column's cell: the form's own label (with the other copies of the field), its tooltip, then its column
- * name, always in that order (the popup focuses the form's label, what the page shows; ui/callout.ts focusKeys), and its
- * choices.
+ * A form cell. A column's cell: its column name, its tooltip, then the form's own label (with the other copies of the
+ * field), always in that order (the popup focuses the column's name; ui/callout.ts focusKeys), and its choices.
  */
 function field(app: AppApi, md: CalloutModel, m: Slot, a: Anchor | undefined): void {
   const { store } = app;
@@ -577,10 +576,9 @@ function field(app: AppApi, md: CalloutModel, m: Slot, a: Anchor | undefined): v
       md.blocks = mk(m, 'Label');
       return;
     }
-    // The timeline's label is saved with the form but never shown: its heading is its Name from the form designer, one
-    // text for every language, else Dynamics' own (LIVE-FINDINGS 101), which its popup says, opened from that heading
-    // (scan.ts TIMELINE_HEADING) as the page shows it.
-    md.blocks = mk(m, 'Form label').map((b) => ({ ...b, note: TIMELINE_LABEL_NOTE, hidden: true }));
+    // The timeline's heading is its Name from the form designer, one text for every language, else Dynamics' own
+    // (LIVE-FINDINGS 101), which its popup says, opened from that heading (scan.ts TIMELINE_HEADING) as the page shows
+    // it. Its label saved with the form is never shown, so the popup has no input for it (the Workbench has one).
     if (a && isHeading(a)) {
       md.title = pageText(a) || md.title;
       md.icon = 'info';
@@ -602,7 +600,7 @@ function field(app: AppApi, md: CalloutModel, m: Slot, a: Anchor | undefined): v
   const also = duplicates(app, m);
   if (also) label.also = also;
   label.note = Number(r.formType) === QUICK_VIEW ? FIELD_NOTES.quickView : FIELD_NOTES.label;
-  md.blocks = [label, ...tip, ...name];
+  md.blocks = [...name, ...tip, label];
   const ch = choicesOf(app, c.entity, c.attr, a?.focus);
   if (ch) md.choices = ch;
 }
@@ -611,8 +609,8 @@ function field(app: AppApi, md: CalloutModel, m: Slot, a: Anchor | undefined): v
 
 /**
  * The clicked text comes first (one element, one slot: the popup edits exactly what was clicked), except in a
- * column's form cell, whose texts keep their order (`keep`: Form label, Tooltip, Column name; the popup focuses the
- * form's label, ui/callout.ts focusKeys). A text of the component that its kind doesn't list (an anchor
+ * column's form cell, whose texts keep their order (`keep`: Column name, Tooltip, Form label; the popup focuses the
+ * column's name, ui/callout.ts focusKeys). A text of the component that its kind doesn't list (an anchor
  * showing another of its slots) gets a block of its own.
  */
 function clickedFirst(app: AppApi, md: CalloutModel, key: string, keep = false): void {
@@ -632,8 +630,6 @@ export const BUILTIN_NOTE = "Built-in Microsoft text. It's already translated in
 export const TIMELINE_NOTE = "Dynamics' own heading, already translated into every language installed in this environment. A Name given to the timeline in the form designer replaces it, the same text in every language.";
 /** What it says where the timeline has a Name (`ref.uniqueName`): the heading, one text for every language. */
 export const TIMELINE_NAME_NOTE = "The timeline's Name, set in the form designer. Dynamics shows it as it is in every language: it keeps one Name for all languages, so it can't be translated. Clear the Name there to show Dynamics' own heading instead, already translated into every language installed in this environment.";
-/** Where the timeline's label of its form applies: nowhere on the page. */
-export const TIMELINE_LABEL_NOTE = 'this form only, not shown on the page';
 /** What the popup of a sitemap item with no name of its own says (the app designer's placeholder, model.ts namesFirst). */
 export const unnamedNote = (kind: Kind, base: string): string =>
   `This ${kind === 'subarea' ? 'menu item' : kind} has no name of its own: Dynamics shows the app designer's placeholder. Name it in each language; other languages will show the ${base} name until you translate them.`;
@@ -666,8 +662,8 @@ export const describe: DescribeFn = (app, comp, a) => {
   };
   if (!m) return md;
   fill(app, md, m, an);
-  // A kind without its own rules; a choice's label is its row in Choices.
-  if (!md.blocks.length && !md.choices?.keys.includes(m.key)) md.blocks = mk(m, 'Label');
+  // A kind without its own rules; a choice's label is its row in Choices, and a timeline's, never shown, has none (field).
+  if (!md.blocks.length && !md.choices?.keys.includes(m.key) && !isTimeline(m)) md.blocks = mk(m, 'Label');
   if (an) clickedFirst(app, md, an.key, m.kind === 'field' && !!columnOf(m));
   // Never two inputs for one text (e.g. a classic button whose tooltip uses its label's LocLabel).
   const keys = new Set<string>();

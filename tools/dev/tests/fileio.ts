@@ -168,6 +168,16 @@ export function register(t: Kit): void {
     const blob = io.exportCsv(slots, [1033, 1036]);
     eq(((await io.parse(new File([blob], 'labels.csv'))).rows as Row[]).map((r) => r.values[1036]), texts);
   });
+  test("csv import: UTF-8, UTF-16 after its byte order mark, else ANSI; bytes that aren't the encoding a byte order mark names are a damaged file, never read as ANSI", async () => {
+    const lines = `Component,${CSV_KEY},Table,1036\r\nmetadata,attribute|account.name|DisplayName,account,`;
+    const csv = (...parts: Array<string | number[]>) => new File(parts.map((p) => (typeof p === 'string' ? utf8(p) : new Uint8Array(p))), 'labels.csv');
+    const utf16 = (s: string, tail: number[] = []) => [0xff, 0xfe, ...Array.from(s, (ch) => [ch.charCodeAt(0) & 0xff, ch.charCodeAt(0) >> 8]).flat(), ...tail];
+    const caf = [0x43, 0x61, 0x66];
+    const files = [csv(lines, 'Café'), csv([0xef, 0xbb, 0xbf], lines, 'Café'), csv(lines, [...caf, 0xe9]), csv(lines, [...caf, 0xc3, 0x28]), csv(utf16(`${lines}Café`))];
+    eq(await Promise.all(files.map(async (f) => ((await createIo().parse(f)).rows as Row[]).map((r) => r.values[1036]))), [['Café'], ['Café'], ['Café'], ['CafÃ('], ['Café']]);
+    for (const f of [csv([0xef, 0xbb, 0xbf], lines, [...caf, 0xc3, 0x28]), csv(utf16(`${lines}Caf`, [0x00, 0xd8]))])
+      eq(await fails(createIo().parse(f)), 'The CSV file is damaged (its text could not be read). Save or export it again, then use the new file.');
+  });
 
   // ---- what a file can't say for sure is never staged ----
   const key = (i: number) => `attribute|account.a${i}|DisplayName`;
@@ -214,6 +224,156 @@ export function register(t: Kit): void {
     const store2 = avant(1);
     const r2 = io.apply(await io.parse(await named(et, 'Attributes')), store2);
     eq([r2.staged, skips(r2.skipped), changes(store2)], [0, [[2, '', { 1036: '#N/A' }]], []]);
+  });
+
+  test("xlsx: each sheet is read from its own relationship (its r:id): an id given twice, or a sheet whose part isn't there, is a damaged workbook naming it; another namespace's id attribute names nothing", async () => {
+    const edit = async (f: (ps: ZipEntry[]) => void) => {
+      const ps = await unzip(new Uint8Array(await (await writeXlsx([{ name: 'A', rows: [['a']] }, { name: 'B', rows: [['b']] }])).arrayBuffer()));
+      f(ps);
+      return new Blob([await zip(ps)]);
+    };
+    const set = (ps: ZipEntry[], name: string, fn: (x: string) => string) => {
+      const p = ps.find((x) => x.name === name)!;
+      p.data = utf8(fn(new TextDecoder().decode(p.data)));
+    };
+    eq(await fails(readXlsx(await edit((ps) => set(ps, 'xl/_rels/workbook.xml.rels', (x) => x.replace('Id="rId2"', 'Id="rId1"'))))), 'The workbook is damaged (xl/_rels/workbook.xml.rels could not be read).');
+    eq(await fails(readXlsx(await edit((ps) => ps.splice(ps.findIndex((p) => p.name === 'xl/worksheets/sheet2.xml'), 1)))), 'The workbook is damaged (the B sheet could not be read).');
+    const got = await readXlsx(await edit((ps) => set(ps, 'xl/workbook.xml', (x) => x.replace('<sheet name="A"', '<sheet xmlns:x="urn:x" x:id="rId2" name="A"'))));
+    eq(got.map((s) => [s.name, s.rows[0]?.[0]]), [['A', 'a'], ['B', 'b']]);
+  });
+
+  test("xlsx: only what Excel shows is read, where the format puts it: another namespace's sheets, rows, cells and text (an extension's, ones Excel ignores) are none of them; a shared string the file doesn't hold, a Boolean neither 1 nor 0, a sheet whose relationship or part is no worksheet, or a sheet with two r:ids is a damaged workbook naming it", async () => {
+    const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    const STRICT = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
+    const SREL = 'http://purl.oclc.org/ooxml/officeDocument/relationships';
+    type Parts = Record<string, string | ((x: string) => string)>;
+    /** The test workbook (sheet "S", A1 "x") with parts replaced (their new XML, or a function of the old one) or added. */
+    const wbk = async (parts: Parts) => {
+      const ps = await unzip(new Uint8Array(await (await writeXlsx([{ name: 'S', rows: [['x']] }])).arrayBuffer()));
+      for (const [name, f] of Object.entries(parts)) {
+        const p = ps.find((x) => x.name === name);
+        const xml = typeof f === 'string' ? f : f(p ? new TextDecoder().decode(p.data) : '');
+        if (p) p.data = utf8(xml);
+        else ps.push({ name, data: utf8(xml) });
+      }
+      return new Blob([await zip(ps)]);
+    };
+    const read = async (parts: Parts) => (await readXlsx(await wbk(parts))).map((s) => [s.name, s.rows]);
+    const ws = (data: string, more = '') => `<worksheet xmlns="${MAIN}" xmlns:a="urn:a"><sheetData>${data}</sheetData>${more}</worksheet>`;
+    const sst = (items: string, ns = MAIN) => `<sst xmlns="${ns}" xmlns:a="urn:a">${items}</sst>`;
+    const sc = (ref: string, v: string) => `<c r="${ref}" t="s"><v>${v}</v></c>`;
+    const bc = (ref: string, v: string) => `<c r="${ref}" t="b"><v>${v}</v></c>`;
+    // The second one rich text: its runs, without the phonetic hint (rPh).
+    const items = '<si><t>zero</t></si><si><r><t>o</t></r><r><rPr><b/></rPr><t>ne</t></r><rPh sb="0" eb="1"><t>ワン</t></rPh></si>';
+    eq(await read({ [SHEET]: ws(`<row r="1">${sc('A1', '1')}${sc('B1', '0')}${bc('C1', '1')}${bc('D1', '0')}</row>`), 'xl/sharedStrings.xml': sst(items) }), [['S', [['one', 'zero', 'TRUE', 'FALSE']]]], 'shared strings, Booleans');
+    const strict = (x: string) => x.split(MAIN).join(STRICT).split(REL).join(SREL);
+    eq(
+      await read({
+        '_rels/.rels': strict,
+        'xl/workbook.xml': strict,
+        'xl/_rels/workbook.xml.rels': strict,
+        [SHEET]: `<x:worksheet xmlns:x="${STRICT}"><x:sheetData><x:row r="1"><x:c r="A1" t="s"><x:v>1</x:v></x:c><x:c r="B1" t="inlineStr"><x:is><x:t>p</x:t></x:is></x:c></x:row></x:sheetData></x:worksheet>`,
+        'xl/sharedStrings.xml': sst(items, STRICT),
+      }),
+      [['S', [['one', 'p']]]],
+      'strict, prefixed',
+    );
+    eq(await read({ 'xl/workbook.xml': (x) => x.replace('r:id="rId1"', `r:id="rId1" xmlns:s="${SREL}" s:id="rId1"`) }), [['S', [['x']]]], 'one r:id in both namespaces');
+    eq(
+      await read({
+        'xl/workbook.xml': (x) => x.replace('</sheets>', '<sheet name="Chart" sheetId="2" r:id="rId9"/></sheets>'),
+        'xl/_rels/workbook.xml.rels': (x) => x.replace('</Relationships>', `<Relationship Id="rId9" Type="${REL}/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>`),
+      }),
+      [['S', [['x']]], ['Chart', []]],
+      'a chart sheet has no cells',
+    );
+    const hidden = '<a:t>Hidden</a:t>';
+    eq(
+      await read({
+        'xl/workbook.xml': (x) => x.replace('</workbook>', '<extLst><ext uri="{X}"><a:sheets xmlns:a="urn:a"><a:sheet name="H1" sheetId="5" r:id="rId1"/></a:sheets><sheet name="H2" sheetId="6" r:id="rId1"/></ext></extLst></workbook>'),
+        [SHEET]: ws(
+          `<row r="1">${sc('A1', '0')}<c r="B1" t="inlineStr"><is><t>Inline</t>${hidden}</is></c><a:c r="C1" t="inlineStr"><is><t>Hidden</t></is></a:c></row>`,
+          `<extLst><ext uri="{X}"><a:row r="2"><a:c r="A2" t="inlineStr"><a:is>${hidden}</a:is></a:c></a:row><row r="3">${cell('A3', 'Hidden')}</row></ext></extLst>`,
+        ),
+        'xl/sharedStrings.xml': sst(`<si><t>Vis<a:x>Hidden</a:x>ible</t>${hidden}</si>`),
+      }),
+      [['S', [['Visible', 'Inline']]]],
+      "another namespace's, an extension's",
+    );
+    const two = (cells: string) => ws(`<row r="1">${bc('A1', '1')}</row><row r="2">${cells}</row>`);
+    for (const [what, parts, says] of [
+      ['a styles relationship', { 'xl/workbook.xml': (x: string) => x.replace('r:id="rId1"', 'r:id="rId2"') }, 'the S sheet'],
+      ['a target outside the file', { 'xl/_rels/workbook.xml.rels': (x: string) => x.replace('Target="worksheets/sheet1.xml"', 'Target="worksheets/sheet1.xml" TargetMode="External"') }, 'the S sheet'],
+      ['a styles part', { 'xl/_rels/workbook.xml.rels': (x: string) => x.replace('Target="worksheets/sheet1.xml"', 'Target="styles.xml"') }, 'the S sheet'],
+      ['two r:ids', { 'xl/workbook.xml': (x: string) => x.replace('r:id="rId1"', `r:id="rId1" xmlns:s="${SREL}" s:id="rId2"`) }, 'the S sheet'],
+      ['a shared string table of another kind', { [SHEET]: two(sc('B2', '0')), 'xl/sharedStrings.xml': `<styleSheet xmlns="${MAIN}"/>` }, 'xl/sharedStrings.xml'],
+      ['a shared string and no table', { [SHEET]: two(sc('B2', '0')) }, 'cell B2 of the S sheet'],
+      ...['2', '-1', '1.5', '', ' ', '0x1', '1e0'].map((v) => [`shared string "${v}"`, { [SHEET]: two(sc('B2', v)), 'xl/sharedStrings.xml': sst(items) }, 'cell B2 of the S sheet']),
+      ...['2', 'TRUE', 'true', ''].map((v) => [`Boolean "${v}"`, { [SHEET]: two(bc('B2', v)) }, 'cell B2 of the S sheet']),
+    ] as Array<[string, Parts, string]>)
+      eq(await fails(readXlsx(await wbk(parts))), `The workbook is damaged (${says} could not be read).`, what);
+  });
+
+  test("xlsx: a part is the one its relationship's whole type names (the format's), never one another URI ending the same way names; its XML is UTF-8, or UTF-16 after a byte order mark: other bytes, or a declared encoding that would read them otherwise, are a damaged workbook, as are a cell type the format doesn't have and two values in one cell", async () => {
+    const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    type Part = string | Uint8Array | ((x: string) => string | Uint8Array);
+    /** The test workbook (sheet "S", A1 "x") with parts replaced (their new XML or bytes, or a function of the old XML) or added. */
+    const wbk = async (parts: Record<string, Part>) => {
+      const ps = await unzip(new Uint8Array(await (await writeXlsx([{ name: 'S', rows: [['x']] }])).arrayBuffer()));
+      for (const [name, f] of Object.entries(parts)) {
+        const p = ps.find((x) => x.name === name);
+        const v = typeof f === 'function' ? f(p ? new TextDecoder().decode(p.data) : '') : f;
+        const data = typeof v === 'string' ? utf8(v) : v;
+        if (p) p.data = data;
+        else ps.push({ name, data });
+      }
+      return new Blob([await zip(ps)]);
+    };
+    const read = async (parts: Record<string, Part>) => (await readXlsx(await wbk(parts))).map((s) => [s.name, s.rows]);
+    const utf16 = (s: string, be = false) => {
+      const a = new Uint8Array(2 + 2 * s.length);
+      const d = new DataView(a.buffer);
+      d.setUint16(0, 0xfeff, !be);
+      for (let i = 0; i < s.length; i++) d.setUint16(2 + 2 * i, s.charCodeAt(i), !be);
+      return a;
+    };
+    const decl = (x: string, enc: string) => x.replace('encoding="UTF-8"', `encoding="${enc}"`);
+    const a1 = (c: string) => (x: string) => x.replace(/<c r="A1"[\s\S]*?<\/c>/, c);
+    const sst = (text: string) => `<sst xmlns="${MAIN}"><si><t>${text}</t></si></sst>`;
+    const ss = (type: string) => ({
+      [SHEET]: a1('<c r="A1" t="s"><v>0</v></c>'),
+      'xl/_rels/workbook.xml.rels': (x: string) => x.replace('</Relationships>', `<Relationship Id="rId9" Type="${type}" Target="other.xml"/></Relationships>`),
+      'xl/sharedStrings.xml': sst('shared'),
+      'xl/other.xml': sst('other'),
+    });
+    eq(await read(ss('urn:x/sharedStrings')), [['S', [['shared']]]], 'shared strings another URI names');
+    eq(await read(ss(`${REL}/sharedStrings`)), [['S', [['other']]]], 'shared strings the format names, wherever they are');
+    eq(
+      await read({
+        '_rels/.rels': (x) => x.replace(`Type="${REL}/officeDocument"`, 'Type="urn:x/officeDocument"').replace('Target="xl/workbook.xml"', 'Target="xl/other.xml"'),
+        'xl/other.xml': `<workbook xmlns="${MAIN}" xmlns:r="${REL}"><sheets><sheet name="O" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+      }),
+      [['S', [['x']]]],
+      'a workbook another URI names',
+    );
+    eq(await read({ [SHEET]: (x) => utf16(decl(x, 'UTF-16')) }), [['S', [['x']]]], 'UTF-16 worksheet');
+    eq(await read({ 'xl/workbook.xml': (x) => utf16(decl(x, 'UTF-16'), true), 'xl/_rels/workbook.xml.rels': (x) => utf16(decl(x, 'UTF-16')) }), [['S', [['x']]]], 'UTF-16 (big-endian) workbook, UTF-16 relationships');
+    eq(await read({ [SHEET]: (x) => new Uint8Array([0xef, 0xbb, 0xbf, ...utf8(x.replace('>x<', '>x �<'))]) }), [['S', [['x �']]]], 'UTF-8 after its byte order mark, a U+FFFD of its own kept');
+    eq(await read({ [SHEET]: (x) => decl(x, 'US-ASCII') }), [['S', [['x']]]], 'another encoding declared over ASCII alone, which it reads the same');
+    const notUtf8 = (x: string) => {
+      const [a, z] = x.split('>x<');
+      return new Uint8Array([...utf8(`${a}>`), 0xff, ...utf8(`<${z}`)]);
+    };
+    for (const [what, parts, says] of [
+      ...['urn:x:not-spreadsheet/worksheet', 'http://example.invalid/relationships/worksheet', 'worksheet'].map((type) => [`a sheet of type ${type}`, { 'xl/_rels/workbook.xml.rels': (x: string) => x.replace(`Type="${REL}/worksheet"`, `Type="${type}"`) }, 'the S sheet']),
+      ['a byte that is not UTF-8', { [SHEET]: notUtf8 }, 'the S sheet'],
+      ['UTF-16 with half a character', { [SHEET]: (x: string) => utf16(decl(x, 'UTF-16').replace('>x<', '>\uD800<')) }, 'the S sheet'],
+      ['UTF-8 declared ISO-8859-1', { [SHEET]: (x: string) => decl(x, 'ISO-8859-1').replace('>x<', '>é<') }, 'the S sheet'],
+      ['a cell type the format does not have', { [SHEET]: a1('<c r="A1" t="unknown"><v>01</v></c>') }, 'cell A1 of the S sheet'],
+      ['two values in a cell', { [SHEET]: a1('<c r="A1" t="str"><v>a</v><v>b</v></c>') }, 'cell A1 of the S sheet'],
+      ['two inline strings in a cell', { [SHEET]: a1('<c r="A1" t="inlineStr"><is><t>a</t></is><is><t>b</t></is></c>') }, 'cell A1 of the S sheet'],
+    ] as Array<[string, Record<string, Part>, string]>)
+      eq(await fails(readXlsx(await wbk(parts))), `The workbook is damaged (${says} could not be read).`, what);
   });
 
   test('xlsx: two rows or two cells at one address are a damaged workbook, not a choice between them', async () => {
@@ -293,7 +453,7 @@ export function register(t: Kit): void {
     const http = {
       all: async (path: string) =>
         path.startsWith('EntityDefinitions')
-          ? [{ LogicalName: 'account', DisplayName: { UserLocalizedLabel: { Label: 'Account' } } }]
+          ? [{ LogicalName: 'account', DisplayName: { LocalizedLabels: [{ Label: 'Account', LanguageCode: 1033 }], UserLocalizedLabel: { Label: 'Account', LanguageCode: 1033 } } }]
           : ['new.Button.Label', 'new.button.label'].map((id, i) => ({
               diffid: `d${i}`,
               entity: 'account',
@@ -347,6 +507,18 @@ export function register(t: Kit): void {
     }
     const head = `<row r="1">${['Key', 'Type', 'Table', 'Component', 'Property', '1036', '1036'].map((h, i) => cell(`${'ABCDEFG'[i]}1`, h)).join('')}</row>`;
     eq(await fails(io.parse(await named(await book(head + keyed(2, key(0), cell('F2', 'Un') + cell('G2', 'Deux'))), 'Other'))), 'Sheet "Other" has two columns for language 1036 (F and G). Keep one of them, then import again.');
+  });
+
+  test('import: two columns naming the label (two Key columns, our CSV Key beside a Key of its own, either case) refuse the file, naming them: which one names it is not known', async () => {
+    const io = createIo();
+    for (const [h, cols] of [
+      [`Key,Type,Table,Component,Property,1036,key`, 'A and G'],
+      [`${CSV_KEY},Type,Table,Component,Property,1036,Key`, 'A and G'],
+      [`${CSV_KEY},Type,Table,Component,Property,1036, ${CSV_KEY.toLowerCase()} `, 'A and G'],
+    ] as const) {
+      const e = await fails(io.parse(new File([[h, `${key(0)},,account,,,Un,${key(1)}`].join('\r\n')], 'labels.csv')));
+      eq(e, `The file has two Key columns (${cols}). Keep one of them, then import again.`);
+    }
   });
 
   test('import: rows giving one label different texts in a language stage none of them (whichever comes last) and report each with the others; the same text twice is staged once; other languages of those rows are staged', async () => {
@@ -413,5 +585,60 @@ export function register(t: Kit): void {
     const e = await fails(io.parse(new File([[`${CSV_KEY},Type,Table,Component,Property,1036`, `${key(0)},,account,,,"Nouveau`, `${key(1)},,account,,,Deux`].join('\r\n')], 'labels.csv')).then((p) => io.apply(p, store)));
     ok(/CSV file is damaged \(the quoted text that starts on line 2 has no closing quote\)/.test(e), e);
     eq(changes(store), []);
+  });
+
+  test('csv: the delimiter is read from the whole header row: a quoted header holding a line break and another delimiter before it never picks that one', async () => {
+    const rows = (h: string) => [[h, 'Key', 'Table', '1036'], ['x', 'k', 'account', 'Nouveau']];
+    // Commas, the header's semicolons before its line break (CRLF or LF), the Key column after or before it.
+    eq(parseCsv('"Notes;;\r\ncontinued",Key,Table,1036\r\nx,k,account,Nouveau\r\n'), rows('Notes;;\r\ncontinued'));
+    eq(parseCsv('Key,"Notes;;\ncontinued",Table,1036\r\nk,x,account,Nouveau\r\n'), [['Key', 'Notes;;\ncontinued', 'Table', '1036'], ['k', 'x', 'account', 'Nouveau']]);
+    // Semicolons or tabs, the header's commas before its line break.
+    eq(parseCsv('"Notes,,\ncontinued";Key;Table;1036\r\nx;k;account;Nouveau\r\n'), rows('Notes,,\ncontinued'));
+    eq(parseCsv('"Notes,,\ncontinued"\tKey\tTable\t1036\r\nx\tk\taccount\tNouveau\r\n'), rows('Notes,,\ncontinued'));
+    // As before: one-line headers, a line break in a value, a header split alike by two delimiters (the comma), a quote in an unquoted field.
+    eq(parseCsv('"Notes;; continued",Key,Table,1036\r\nx,k,account,Nouveau\r\n'), rows('Notes;; continued'));
+    eq(parseCsv('"Notes,, continued";Key;Table;1036\r\nx;k;account;Nouveau\r\n'), rows('Notes,, continued'));
+    eq(parseCsv('Key,Table,1036\r\nk,account,"Nouveau;\ntexte"\r\n'), [['Key', 'Table', '1036'], ['k', 'account', 'Nouveau;\ntexte']]);
+    eq(parseCsv('Key,Table;1036\r\nk,a;b\r\n'), [['Key', 'Table;1036'], ['k', 'a;b']]);
+    eq(parseCsv('Key;Size 5";1036\r\nk;x;Nouveau\r\n'), [['Key', 'Size 5"', '1036'], ['k', 'x', 'Nouveau']]);
+    // A header damaged under every delimiter is still refused, naming its line.
+    eq(await fails(Promise.resolve().then(() => parseCsv('"Key"x,1036\r\nk,Nouveau\r\n'))), 'The CSV file is damaged (line 1 has more text after the closing quote of a quoted field). Check the quotes there, then import again.');
+    // Through the import: the French text is staged.
+    const store = avant(1);
+    const io = createIo();
+    io.apply(await io.parse(new File([`"Notes;;\r\ncontinued",${CSV_KEY},Table,1036\r\nx,${key(0)},account,Nouveau\r\n`], 'labels.csv')), store);
+    eq(changes(store), [[key(0), 1036, 'Nouveau']]);
+  });
+
+  test('csv import: the delimiter is the one under which the header row has a Key column (or a sheet layout) and a language column; a header row that has them under two is refused, and nothing is staged', async () => {
+    const io = createIo();
+    /** What importing `text` into key(0) and key(1) says (or 'no error') and stages. */
+    const run = async (text: string) => {
+      const store = avant(2);
+      return [await fails(io.parse(new File([text], 'labels.csv')).then((p) => io.apply(p, store))), changes(store)];
+    };
+    const unclear = (...ways: string[]) =>
+      `Which separator this CSV file uses is not clear: its header row can be read ${ways.slice(0, -1).map((w) => `as columns split at ${w}`).join(', ')} and as columns split at ${ways[ways.length - 1]}. Keep only the separator it uses in that row, then import again.`;
+    // Audit 13: our header naming key(0) by delimiter `d`, behind a first cell that, split at `o`, is a keyed header naming key(1).
+    const decoy = (d: string, o: string, quoted = false) => {
+      const q = (s: string) => (quoted ? `"${s}"` : s);
+      const pad = o.repeat(5);
+      return `${q(`Notes${o}Key${o}1036${o}Table${pad}`)}${d}${CSV_KEY}${d}Table${d}1036\r\n${q(`metadata${o}${key(1)}${o}Wrong target text${o}account${pad}`)}${d}${key(0)}${d}account${d}Intended French text\r\n`;
+    };
+    eq(await run(decoy(',', ';')), [unclear('commas', 'semicolons'), []]);
+    eq(await run(decoy(';', ',')), [unclear('commas', 'semicolons'), []]);
+    eq(await run(decoy('\t', ',')), [unclear('commas', 'tabs'), []]);
+    eq(await run(`Key;1036;x\tKey\t1036\tx,Key,1036\r\n${key(0)},Nouveau\r\n`), [unclear('commas', 'semicolons', 'tabs'), []]);
+    // That first cell quoted: read the one way the file is.
+    for (const [d, o] of [[',', ';'], [';', ','], ['\t', ',']]) eq(await run(decoy(d, o, true)), ['no error', [[key(0), 1036, 'Intended French text']]], JSON.stringify(d));
+    // A header cell holding more of another delimiter than the file's own, our Key column first or second: read as the
+    // file is (it was refused, split at that other delimiter, as having no Key column).
+    for (const [d, o] of [[',', ';'], [';', ','], ['\t', ',']]) {
+      const notes = `Notes${o.repeat(7)}`;
+      eq(await run(`${CSV_KEY}${d}${notes}${d}Table${d}1036\r\n${key(0)}${d}metadata${d}account${d}Nouveau\r\n`), ['no error', [[key(0), 1036, 'Nouveau']]], `first ${JSON.stringify(d)}`);
+      eq(await run(`${notes}${d}${CSV_KEY}${d}Table${d}1036\r\nmetadata${d}${key(0)}${d}account${d}Nouveau\r\n`), ['no error', [[key(0), 1036, 'Nouveau']]], `second ${JSON.stringify(d)}`);
+    }
+    // A header row read under no delimiter: refused as before.
+    eq(await run(`Name;1036\r\nx;Nouveau\r\n`),['This CSV file has no "Key" column and does not match an Easy Translator sheet, so it cannot be imported.', []]);
   });
 }

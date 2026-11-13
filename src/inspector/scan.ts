@@ -1341,10 +1341,7 @@ function relatedItem(sc: Scanner, el: Element, id: string): Anchor | null {
   if (s) {
     const src = navSource((k) => x.store.slots.get(k), s);
     if (!src && menuRelationship(s)) sc.want.add(WANT_RELATED + (s.entity || x.entity));
-    const t = shown(sc, el, src ? new Set([...x.labels(s), ...x.labels(src)]) : x.labels(s), 8)?.[1];
-    const a = A(x, el, s, { role: 'nav', text: t });
-    if (a && t) a.orig = sc.textOf(t);
-    return a;
+    return A(x, el, s, { role: 'nav', text: shown(sc, el, src ? new Set([...x.labels(s), ...x.labels(src)]) : x.labels(s), 8)?.[1] });
   }
   // A built-in item the form XML doesn't list (Background Processes, Audit History…): Microsoft's text. Only once the
   // form's own entries are known: a form can list (and rename) one (navAudit, LIVE-FINDINGS 63).
@@ -2128,6 +2125,8 @@ export class Scanner {
       got = (Array.isArray(r) ? r : [r]).filter((a): a is Anchor => !!a);
       if (got.length) break;
     }
+    // What each label's text showed as it was found, never a staged text the preview swapped in (Anchor.orig).
+    for (const a of got) if (a.text && !a.part) a.orig = this.textOf(a.text);
     if (old && sameAll(old, got)) got = old;
     if (!got.length) {
       if (this.map.has(k)) this.drop(k);

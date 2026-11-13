@@ -2,7 +2,9 @@
 // that msdyn_componentlayers reads from the database tell a write Dataverse applied, while the metadata reads still show
 // the text from before it (LIVE-FINDINGS 66), from one it did not apply. Then the write log behind "Copy details".
 import { DvError } from '../../../src/core/http';
+import { toLabels } from '../../../src/core/labels';
 import { PublishSet, type Change, type ChangeResult, type Labels, type Slot } from '../../../src/core/model';
+import { MARK } from '../../../src/providers/formxml';
 import { parseLayers, readLayers, type LayerKind } from '../../../src/providers/layers';
 import { metadataWriters } from '../../../src/providers/metadata';
 import { logWrite, writeDetails, writesOf } from '../../../src/providers/writelog';
@@ -210,6 +212,39 @@ export function register(t: Kit): void {
       c.queue = [before, before];
       const [r2] = await c.save([{ slot: c.slot('DisplayName'), lcid: EN, before: 'Team name', after: 'Team' }]);
       t.eq([r2.outcome, c.db.DisplayName, c.puts.length, c.waits().length], ['saved', { [EN]: 'Team', [FR]: 'Nom 2' }, 2, 2], JSON.stringify(r2));
+    }),
+  );
+
+  t.test("layers: Publish again's repair of a column name every metadata read still gives as it was before its save, the layers holding the new one (LIVE-FINDINGS 118): the name with MARK after it, a publish, the name as it is, a publish, each written at once from that read (the layers tell it is no one else's); a name someone else saved since is never written over: nothing written from a read that shows it, theirs put back at once from one that doesn't", () =>
+    fast(async () => {
+      const c = column(t, 'attribute|team.name#118');
+      c.stale = copy(c.db); // every metadata read answers the name from before the save
+      const dn = c.slot('DisplayName');
+      t.eq((await c.save([fr(dn)])).map((x) => x.outcome), ['saved']);
+      const w = metadataWriters.find((x) => x.kinds.includes('attribute'))!;
+      const pubs: string[] = [];
+      // A publish after another text was written: Dataverse serves the column as it is from then on.
+      const publish = async () => {
+        pubs.push(c.db.DisplayName[FR]);
+        c.stale = null;
+      };
+      // Its writes run as quiet() jobs (LangSession.quiet): no language switch window is open here.
+      const lang = { quiet: <T>(fn: () => Promise<T>) => fn() };
+      const again = (cs: Change[]) =>
+        w.again!(c.ctx as never, cs, { signal: new AbortController().signal, publish: new PublishSet(), progress: (m: string) => void c.said.push(m), force: new Set<string>(), lang: lang as never, allowPublish: true }, publish);
+      const [r] = await again([fr(dn)]);
+      const sent = () => c.puts.map((p) => toLabels(p.DisplayName)[FR]);
+      t.eq([r.outcome, sent(), pubs, c.db.DisplayName, c.waits()], ['saved', [NEW, NEW + MARK, NEW], [NEW + MARK, NEW], { [EN]: 'Team name', [FR]: NEW }, []], JSON.stringify(r));
+      // Someone else renamed it since, a read showing it: a conflict, nothing written, one publish.
+      c.db.DisplayName[FR] = 'Nom (eux)';
+      pubs.length = 0;
+      const [r2] = await again([fr(dn)]);
+      t.eq([r2.outcome, sent().length, pubs], ['conflict', 3, ['Nom (eux)']], JSON.stringify(r2));
+      // Read as it was before the save: written from that read, then theirs put back from the layers, a conflict.
+      c.stale = { DisplayName: { [EN]: 'Team name', [FR]: OLD }, Description: { ...c.db.Description } };
+      pubs.length = 0;
+      const [r3] = await again([fr(dn)]);
+      t.eq([r3.outcome, sent().slice(3), pubs, c.db.DisplayName[FR]], ['conflict', [NEW + MARK, 'Nom (eux)'], ['Nom (eux)'], 'Nom (eux)'], JSON.stringify(r3));
     }),
   );
 

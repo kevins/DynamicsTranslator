@@ -3,17 +3,22 @@
 //   dist/bridge.html?f=translator.debug.js,e2e-suite.js&back=<page>   (full app, built with --dev)
 // (<page>: an https page of the test org; tools/dev/bridge.html has no default.)
 // Uses only test components (table new_dxttest, app "Translator Test App", BPF "bpf test" with backup); the account
-// table and its main form are only read, to check that a managed solution's components are read-only.
+// table and its main form are only read, to check that a managed solution's components are read-only. Kept test
+// components the step 'form labels' creates when they are missing (and never deletes): the text column new_dxtremove
+// ("DXT Remove" / "Retrait DXT") of new_dxttest, and new_dxttest's inactive main form "DXT e2e form labels".
 // Every test edits through the translator, verifies with independent reads that only the edited language
-// changed, then restores. Some undo a published save from its journal entry, as Recent publishes does, and one makes a
-// publish fail on purpose to check Try again. Set window.__dxtE2EWithRibbon = true first to include the classic-ribbon
-// tests (~4 min).
-// Results: window.__dxtE2E = { running, log: [{ name, pass, info }], progress }.
-window.__dxtE2E = { running: true, log: [], progress: [] };
+// changed, then restores. A main form's field label is restored by giving its cell its own label key back (onTestKey),
+// never by writing a text back. Some undo a published save from its journal entry, as Recent publishes does, and one
+// makes a publish fail on purpose to check Try again. Set window.__dxtE2EWithRibbon = true first to include the
+// classic-ribbon tests (~4 min); window.__dxtE2EOnly = ['<step>', …] runs only the steps named.
+// Results: window.__dxtE2E = { running, log: [{ name, pass, info }], progress, keys } (keys: the test label keys made).
+window.__dxtE2E = { running: true, log: [], progress: [], keys: [] };
 (async () => {
   for (let i = 0; i < 80 && !window.__dxtDev?.ready && !window.__dxtDev?.app?.saver; i++) await new Promise((r) => setTimeout(r, 250));
   const d = window.__dxtDev;
   const { ctx, store, providers } = d;
+  // A process's labels: loadBpf in the full app's registry (src/providers/index.ts), loadBpfLabels in the headless one's.
+  const loadBpf = providers.loadBpf || providers.loadBpfLabels;
   const saver = d.app.saver;
   const api = ctx.http.api;
   const H = { Accept: 'application/json', 'If-None-Match': 'null', Consistency: 'Strong' };
@@ -42,8 +47,12 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     return saver.save(changes, opts(publish));
   }
   const blocked = (rep) => rep.saved === 0 && rep.results.length === 1 && rep.results[0].outcome !== 'saved';
+  /** The check after a form write had nothing to say: no label dropped, none put back (providers/formxml.ts nothingElse). */
+  const clean = (rep) => !rep.warning && !rep.notice;
   const E = 'new_dxttest';
+  const only = window.__dxtE2EOnly;
   const step = async (name, fn) => {
+    if (only && !only.includes(name)) return;
     try {
       await fn();
     } catch (e) {
@@ -67,6 +76,99 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     ids.bpf ??= (await findOne("workflows?$select=workflowid&$filter=name eq 'bpf test' and category eq 4 and type eq 1", 'the process "bpf test"')).workflowid;
     return ids;
   };
+
+  // ---- Main-form field labels. A form read fills in its column's name where a cell has no label of its own
+  // (LIVE-FINDINGS 103), and Dataverse keeps a cell's labels whatever a save leaves out (104): a text written back would
+  // store a copy of the column's name where the label followed it. So a test that writes a main form's field label puts
+  // its cell on a label key of its own first (onTestKey) and gives it its own key back after (105). ----
+  const JH = { Accept: 'application/json', 'Content-Type': 'application/json' };
+  const unpubDoc = async (id) => xmlDoc((await get(`systemforms(${id})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=formxml`)).formxml);
+  const cellIn = (doc, id) => [...doc.getElementsByTagName('cell')].find((c) => norm(c.getAttribute('id')) === norm(id));
+  const keyIn = (doc, id) => norm(cellIn(doc, id)?.getAttribute('labelid')) || null;
+  /** The test table's main form by name ("Information"): the fixture form of 'form labels' is a second main form. */
+  async function mainForm(name = 'Information') {
+    const v = (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2 and name eq '${name}'`)).value;
+    if (v.length !== 1) throw new Error(`${v.length} main forms of ${E} named "${name}", expected one`);
+    return v[0].formid;
+  }
+  /** Publishes a table outside any language switch (LIVE-FINDINGS 62), again while Dataverse is busy with another publish. */
+  const publishE = (entity = E) =>
+    d.lang.quiet(async () => {
+      for (let i = 0; ; i++) {
+        const r = await fetch(api + 'PublishXml', { method: 'POST', headers: JH, body: JSON.stringify({ ParameterXml: `<importexportxml><entities><entity>${entity}</entity></entities></importexportxml>` }) });
+        if (r.ok) return;
+        if (i === 3) throw new Error(`PublishXml ${entity}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+        await new Promise((go) => setTimeout(go, 5000 * (i + 1)));
+      }
+    });
+  /** A column's own cell in the body or header (src/core/column.ts columnCell; the zones a main form's save posts sparse). */
+  const columnCell = (c) => {
+    const ctl = c.querySelector(':scope > control');
+    const df = (ctl?.getAttribute('datafieldname') || '').toLowerCase();
+    const id = (ctl?.getAttribute('id') || '').toLowerCase().replace(/^header_/, '');
+    return !!df && !c.closest('footer') && (!id || id === df || (id.startsWith(df) && /^\d+$/.test(id.slice(df.length))));
+  };
+  /**
+   * A raw read-modify-write of a main form, for fixtures and test keys only: under the translator's lock (never inside a
+   * language switch), every column cell of the body and header posted without labels as the translator posts them
+   * (LIVE-FINDINGS 104: one posted as read would store the names a read fills in, 103), but `keep`'s; then `edit(doc)`.
+   */
+  const rawPatch = (formId, edit, keep) =>
+    d.lang.hold(async () => {
+      for (let i = 0; i < 3; i++) {
+        const [u, p] = await Promise.all([get(`systemforms(${formId})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=formxml`), get(`systemforms(${formId})?$select=formid`)]);
+        const doc = xmlDoc(u.formxml);
+        for (const c of [...doc.getElementsByTagName('cell')]) if (columnCell(c) && norm(c.getAttribute('id')) !== norm(keep)) c.querySelector(':scope > labels')?.remove();
+        edit(doc);
+        // If-Match is checked against the published row (providers/formxml.ts).
+        const r = await fetch(api + `systemforms(${formId})`, { method: 'PATCH', headers: { ...JH, 'If-Match': p['@odata.etag'] }, body: JSON.stringify({ formxml: new XMLSerializer().serializeToString(doc) }) });
+        if (r.ok) return;
+        if (r.status !== 412) throw new Error(`PATCH systemforms(${formId}): ${r.status} ${(await r.text()).slice(0, 200)}`);
+      }
+      throw new Error(`PATCH systemforms(${formId}): 412 three times`);
+    });
+  /**
+   * Puts a cell on a label key of its own for a test's writes (LIVE-FINDINGS 105): its labels posted as read to a fresh
+   * labelid, which stores its own labels and none of the column's names it shows (104). `restore()` gives the cell its
+   * own key back (or none), posting no labels for it, so it shows its labels from before the test exactly (105), publishes
+   * the table, and says whether the read shows that key again. A test key stays behind as label rows of no cell (107).
+   */
+  async function onTestKey(formId, cellId, entity = E) {
+    const lid0 = keyIn(await unpubDoc(formId), cellId);
+    const key = crypto.randomUUID();
+    await rawPatch(formId, (doc) => cellIn(doc, cellId)?.setAttribute('labelid', `{${key}}`), cellId);
+    window.__dxtE2E.keys.push(key);
+    return {
+      key,
+      async restore() {
+        await rawPatch(formId, (doc) => {
+          const c = cellIn(doc, cellId);
+          if (lid0) c?.setAttribute('labelid', `{${lid0}}`);
+          else c?.removeAttribute('labelid');
+        });
+        await publishE(entity);
+        return keyIn(await unpubDoc(formId), cellId) === lid0;
+      },
+    };
+  }
+  /** The store after a raw write: the form read again (and the table's columns, `cols`), so an edit is measured against the server's text. */
+  async function refresh(formId, cols = false, langs = [1033, 1036]) {
+    if (cols) store.add(await providers.loadTables(ctx, [E], new Set(['attribute']), lo));
+    const fs = await providers.loadFormXml(ctx, [await providers.getForm(ctx, formId)], langs, lo);
+    store.add(fs);
+    return fs;
+  }
+  /** Records the form PATCH bodies the translator sends (through the Http its language session uses). */
+  function capture() {
+    const bodies = [];
+    const b0 = ctx.http.batch;
+    ctx.http.batch = function (parts, o) {
+      for (const p of parts) if (p.method === 'PATCH' && /^systemforms\(/.test(p.url)) bodies.push(p.body.formxml);
+      return b0.call(this, parts, o);
+    };
+    return { bodies, stop: () => (ctx.http.batch = b0) };
+  }
+
   const pick = async (attr, cast, value) => {
     const r = await get(`EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='${attr}')/Microsoft.Dynamics.CRM.${cast}`);
     const o = r.OptionSet.Options ? r.OptionSet.Options.find((x) => x.Value === value) : value ? r.OptionSet.TrueOption : r.OptionSet.FalseOption;
@@ -115,19 +217,39 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
       ok('option restored', rep3b.saved === 1 && (await pick('new_priority', P, 100000002))[1036] === hb[1036], res(rep3b));
     }
 
+    // A conflict: someone else saves the French description after it was loaded, with a write of their own carrying
+    // every language as read (the base language too: a label PUT without it writes the French text there,
+    // LIVE-FINDINGS 2), and the staged text must leave theirs. Then the description is put back exactly as read, in
+    // every language, whatever happened. Only one with a French and a base-language text (an empty one counts) can be:
+    // the write adds a language it has none in, and a metadata translation can't be removed again (LIVE-FINDINGS 31).
     const key = `attribute|${E}.new_name|Description`;
-    const slot = store.get(key);
+    const descUrl = `EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')`;
+    const desc = async () => labelsOf((await get(`${descUrl}?$select=Description`)).Description);
+    const putDesc = async (labels) => {
+      const r = await fetch(api + descUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'MSCRM.MergeLabels': 'true' },
+        body: JSON.stringify({ '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata', LogicalName: 'new_name', Description: { LocalizedLabels: Object.entries(labels).map(([l, t]) => ({ Label: t, LanguageCode: +l })) } }),
+      });
+      if (!r.ok) throw new Error(`${r.status} PUT ${descUrl}: ${(await r.text()).slice(0, 200)}`);
+    };
+    const exact = (x) => JSON.stringify(Object.entries(x).sort());
+    const d0 = await desc();
+    if (!(1036 in d0) || !(ctx.base in d0)) return ok('conflict check: new_name has a French and a base-language description', false, { d0, why: "the check's write would add the missing one, which can't be removed" });
     const theirs = 'Theirs ' + Date.now().toString(36);
     store.set(key, 1036, 'Mine');
-    await fetch(api + `EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'MSCRM.MergeLabels': 'true' },
-      body: JSON.stringify({ '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata', LogicalName: 'new_name', Description: { LocalizedLabels: [{ Label: slot.labels[1033] || 'Primary name', LanguageCode: 1033 }, { Label: theirs, LanguageCode: 1036 }] } }),
-    });
-    const rep4 = await saver.save(store.changes((s) => s.key === key), opts());
-    const ca = labelsOf((await get(`EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')?$select=Description`)).Description);
-    ok('conflict detected, server kept', rep4.conflicts === 1 && ca[1036] === theirs, { rep: res(rep4), ca });
-    store.resolve(key, 1036, false);
+    try {
+      await putDesc({ ...d0, 1036: theirs });
+      const rep4 = await saver.save(store.changes((s) => s.key === key), opts());
+      const ca = await desc();
+      ok('conflict detected, server kept', rep4.conflicts === 1 && ca[1036] === theirs, { rep: res(rep4), ca });
+    } finally {
+      store.resolve(key, 1036, false);
+      store.revert(key, 1036);
+      if (exact(await desc().catch(() => ({ unread: true }))) !== exact(d0)) await putDesc(d0);
+      const back = await desc();
+      ok('conflict description restored exactly, every language as read', exact(back) === exact(d0), { d0, back });
+    }
   });
 
   await step('metadata2', async () => {
@@ -181,7 +303,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
   });
 
   await step('records', async () => {
-    const FORM = (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2`)).value[0].formid;
+    const FORM = await mainForm();
     for (const [kind, id, set, col, prop] of [
       ['view', (await testIds()).view, 'savedqueries', 'name', 'Name'],
       ['form', FORM, 'systemforms', 'name', 'Name'],
@@ -270,33 +392,42 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
   });
 
   await step('formxml', async () => {
-    const FORM = (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2`)).value[0].formid;
+    const FORM = await mainForm();
     const fref = await providers.getForm(ctx, FORM);
     const fs = await providers.loadFormXml(ctx, [fref], [1033, 1036], lo);
     store.add(fs);
     const cell = fs.find((s) => s.kind === 'field' && s.ref?.controlId === 'new_name');
     const tab = fs.find((s) => s.kind === 'tab');
-    const unpub = async () => xmlDoc((await get(`systemforms(${FORM})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=formxml`)).formxml);
+    const unpub = () => unpubDoc(FORM);
     const cellId = norm(cell.key.split('|')[2]);
     const tabId = norm(tab.key.split('|')[2]);
-    const cellLabels = (doc) => labelMap([...doc.getElementsByTagName('cell')].find((c) => norm(c.getAttribute('id')) === cellId));
+    const cellLabels = (doc) => labelMap(cellIn(doc, cellId));
     const tabLabels = (doc) => labelMap([...doc.getElementsByTagName('tab')].find((c) => norm(c.getAttribute('id')) === tabId));
-    const cb = cellLabels(await unpub());
-    const t = tgt(cb[1036], 'Nom E2E');
-    const rep = await editSave(cell.key, 1036, t);
-    const ca = cellLabels(await unpub());
-    ok('cell fr saved', rep.saved === 1 && ca[1036] === t && ca[1033] === cb[1033], { rep: res(rep), cb, ca });
-    // Field labels can't be removed (LIVE-FINDINGS 37): clearing writes what the field shows without one, its column's
-    // French name, else its English name (LIVE-FINDINGS 42, model.ts standIn); with the column's names not loaded here,
-    // it is refused and nothing is written.
-    store.set(cell.key, 1036, '');
-    const si = store.standIn(cell.key, 1036, ctx.base);
-    const rep2 = await editSave(cell.key, 1036, '');
-    const cc = cellLabels(await unpub());
-    ok('cell clear writes its column name (field label)', (si?.text ? rep2.saved === 1 && cc[1036] === si.text : blocked(rep2) && cc[1036] === t) && cc[1033] === cb[1033], { rep: res(rep2), cc, si });
-    store.set(cell.key, 1036, t);
-    const rep3 = await editSave(cell.key, 1036, orig(cb[1036], 'Nom'));
-    ok('cell restored', rep3.saved === 1 || rep3.noop, res(rep3));
+    // The field on a label key of its own, given back after (onTestKey).
+    const c0 = cellLabels(await unpub());
+    const k = await onTestKey(FORM, cellId);
+    try {
+      await refresh(FORM, true);
+      const cb = cellLabels(await unpub());
+      const t = tgt(cb[1036], 'Nom E2E');
+      const rep = await editSave(cell.key, 1036, t);
+      const ca = cellLabels(await unpub());
+      ok('cell fr saved', rep.saved === 1 && clean(rep) && ca[1036] === t && ca[1033] === cb[1033], { rep: res(rep), w: rep.warning, n: rep.notice, cb, ca });
+      // Field labels can't be removed (LIVE-FINDINGS 37, 104): clearing writes what the field shows without one, its column's
+      // French name, else its English name (LIVE-FINDINGS 42, model.ts standIn), as a text of the label's own on the same key.
+      store.set(cell.key, 1036, '');
+      const si = store.standIn(cell.key, 1036, ctx.base);
+      const rep2 = await editSave(cell.key, 1036, '');
+      const d2 = await unpub();
+      const cc = cellLabels(d2);
+      ok('cell clear writes its column name (field label), on the same key', !!si?.text && rep2.saved === 1 && clean(rep2) && cc[1036] === si.text && cc[1033] === cb[1033] && keyIn(d2, cellId) === k.key, { rep: res(rep2), w: rep2.warning, n: rep2.notice, cc, si, key: keyIn(d2, cellId), k: k.key });
+    } finally {
+      if (store.isEdited(cell.key, 1036)) store.revert(cell.key, 1036);
+      const back = await k.restore();
+      const c1 = cellLabels(await unpub());
+      ok('cell restored (its own label key back, its labels as before)', back && JSON.stringify(c1) === JSON.stringify(c0), { c0, c1 });
+      await refresh(FORM);
+    }
 
     const tb = { ...tab.labels };
     const tt = tgt(tb[1036], 'Général E2E');
@@ -319,45 +450,47 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
   await step('undo after publish: form', async () => {
     // A form label saved and published, then undone from its journal entry with publishing on, as Recent publishes'
     // Undo does (saver.undo): its French text is back and published, the form's every other label as it was, the entry
-    // marked undone, and the undo journaled and published (its Redo).
-    const FORM = (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2`)).value[0].formid;
+    // marked undone, and the undo journaled and published (its Redo). On a test key (onTestKey), given back after: where its
+    // French text was its column's name, the undo writes that name back as a text of its own there, the same text.
+    const FORM = await mainForm();
     const fs = await providers.loadFormXml(ctx, [await providers.getForm(ctx, FORM)], [1033, 1036], lo);
     store.add(fs);
     const cell = fs.find((s) => s.kind === 'field' && s.ref?.controlId === 'new_name');
     const cellId = norm(cell.key.split('|')[2]);
-    const unpub = async () => xmlDoc((await get(`systemforms(${FORM})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=formxml`)).formxml);
-    const cellLabels = (doc) => labelMap([...doc.getElementsByTagName('cell')].find((c) => norm(c.getAttribute('id')) === cellId));
+    const unpub = () => unpubDoc(FORM);
+    const cellLabels = (doc) => labelMap(cellIn(doc, cellId));
     /** Every label of the form: `<element>#<id>` -> its labels. */
     const allLabels = (doc) => Object.fromEntries([...doc.querySelectorAll('[id]')].filter((x) => x.querySelector(':scope > labels')).map((x) => [`${x.tagName}#${norm(x.getAttribute('id'))}`, labelMap(x)]));
     // Published once the published form's version is the unpublished one (the Publish dialog's own check, review.ts).
     const versions = async () => [(await get(`systemforms(${FORM})?$select=versionnumber`)).versionnumber, (await get(`systemforms(${FORM})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=versionnumber`)).versionnumber];
-    const d0 = await unpub();
-    const b = cellLabels(d0);
-    const all0 = allLabels(d0);
-    const t = tgt(b[1036], 'Nom E2E');
+    const c0 = cellLabels(await unpub());
+    const k = await onTestKey(FORM, cellId);
     try {
+      await refresh(FORM, true);
+      const d0 = await unpub();
+      const b = cellLabels(d0);
+      const all0 = allLabels(d0);
+      const t = tgt(b[1036], 'Nom E2E');
       const rep = await editSave(cell.key, 1036, t, true);
       const e = saver.history().find((x) => x.id === rep.historyId);
       const [p1, u1] = await versions();
-      ok('undo after publish (form): saved, published and journaled', rep.saved === 1 && rep.published && !rep.publishError && e?.published && e.items.length === 1 && e.items[0].before === (b[1036] || '') && e.items[0].after === t && cellLabels(await unpub())[1036] === t && p1 === u1, { rep: res(rep), e, p1, u1 });
+      ok('undo after publish (form): saved, published and journaled', rep.saved === 1 && clean(rep) && rep.published && !rep.publishError && e?.published && e.items.length === 1 && e.items[0].before === (b[1036] || '') && e.items[0].after === t && cellLabels(await unpub())[1036] === t && p1 === u1, { rep: res(rep), e, p1, u1 });
       if (!e) return;
       const u = await saver.undo(e, opts(true));
       const d1 = await unpub();
       const [p2, u2] = await versions();
-      ok('undo after publish (form): the French text is back and published, every other label as it was', u.saved === 1 && u.errors === 0 && u.conflicts === 0 && u.published && !u.publishError && cellLabels(d1)[1036] === b[1036] && JSON.stringify(allLabels(d1)) === JSON.stringify(all0) && p2 === u2, { u: res(u), now: cellLabels(d1), b, p2, u2 });
+      ok('undo after publish (form): the French text is back and published, every other label as it was', u.saved === 1 && clean(u) && u.errors === 0 && u.conflicts === 0 && u.published && !u.publishError && cellLabels(d1)[1036] === b[1036] && JSON.stringify(allLabels(d1)) === JSON.stringify(all0) && p2 === u2, { u: res(u), now: cellLabels(d1), b, p2, u2 });
       const marked = saver.history().find((x) => x.id === e.id);
       const redo = saver.history().find((x) => x.id === u.historyId);
       ok('undo after publish (form): the entry is undone, the undo journaled and published', !!marked?.undoneAt && !marked.kept && redo?.published && redo.items.length === 1 && redo.items[0].before === t && redo.items[0].after === (b[1036] || ''), { marked, redo });
     } finally {
-      // Read again first: a write whose answer was lost commits nothing, and the store would take the text for unchanged.
-      if (cellLabels(await unpub())[1036] !== b[1036]) {
-        store.revert(cell.key, 1036);
-        store.add(await providers.loadFormXml(ctx, [await providers.getForm(ctx, FORM)], [1033, 1036], lo));
-        await editSave(cell.key, 1036, orig(b[1036], 'Nom'), true);
-      }
-      // A publish that failed leaves the form unpublished, its published text the test's.
+      // The cell's own key back (published with it), whatever the test left on the test key.
+      if (store.isEdited(cell.key, 1036)) store.revert(cell.key, 1036);
+      const back = await k.restore();
+      const c1 = cellLabels(await unpub());
       const [p, u] = await versions();
-      if (p !== u) await fetch(api + 'PublishXml', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ ParameterXml: `<importexportxml><entities><entity>${E}</entity></entities></importexportxml>` }) });
+      ok('undo after publish (form) restored: its own label key back, its labels as before, published', back && JSON.stringify(c1) === JSON.stringify(c0) && p === u, { c0, c1, p, u });
+      await refresh(FORM);
     }
   });
 
@@ -365,7 +498,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     // A cell whose control is bound to no column keeps its labels per UI language, as a tab does (LIVE-FINDINGS 102):
     // the test form's timeline (its last tab, "Timeline test"). Loaded in each language as Dynamics keeps it (read here
     // while switched to it), its French label is written in French, its English one kept; then put back.
-    const FORM = (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2`)).value[0].formid;
+    const FORM = await mainForm();
     const fs = await providers.loadFormXml(ctx, [await providers.getForm(ctx, FORM)], [1033, 1036], lo);
     store.add(fs);
     const tl = fs.find((s) => s.kind === 'field' && /06375649-c143-495e-a496-c962e5b4488e/i.test(s.ref?.classid || ''));
@@ -480,7 +613,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     localStorage.setItem('dxt:test:bpfOriginal', JSON.stringify({ xaml: orig0.xaml, clientdata: orig0.clientdata }));
     let t = '';
     try {
-      const bs = await (providers.loadBpf || providers.loadBpfLabels)(ctx, WF, lo);
+      const bs = await loadBpf(ctx, WF, lo);
       store.add(bs);
       const stage = bs.find((s) => s.kind === 'stage');
       t = tgt(stage.labels[1036], 'Étape E2E');
@@ -525,7 +658,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     let shown;
     let k0 = {};
     try {
-      const bs = await (providers.loadBpf || providers.loadBpfLabels)(ctx, WF, lo);
+      const bs = await loadBpf(ctx, WF, lo);
       store.add(bs);
       k0 = await kept();
       const d0 = defined(orig0);
@@ -601,7 +734,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     let slotKey = '';
     let shown = '';
     try {
-      const bs = await providers.loadBpfLabels(ctx, WF, lo);
+      const bs = await loadBpf(ctx, WF, lo);
       // A step (else a stage) whose French name only Dynamics keeps, its own (not the English name, nor a test's).
       const fr = (x) => k0[`${norm(x.ref.labelId)}|1036`];
       const find = (kind) => bs.find((x) => x.kind === kind && !x.labels[1036] && fr(x) && fr(x) !== x.labels[ctx.base] && !/E2E/.test(fr(x)));
@@ -630,7 +763,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
       // In the Workbench: the definition as it was (no French name for that step), read again.
       await restore();
       store.revert(slotKey, 1036);
-      store.add(await providers.loadBpfLabels(ctx, WF, lo));
+      store.add(await loadBpf(ctx, WF, lo));
       const t2 = tgt(shown, 'Pas Workbench E2E');
       const rep2 = await editSave(slotKey, 1036, t2, true);
       const e2 = saver.history().find((x) => x.id === rep2.historyId);
@@ -651,7 +784,7 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
       const now = await kept().then((k) => k[key], () => undefined);
       if (slotKey && shown && now !== shown) {
         store.revert(slotKey, 1036);
-        const fresh = await providers.loadBpfStored(ctx, await providers.loadBpfLabels(ctx, WF, lo), { entity: orig0.primaryentity, record, app }, lo).catch(() => null);
+        const fresh = await providers.loadBpfStored(ctx, await loadBpf(ctx, WF, lo), { entity: orig0.primaryentity, record, app }, lo).catch(() => null);
         if (fresh) store.add(fresh.slots);
         const r = await editSave(slotKey, 1036, shown).catch((e) => ({ saved: 0, unchanged: 0, results: [], e: String(e) }));
         ok('undo after publish (bpf) restored: the kept French name written back', r.saved + (r.unchanged || 0) === 1, r.e || res(r));
@@ -687,6 +820,198 @@ window.__dxtE2E = { running: true, log: [], progress: [] };
     ok('unmanaged test table: editable', mine.length && mine.every((s) => !s.readOnly && s.ref.managed === false), mine.map((s) => [s.key, s.readOnly]));
     const sm = await providers.loadSitemap(ctx, (await testIds()).sitemap, lo);
     ok('unmanaged test sitemap: read as unmanaged, its items editable', sm.length && sm.every((s) => s.ref.managed === false) && sm.some((s) => !s.readOnly), sm.slice(0, 5).map((s) => [s.key, s.readOnly, s.ref.managed]));
+  });
+
+  // ---- The kept test components of 'form labels' (named in the header), created when missing: the text column
+  // new_dxtremove and the main form "DXT e2e form labels", inactive (the app never opens it), holding new_name (no label
+  // of its own), new_dxtremove (English "Own remove", French "Propre retrait") and, in the header, header_new_dxtremove
+  // (English "Own header"). Their labels stay under the cells' ids: every test works on a test key (onTestKey). ----
+  const FX = { col: 'new_dxtremove', names: { 1033: 'DXT Remove', 1036: 'Retrait DXT' }, own: { 1033: 'Own remove', 1036: 'Propre retrait' }, form: 'DXT e2e form labels' };
+  const colUrl = `EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='${FX.col}')`;
+  const colNames = async () => labelsOf((await get(`${colUrl}?$select=DisplayName`)).DisplayName);
+  /** The fixture column's names set elsewhere than through the translator: every language in one PUT (LIVE-FINDINGS 2), not published. */
+  const rawRename = (names) =>
+    d.lang.quiet(async () => {
+      const LocalizedLabels = Object.entries(names).map(([l, Label]) => ({ '@odata.type': 'Microsoft.Dynamics.CRM.LocalizedLabel', Label, LanguageCode: Number(l) }));
+      const r = await fetch(api + colUrl, { method: 'PUT', headers: { ...JH, 'MSCRM.MergeLabels': 'true' }, body: JSON.stringify({ '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata', LogicalName: FX.col, DisplayName: { '@odata.type': 'Microsoft.Dynamics.CRM.Label', LocalizedLabels } }) });
+      if (!r.ok) throw new Error(`rename ${FX.col}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+    });
+  /** The fixtures, made when missing, with the column's names and the cells' keys as the steps expect them; the form's id. */
+  async function fixtures() {
+    const LL = (Label, LanguageCode) => ({ '@odata.type': 'Microsoft.Dynamics.CRM.LocalizedLabel', Label, LanguageCode });
+    if (!(await get(`${colUrl}?$select=LogicalName`).catch(() => null)))
+      await d.lang.quiet(async () => {
+        const r = await fetch(api + `EntityDefinitions(LogicalName='${E}')/Attributes`, {
+          method: 'POST',
+          headers: JH,
+          body: JSON.stringify({
+            '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata',
+            SchemaName: FX.col,
+            AttributeType: 'String',
+            AttributeTypeName: { Value: 'StringType' },
+            MaxLength: 100,
+            FormatName: { Value: 'Text' },
+            RequiredLevel: { Value: 'None', CanBeChanged: true, ManagedPropertyLogicalName: 'canmodifyrequirementlevelsettings' },
+            DisplayName: { '@odata.type': 'Microsoft.Dynamics.CRM.Label', LocalizedLabels: [LL(FX.names[1033], 1033), LL(FX.names[1036], 1036)] },
+            Description: { '@odata.type': 'Microsoft.Dynamics.CRM.Label', LocalizedLabels: [LL('Translator live tests: a form label fixture (tools/e2e-suite.js)', 1033)] },
+          }),
+        });
+        if (!r.ok) throw new Error(`create ${FX.col}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+      });
+    // A French name given at creation may not be stored, and a failed run may have left a rename.
+    const n = await colNames();
+    if (n[1033] !== FX.names[1033] || n[1036] !== FX.names[1036]) await rawRename(FX.names);
+    const find = async () => (await get(`systemforms?$select=formid&$filter=objecttypecode eq '${E}' and type eq 2 and name eq '${FX.form}'`)).value[0]?.formid;
+    let id = await find();
+    if (!id) {
+      const g = () => `{${crypto.randomUUID()}}`;
+      const lab = (en, fr) => `<labels><label description="${en}" languagecode="1033" />${fr ? `<label description="${fr}" languagecode="1036" />` : ''}</labels>`;
+      const ctl = (cid, df) => `<control id="${cid}" classid="{4273EDBD-AC1D-40d3-9FB2-095C621B552D}" datafieldname="${df}" disabled="false" />`;
+      const xml =
+        `<form><tabs><tab name="dxt_fl_tab" id="${g()}" IsUserDefined="1" verticallayout="true" showlabel="true" expanded="true">${lab('Form labels', 'Libellés')}<columns><column width="100%"><sections>` +
+        `<section name="dxt_fl_sec" id="${g()}" IsUserDefined="0" showlabel="true" showbar="false" columns="1">${lab('Fields', 'Champs')}<rows>` +
+        `<row><cell id="${g()}">${lab('Name')}${ctl('new_name', 'new_name')}</cell></row>` +
+        `<row><cell id="${g()}">${lab(FX.own[1033], FX.own[1036])}${ctl(FX.col, FX.col)}</cell></row>` +
+        `</rows></section></sections></column></columns></tab></tabs>` +
+        `<header id="${g()}" celllabelposition="Top" columns="111" labelwidth="115" celllabelalignment="Left"><rows><row><cell id="${g()}">${lab('Own header')}${ctl('header_' + FX.col, FX.col)}</cell></row></rows></header>` +
+        `<DisplayConditions Order="99" FallbackForm="false"><Everyone /></DisplayConditions></form>`;
+      await d.lang.hold(async () => {
+        const r = await fetch(api + 'systemforms', { method: 'POST', headers: JH, body: JSON.stringify({ name: FX.form, description: 'Translator live tests: main-form field label fixture (tools/e2e-suite.js), kept', objecttypecode: E, type: 2, formactivationstate: 0, formxml: xml }) });
+        if (!r.ok) throw new Error(`create the form "${FX.form}": ${r.status} ${(await r.text()).slice(0, 200)}`);
+      });
+      id = await find();
+    }
+    // A failed run may have left a fixture cell on a test key: its own key back (none).
+    const doc = await unpubDoc(id);
+    if ([...doc.getElementsByTagName('cell')].some((c) => columnCell(c) && c.getAttribute('labelid'))) await rawPatch(id, (x) => [...x.getElementsByTagName('cell')].forEach((c) => c.removeAttribute('labelid')));
+    await publishE();
+    return id;
+  }
+
+  await step('form labels', async () => {
+    // A main form's field labels (LIVE-FINDINGS 103, 104), on the fixture form, each test with the cell new_dxtremove on a
+    // test key: a save posts only the labels it changes; an emptied label is saved as 1.0.0 saves it, French as its
+    // stand-in (the column's French name, a text of the label's own on the same key), which Undo writes the own text back
+    // over, English refused; a column rename and an emptied French label in one save.
+    // After every save the check after the write has nothing to say (no warning, no notice).
+    const FL = await fixtures();
+    const doc0 = await unpubDoc(FL);
+    const CELL = norm([...doc0.getElementsByTagName('cell')].find((c) => c.querySelector(':scope > control')?.getAttribute('id') === FX.col)?.getAttribute('id'));
+    if (!CELL) return ok('form labels: the fixture form has the cell new_dxtremove', false, FL);
+    const SK = `field|${norm(FL)}|${CELL}|Label`;
+    const CK = `attribute|${E}.${FX.col}|DisplayName`;
+    const read = async () => {
+      const doc = await unpubDoc(FL);
+      return { labels: labelMap(cellIn(doc, CELL)), key: keyIn(doc, CELL) };
+    };
+    const at0 = await read();
+    ok('form labels: the fixture cell shows its own labels, on its own id', !at0.key && at0.labels[1033] === FX.own[1033] && at0.labels[1036] === FX.own[1036], at0);
+    const lname = (l) => (l === 1033 ? 'English' : 'French');
+    /** Runs `fn(k)` with the cell on a test key, then puts back the column's names and the cell's own key. */
+    const keyed = async (name, fn) => {
+      const k = await onTestKey(FL, CELL);
+      try {
+        const fs = await refresh(FL, true, [ctx.user]);
+        if (!fs.some((s) => s.key === SK && s.ref.sparse)) return ok(`${name}: the fixture cell loaded as a main form's column cell`, false, fs.map((s) => [s.key, s.ref.sparse]));
+        await fn(k);
+      } finally {
+        for (const [key, l] of [[SK, 1033], [SK, 1036], [CK, 1033], [CK, 1036]]) if (store.isEdited(key, l)) store.revert(key, l);
+        const n = await colNames();
+        if (n[1033] !== FX.names[1033] || n[1036] !== FX.names[1036]) await rawRename(FX.names);
+        const back = await k.restore();
+        const now = await read();
+        ok(`${name}: restored (the cell's own key and labels, the column's names)`, back && JSON.stringify(now) === JSON.stringify(at0) && JSON.stringify(await colNames()) === JSON.stringify(FX.names), now);
+        await refresh(FL, true, [ctx.user]);
+      }
+    };
+
+    await keyed('form: a save posts only what it changes', async (k) => {
+      const d0 = await unpubDoc(FL);
+      const t = FX.own[1036] + ' E2E';
+      const cap = capture();
+      let rep;
+      try {
+        rep = await editSave(SK, 1036, t);
+      } finally {
+        cap.stop();
+      }
+      const sent = cap.bodies[0] && xmlDoc(cap.bodies[0]);
+      const cells = sent ? [...sent.getElementsByTagName('cell')].filter(columnCell) : [];
+      const mine = cells.find((c) => norm(c.getAttribute('id')) === CELL);
+      const others = cells.filter((c) => c !== mine);
+      const tabs = (doc) => JSON.stringify([...doc.querySelectorAll('tab, section')].map(labelMap));
+      ok(
+        'form: a save posts no labels for the column cells it leaves alone (body and header), only French on the one it edits, the tab and section as read',
+        cap.bodies.length === 1 && mine && JSON.stringify(labelMap(mine)) === JSON.stringify({ 1036: t }) && keyIn(sent, CELL) === k.key && others.length === 2 && others.every((c) => !c.querySelector(':scope > labels')) && tabs(sent) === tabs(d0),
+        { n: cap.bodies.length, mine: mine && labelMap(mine), others: others.map((c) => [c.querySelector(':scope > control')?.getAttribute('id'), labelMap(c)]) },
+      );
+      const a = await read();
+      ok('form: the edit saved, English kept; nothing else to say', rep.saved === 1 && clean(rep) && a.labels[1036] === t && a.labels[1033] === FX.own[1033] && a.key === k.key, { rep: res(rep), w: rep.warning, n: rep.notice, a });
+    });
+
+    // French emptied, as 1.0.0 saves it: written as its stand-in, the column's French name, a text of the label's own on
+    // the same key (LIVE-FINDINGS 104), which a rename made elsewhere leaves as it is; then the undo, as Recent publishes'
+    // Undo does it, writes the own text back.
+    await keyed('form: French emptied', async (k) => {
+      const name = 'form: French emptied';
+      store.set(SK, 1036, '');
+      const si = store.standIn(SK, 1036, ctx.base);
+      const cap = capture();
+      let rep;
+      try {
+        rep = await saver.save(store.changes((s) => s.key === SK), opts(true));
+      } finally {
+        cap.stop();
+      }
+      const e = saver.history().find((x) => x.id === rep.historyId);
+      const a = await read();
+      const sent = cap.bodies[0] && cellIn(xmlDoc(cap.bodies[0]), CELL);
+      ok(
+        `${name}: saved and published as the column's French name, on the same key, English kept, journaled as written; nothing else to say`,
+        si?.text === FX.names[1036] && rep.saved === 1 && rep.errors + rep.conflicts === 0 && rep.published && clean(rep) &&
+          a.key === k.key && a.labels[1036] === FX.names[1036] && a.labels[1033] === FX.own[1033] &&
+          norm(sent?.getAttribute('labelid')) === k.key && JSON.stringify(labelMap(sent)) === JSON.stringify({ 1036: FX.names[1036] }) &&
+          e?.items.length === 1 && e.items[0].before === FX.own[1036] && e.items[0].after === FX.names[1036],
+        { rep: res(rep), w: rep.warning, n: rep.notice, si, a, k: k.key, sent: sent && new XMLSerializer().serializeToString(sent), e },
+      );
+      if (!e) return;
+      await rawRename({ ...FX.names, 1036: FX.names[1036] + ' 2' });
+      const b = await read();
+      ok(`${name}: a rename made elsewhere leaves it (a text of its own)`, b.labels[1036] === FX.names[1036] && b.labels[1033] === FX.own[1033] && b.key === k.key, b);
+      const u = await saver.undo(e, opts(true));
+      const c = await read();
+      ok(`${name}: Undo writes the own text back, on the same key; nothing else to say`, u.saved === 1 && u.errors + u.conflicts === 0 && u.published && clean(u) && [1033, 1036].every((l) => c.labels[l] === FX.own[l]) && c.key === k.key && !!saver.history().find((x) => x.id === e.id)?.undoneAt, { u: res(u), w: u.warning, n: u.notice, c });
+    });
+
+    // English emptied, refused as 1.0.0 refuses it: nothing stands in for the base language, and Dataverse keeps a label
+    // posted empty (LIVE-FINDINGS 104), so the change is an error saying so; the label as it was, nothing journaled.
+    await keyed('form: English emptied (the base language)', async (k) => {
+      const ids0 = new Set(saver.history().map((x) => x.id));
+      store.set(SK, 1033, '');
+      const rep = await saver.save(store.changes((s) => s.key === SK), opts(true));
+      const a = await read();
+      ok(
+        'form: English emptied is refused as in 1.0.0: Dataverse kept the label, the change an error, nothing journaled',
+        rep.saved === 0 && rep.results[0]?.outcome === 'error' && rep.results[0]?.message === 'Dataverse did not keep this label. Reload the form to see what is saved.' &&
+          !rep.historyId && saver.history().every((x) => ids0.has(x.id)) && a.key === k.key && a.labels[1033] === FX.own[1033] && a.labels[1036] === FX.own[1036],
+        { rep: res(rep), a, k: k.key },
+      );
+    });
+
+    // Last: the translator's own rename of the column makes its saves read that column's names as lagging behind it
+    // for a minute (LIVE-FINDINGS 66), and the raw renames after it would hold back a save on this cell in that time.
+    await keyed('form: a column rename and an emptied French label in one save', async (k) => {
+      const t = FX.names[1036] + ' 3';
+      store.set(CK, 1036, t);
+      store.set(SK, 1036, '');
+      const rep = await saver.save(store.changes((s) => s.key === SK || s.key === CK), opts(true));
+      const a = await read();
+      const col = await colNames();
+      ok("form: a column rename and an emptied French label in one save: both saved, the label written as the column's new name once the rename is saved, English kept; nothing else to say", rep.saved === 2 && rep.errors + rep.conflicts === 0 && clean(rep) && col[1036] === t && a.labels[1036] === t && a.labels[1033] === FX.own[1033] && a.key === k.key, { rep: res(rep), w: rep.warning, n: rep.notice, col, a, k: k.key });
+      await rawRename({ ...FX.names, 1036: FX.names[1036] + ' 4' });
+      const b = await read();
+      ok('form: …a text of its own: the next rename leaves it', b.labels[1036] === t && b.labels[1033] === FX.own[1033], b);
+    });
   });
 
   if (window.__dxtE2EWithRibbon) {

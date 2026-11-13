@@ -40,7 +40,7 @@
   var isRecord = (v) => !!v && typeof v === "object" && !Array.isArray(v);
   var abortError = () => new DOMException("The operation was cancelled.", "AbortError");
   var isAbort = (e) => e instanceof DOMException && e.name === "AbortError";
-  var turnedAway = (e) => e instanceof DvError && (e.status === 429 || e.status === 503 && (!e.write || e.retryAfter > 0) || /cannot start another|0x80071151|customizationlock|another \[/i.test(`${e.message} ${e.code}`));
+  var turnedAway = (e) => e instanceof DvError && (e.status === 429 || e.status === 503 && (!e.write || e.retryAfter > 0) || /cannot start another|0x80071151|customizationlock|another \[|was deadlocked on lock resources/i.test(`${e.message} ${e.code}`));
   var mayHaveRun = (e) => !isAbort(e) && (!(e instanceof DvError) || (e.status === 0 || e.status >= 500) && !turnedAway(e));
   var Http = class {
     constructor(origin, version = "9.2") {
@@ -380,6 +380,26 @@
   var isRtl = (lcid) => lcid === 1025 || lcid === 1037;
 
   // src/core/context.ts
+  var NOT_CUSTOMIZER = "Only System Administrators and System Customizers can publish translations.";
+  var CUSTOMIZERS = ["627090ff-40a3-4053-8790-584edc5be201", "119f245c-3cc8-4b62-b31c-d1a046ced15d"];
+  async function customizer(http) {
+    const roles = `<filter><condition attribute="roletemplateid" operator="in">${CUSTOMIZERS.map((t) => `<value>${t}</value>`).join("")}</condition></filter>`;
+    const me = '<filter><condition attribute="systemuserid" operator="eq-userid" /></filter>';
+    const has2 = (link2) => http.get(`roles?fetchXml=${encodeURIComponent(`<fetch top="1" no-lock="true"><entity name="role"><attribute name="roleid" />${roles}${link2}</entity></fetch>`)}`).then(
+      (r) => Array.isArray(r?.value) && r.value.length > 0,
+      (e) => {
+        if (e instanceof DvError && e.status === 403) return false;
+        throw e;
+      }
+    );
+    const got = await Promise.allSettled([
+      has2(`<link-entity name="systemuserroles" from="roleid" to="roleid" intersect="true">${me}</link-entity>`),
+      has2(`<link-entity name="teamroles" from="roleid" to="roleid" intersect="true"><link-entity name="teammembership" from="teamid" to="teamid" intersect="true">${me}</link-entity></link-entity>`)
+    ]);
+    if (got.some((g) => g.status === "fulfilled" && g.value)) return true;
+    for (const g of got) if (g.status === "rejected") throw g.reason;
+    return false;
+  }
   function findXrm() {
     const w = window;
     if (w.Xrm?.Utility?.getGlobalContext) return w.Xrm;
@@ -426,10 +446,11 @@
     const version = String(gc?.getVersion?.() || "9.2");
     const m = /^(\d+)\.(\d+)/.exec(version);
     const http = new Http(origin, m && Number(m[1]) === 9 && Number(m[2]) < 2 ? `${m[1]}.${m[2]}` : "9.2");
-    const [who, provisioned, cur2] = await Promise.all([
+    const [who, provisioned, cur2, may] = await Promise.all([
       http.get("WhoAmI()"),
       http.get("RetrieveProvisionedLanguages()"),
-      http.get("RetrieveCurrentOrganization(AccessType=Microsoft.Dynamics.CRM.EndpointAccessType'Default')").catch(() => null)
+      http.get("RetrieveCurrentOrganization(AccessType=Microsoft.Dynamics.CRM.EndpointAccessType'Default')").catch(() => null),
+      customizer(http)
     ]);
     const [orgRow, ui] = await Promise.all([
       http.get(`organizations(${guid(who.OrganizationId)})?$select=languagecode,name`).catch(() => null),
@@ -466,7 +487,8 @@
       base,
       user,
       langs,
-      version
+      version,
+      customizer: may
     };
   }
   function pageInfo(xrm) {
@@ -890,7 +912,7 @@
         if (signal?.aborted) throw abortError();
         const orig = this.orig;
         const path = us2(this.ctx);
-        const all2 = [
+        const all = [
           { method: "GET", url: `${path}?$select=uilanguageid` },
           { method: "PATCH", url: path, body: { uilanguageid: lcid } },
           PROBE,
@@ -905,7 +927,7 @@
         const sent2 = () => this.mark(orig, lcid, until = this.clock() + LOST_MS);
         let res2;
         try {
-          res2 = await http.batch(all2, { idempotent: false, once: !reads2, onSend: sent2 });
+          res2 = await http.batch(all, { idempotent: false, once: !reads2, onSend: sent2 });
         } catch (e) {
           if (answered(e)) {
             this.mark(orig, lcid);
@@ -919,7 +941,7 @@
           throw e;
         }
         this.mark(orig, lcid);
-        const back = res2[all2.length - 1].ok;
+        const back = res2[all.length - 1].ok;
         const was = clean && res2[0].ok ? Number(res2[0].data?.uilanguageid) : 0;
         if (was > 0 && was !== orig) {
           this.orig = was;
@@ -1177,9 +1199,10 @@
 
   // src/providers/types.ts
   var changeId = (c) => `${c.slot.key}#${c.lcid}`;
+  var CHANGED = "Someone changed this label after you loaded it.";
   function check(c, server, force) {
     if (server === c.after) return { change: c, outcome: "unchanged" };
-    if (server !== c.before && !force.has(changeId(c))) return { change: c, outcome: "conflict", server, message: "Someone changed this label after you loaded it." };
+    if (server !== c.before && server !== c.alsoBefore && !force.has(changeId(c))) return { change: c, outcome: "conflict", server, message: CHANGED };
     return null;
   }
 
@@ -1225,10 +1248,10 @@
   };
   function readHistory(ctx) {
     dropShared(ctx);
-    const all2 = stored(ctx);
-    if (!all2) return [];
-    const list2 = unexpired(all2);
-    if (list2.length < all2.length) void change(ctx, () => null);
+    const all = stored(ctx);
+    if (!all) return [];
+    const list2 = unexpired(all);
+    if (list2.length < all.length) void change(ctx, () => null);
     return list2;
   }
   function change(ctx, edit3) {
@@ -1243,9 +1266,9 @@
       for (let i = 0; ; i++) {
         const was = raw();
         if (was === void 0) return false;
-        const all2 = parse(was);
-        const list2 = unexpired(all2);
-        const next = edit3(list2) ?? (list2.length < all2.length ? list2 : null);
+        const all = parse(was);
+        const list2 = unexpired(all);
+        const next = edit3(list2) ?? (list2.length < all.length ? list2 : null);
         if (!next) return true;
         if (i < 3 && raw() !== was) continue;
         return write(ctx, next);
@@ -1386,7 +1409,14 @@
   };
   var slotKey = (kind, id, prop) => `${kind}|${id}|${prop}`;
   var MANAGED = "From a managed solution: a translation here would add an unmanaged layer on top of it. Translate it where its solution is developed.";
+  var MANAGED_OPEN = "From a managed solution: a change here adds an unmanaged layer on top of it, which stays until removed in Power Apps.";
+  var MANAGED_RIBBON = "From a managed solution: Allow changes to managed labels doesn't cover the classic command bar. Translate it where its solution is developed.";
   var isManaged = (s) => s.ref?.managed === true;
+  function managedSlot(s, allow, lock, held = MANAGED) {
+    return { ...s, readOnly: allow ? lock : held, ref: { ...s.ref, lock, held } };
+  }
+  var managedReadOnly = (s, allow) => allow && typeof s.ref?.lock === "string" ? s.ref.lock : typeof s.ref?.held === "string" ? s.ref.held : MANAGED;
+  var managedHeld = (s, allow) => isManaged(s) && !!managedReadOnly(s, allow);
   var canClear = (s, l) => !NO_CLEAR.has(s.kind) && !stays(s, l);
   var NO_CLEAR = /* @__PURE__ */ new Set(["entity", "attribute", "relationship", "option", "globaloptionset", "globaloption", "boolean", "state", "status", "tab", "section", "dtab", "dsection", "field", "dfield", "ribbon"]);
   var PER_LANGUAGE = /* @__PURE__ */ new Set(["tab", "section", "dtab", "dsection"]);
@@ -1412,6 +1442,11 @@
   }
   var bare = (t) => t.trim() ? t : "";
   function standIn(s, l, base, before, after, text4, untranslated) {
+    if (!after.trim() && before !== "" && freesAll(s, l, text4)) {
+      const t = filledIn(s, l, base, text4);
+      if (t === void 0) return { text: "", from: "column", why: "its column's names aren't loaded", unloaded: true };
+      return { text: t, from: text4(columnKey(s), l)?.trim() ? "column" : "columnBase", follow: true };
+    }
     if (l === base || after.trim() || before === "" && !untranslated || canClear(s, l) || savesEmpty(s, l, base, untranslated)) return void 0;
     const got = (x) => bare(x.text) === bare(before) ? { ...x, same: true } : x;
     const k = columnKey(s);
@@ -1426,19 +1461,48 @@
     if (b === void 0) return { text: "", from: "base", why: `its ${lcidName(base)} text isn't loaded`, unloaded: true };
     return b.trim() ? got({ text: b, from: "base" }) : { text: "", from: "base", why: `its ${lcidName(base)} text is empty` };
   }
+  var freesAll = (s, l, text4) => {
+    if (s.kind !== "field" || !s.ref?.sparse || s.ref.partial || s.readOnly || !columnKey(s) || !(l in s.labels)) return false;
+    return Object.keys(s.labels).every((k) => {
+      const x = Number(k);
+      const t = text4(s.key, x);
+      if (t === void 0) return false;
+      if (!t.trim()) return true;
+      return x !== l && s.ref.own?.[x] === false && t === s.labels[x];
+    });
+  };
   var columnKey = (s) => {
     const c = (s.kind === "field" || s.kind === "dfield") && s.prop === "Label" ? columnOf(s) : null;
     return c ? `attribute|${c.entity}.${c.attr}|DisplayName` : "";
   };
+  var filledIn = (s, l, base, text4) => {
+    const k = columnKey(s);
+    const own2 = k ? text4(k, l) : void 0;
+    const b = k ? text4(k, base) : void 0;
+    return own2 === void 0 || b === void 0 ? void 0 : own2.trim() ? own2 : b;
+  };
+  var fillsIn = (s, l, base, loaded, text4) => !s.readOnly && loaded === filledIn(s, l, base, text4);
+  var follows = (s, l, base, loaded, text4, user) => (s.ref?.own?.[l] ?? (user === void 0 ? void 0 : s.ref?.own?.[user])) === false && fillsIn(s, l, base, loaded, text4);
   function standInSources(s, l, base, from) {
     const k = columnKey(s);
     if (from === "base" || !k) return [{ key: s.key, lcid: base }];
     return from === "column" ? [{ key: k, lcid: l }] : [{ key: k, lcid: l }, { key: k, lcid: base }];
   }
+  function columnNames(key, langs, base, ...texts) {
+    const of = (l) => [...new Set(texts.map((t) => t(key, l) || t(key, base) || ""))].filter((x) => x !== "");
+    return Object.fromEntries(langs.map((l) => [l, of(l)]));
+  }
   var sourceName = (s, src) => src.key === s.key ? `Its ${lcidName(src.lcid)} text` : `Its column's ${lcidName(src.lcid)} name`;
   var sourceMoved = (s, src, now) => `${sourceName(s, src)} changed on the server since it was loaded (now ${now.trim() ? `“${now.trim()}”` : "empty"}), so nothing was written: Try again to put the new text in its place.`;
   var sourceUnsaved = (s, src) => `${sourceName(s, src)} wasn't saved, so nothing was written here either: Try again to save both.`;
   var sourceUnread = (s, src, why3) => `${sourceName(s, src)} couldn't be read to check it before writing (${why3.trim().replace(/[.!]+$/, "")}), so nothing was written. Try again.`;
+  var droppedBack = (form2, n, raced = false) => `Dataverse dropped ${n} label${n === 1 ? "" : "s"} of the form “${form2}” that this save did not change. ${n === 1 ? "It was" : "They were"} written back${raced ? ", but that may have replaced a save someone else made at the same moment" : ""}; check the form.`;
+  var droppedLeft = (form2, lost) => {
+    const n = lost.length;
+    const some = lost.slice(0, 3).map((x) => `${x.lang} “${x.text}”`).join(", ");
+    return `${n} label${n === 1 ? "" : "s"} of the form “${form2}” that this save did not change ${n === 1 ? "was" : "were"} changed on the server while it saved and could not be put back (${some}${n > 3 ? ` and ${n - 3} more` : ""}): check the form.`;
+  };
+  var behindText = (what) => `Not saved: Dataverse doesn't show your last change to this ${what} yet, and saving now could undo it. Try again in a minute.`;
   var unremovable = (s, l) => stays(s, l) ? `Dynamics keeps a ${s.kind}'s translation` : "Dataverse can't remove a translation";
   var standInWhat = (from, l, base) => from === "base" ? `the ${lcidName(base)} text` : `the column's ${lcidName(from === "column" ? l : base)} name`;
   var standInText = (s, l, base, from) => `${unremovable(s, l)}${stays(s, l) ? "" : " here"}, so ${lcidName(l)} gets ${standInWhat(from, l, base)}.`;
@@ -1596,7 +1660,7 @@
   var xmlAttr = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/\r/g, "&#xD;").replace(/\n/g, "&#xA;").replace(/\t/g, "&#x9;");
 
   // src/core/publish.ts
-  var isLockError = (e) => e instanceof DvError && (e.status === 429 || /Cannot start|0x80071151|CustomizationLock|another \[/i.test(`${e.message} ${e.code}`));
+  var isLockError = (e) => e instanceof DvError && (e.status === 429 || /Cannot start|0x80071151|CustomizationLock|another \[|was deadlocked on lock resources/i.test(`${e.message} ${e.code}`));
   var PartialPublishError = class extends Error {
   };
   var sleep4 = (ms, signal) => new Promise((resolve, reject) => {
@@ -1616,6 +1680,7 @@
     return body && `<importexportxml>${body}</importexportxml>`;
   }
   async function publishXml(ctx, set, signal, onRetry) {
+    if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
     let apps = set.appmodules.size > 0;
     let rejected = "";
     for (let waits = 0; ; ) {
@@ -1663,8 +1728,8 @@
     const late = () => new DvError(`Dataverse doesn't show the new ${lcidName(ctx.base)} name of the process yet.`, 0, "behind");
     if (signal?.aborted) throw abortError();
     const managed = (await ctx.http.get(`workflows(${wf})?$select=ismanaged`, { signal, headers: { Consistency: "Strong" } }))?.ismanaged;
-    if (managed === true) throw new DvError(`The process ${title} was not updated. ${MANAGED}`, 0, "managed");
-    if (managed !== false) throw new DvError(`The process ${title} was not updated: Dataverse did not say whether it is from a managed solution.`, 0, "unread");
+    if (managed === true && !ctx.managedEdits) throw new DvError(`The process ${title} was not updated. ${MANAGED}`, 0, "managed");
+    if (typeof managed !== "boolean") throw new DvError(`The process ${title} was not updated: Dataverse did not say whether it is from a managed solution.`, 0, "unread");
     if (olds.length)
       for (let i = 0; behind2((await read2(signal))[ctx.base]); i++) {
         if (i === 4) throw late();
@@ -1709,13 +1774,13 @@
       return [raced, other].filter(Boolean).join(" ");
     });
   }
-  function publishTargets(changes) {
+  function publishTargets(changes, managed) {
     const p = new PublishSet();
     const add2 = (set, v, id = false) => {
       if (v && v !== "none") set.add(id ? guid(v) : String(v));
     };
     for (const { slot: s } of changes) {
-      if (s.readOnly || isManaged(s)) continue;
+      if (s.readOnly || managedHeld(s, managed)) continue;
       const r = s.ref || {};
       switch (s.kind) {
         case "globaloptionset":
@@ -1765,6 +1830,7 @@
 
   // src/core/saver.ts
   var CANCELLED = "Cancelled before saving";
+  var BUSY = "A save is already running. Wait for it to finish.";
   var OPTIONS = /^(option|status|state|boolean|globaloption)$/;
   var placeholders = (t) => (t.match(/\{\d+\}/g) || []).length;
   var safe = (fn) => {
@@ -1793,11 +1859,11 @@
       return next.get(id) ?? (typeof read2 === "string" && loaded !== void 0 ? read2 : loaded);
     };
   };
-  function withStandIns(changes, base, text4) {
+  function withStandIns(changes, base, text4, managed) {
     return changes.map((c) => {
-      if (c.standIn || c.slot.readOnly || isManaged(c.slot)) return c;
+      if (c.standIn || c.slot.readOnly || managedHeld(c.slot, managed)) return c;
       const x = standIn(c.slot, c.lcid, base, c.before, c.after, text4, c.untranslated);
-      if (x?.text) return { ...c, after: x.text, standIn: { from: x.from, typed: c.after } };
+      if (x?.text) return { ...c, after: x.text, standIn: { from: x.from, typed: c.after, ...x.follow ? { follow: true } : {} } };
       if (x && c.untranslated && !x.unloaded && keepsEmpty(c.slot)) {
         const { untranslated: _, ...none } = c;
         return none;
@@ -1857,6 +1923,14 @@
   function createSaver(ctx, store, lang, writerFor) {
     let running = false;
     const base = ctx.base;
+    const langs = ctx.langs.map((l) => l.lcid);
+    const loaded = (k, l) => store.text(k, l, true);
+    const columnsOf = (text4) => (entity, attr3) => {
+      const k = `attribute|${entity}.${attr3}|DisplayName`;
+      if (!store.get(k)) return void 0;
+      const [was, now] = [columnNames(k, langs, base, loaded), columnNames(k, langs, base, text4)];
+      return { names: columnNames(k, langs, base, loaded, text4), renamed: langs.filter((l) => was[l][0] !== now[l][0]) };
+    };
     const stored4 = (text4) => text4.trim() ? text4 : "";
     const tried = /* @__PURE__ */ new Map();
     function check2(changes, purpose, text4) {
@@ -1865,7 +1939,7 @@
       const baseName = lcidName(base);
       for (const c of changes) {
         const { slot: s, lcid, after: v } = c;
-        const ro = s.readOnly || (isManaged(s) ? MANAGED : "");
+        const ro = s.readOnly || (isManaged(s) ? managedReadOnly(s, ctx.managedEdits) : "");
         if (ro) {
           out.push({ change: c, level: "error", message: `Read-only: ${ro}` });
           continue;
@@ -1926,7 +2000,7 @@
       let sent2 = staged.filter(writes);
       for (let round = 0; ; round++) {
         const text4 = saveText(store, sent2, o.now);
-        const changes = withStandIns(staged, base, text4);
+        const changes = withStandIns(staged, base, text4, ctx.managedEdits);
         const issues = check2(changes, purpose, text4);
         const at = new Map(changes.map((c, i) => [c, i]));
         const bad = new Set(issues.filter((i) => i.level === "error").map((i) => at.get(i.change)));
@@ -1999,10 +2073,26 @@
         if (i.unloaded) held.add(i.change);
       }
       const was = new Map(sent2.map((c) => [changeId(c), c.before]));
-      const stood = changes.filter((c) => c.standIn && !blocked2.has(c) && !c.slot.readOnly && !isManaged(c.slot));
-      const same4 = new Set(stood.filter((c) => bare2(c.after) === bare2(c.before)));
+      const stood = changes.filter((c) => c.standIn && !blocked2.has(c) && !c.slot.readOnly && !managedHeld(c.slot, ctx.managedEdits));
+      const same4 = new Set(stood.filter((c) => !c.standIn.follow && bare2(c.after) === bare2(c.before)));
+      const ids3 = new Set(changes.map(changeId));
       const { stale, now } = stood.length ? await sources(stood, [...same4], (k, l) => was.get(`${k}#${l}`) ?? store.original(k, l), signal) : { stale: /* @__PURE__ */ new Map(), now: /* @__PURE__ */ new Map() };
+      const renamedFirst = /* @__PURE__ */ new Set();
       const sentIds = new Set(sent2.map(changeId));
+      const firstOf = /* @__PURE__ */ new Map();
+      for (const [i, c] of changes.entries()) {
+        if (c.slot.kind !== "field" || c.slot.prop !== "Label" || c.standIn || blocked2.has(c) || !columnKey(c.slot)) continue;
+        const k = columnKey(c.slot);
+        const old = filledIn(c.slot, c.lcid, base, loaded);
+        const next = filledIn(c.slot, c.lcid, base, text4);
+        if (next === void 0 || old === void 0 || next === old) continue;
+        if (bare2(c.before) === bare2(old)) changes[i] = { ...c, alsoBefore: next };
+        if (bare2(c.after) !== bare2(old)) continue;
+        renamedFirst.add(changes[i]);
+        if (bare2(c.before) !== bare2(old)) continue;
+        const from = loaded(k, c.lcid)?.trim() || text4(k, c.lcid)?.trim() ? "column" : "columnBase";
+        firstOf.set(changes[i], standInSources(c.slot, c.lcid, base, from).map((src) => ({ ...src, id: `${src.key}#${src.lcid}` })).filter((src) => sentIds.has(src.id) && ids3.has(src.id)));
+      }
       const byId = new Map(changes.map((c) => [changeId(c), c]));
       const deps = /* @__PURE__ */ new Map();
       for (const c of stood) {
@@ -2018,11 +2108,16 @@
         const x = byId.get(src.id);
         return writerFor(x.slot.kind) === writerFor(c.slot.kind) && x.slot.group === c.slot.group;
       }) && apart(c).length > 0;
+      const unsaved = (c, list2) => {
+        const src = list2.find((x) => {
+          const r = outcomes.get(x.id);
+          return r?.outcome !== "saved" && r?.outcome !== "unchanged";
+        });
+        return src && sourceUnsaved(c.slot, src);
+      };
       const ready = (c, list2) => {
-        for (const src2 of list2) {
-          const r = outcomes.get(src2.id);
-          if (r?.outcome !== "saved" && r?.outcome !== "unchanged") return sourceUnsaved(c.slot, src2);
-        }
+        const no = unsaved(c, list2);
+        if (no) return no;
         const confirmed = (k, l) => {
           const r = list2.some((src2) => src2.id === `${k}#${l}`) ? outcomes.get(`${k}#${l}`) : void 0;
           return r ? stored4(r.change.after) : text4(k, l);
@@ -2033,10 +2128,10 @@
         return sourceMoved(c.slot, src, confirmed(src.key, src.lcid) ?? "");
       };
       const wait = [];
-      const decide2 = (all2) => {
+      const decide2 = (all) => {
         for (const c of [...wait]) {
           const list2 = deps.get(c);
-          if (!all2 && list2.some((src) => !outcomes.has(src.id))) continue;
+          if (!all && list2.some((src) => !outcomes.has(src.id))) continue;
           wait.splice(wait.indexOf(c), 1);
           const why3 = ready(c, list2);
           finish(why3 ? { change: c, outcome: "skipped", message: signal.aborted ? CANCELLED : why3 } : { change: c, outcome: "unchanged" });
@@ -2050,7 +2145,7 @@
         const msg = blocked2.get(c);
         const read2 = same4.has(c) ? now.get(c) : void 0;
         const r = typeof read2 === "string" ? check(c, read2, o.force ?? /* @__PURE__ */ new Set()) : null;
-        if (c.slot.readOnly || isManaged(c.slot) || held.has(c)) finish({ change: c, outcome: "skipped", message: msg });
+        if (c.slot.readOnly || managedHeld(c.slot, ctx.managedEdits) || held.has(c)) finish({ change: c, outcome: "skipped", message: msg });
         else if (msg) finish({ change: c, outcome: "error", message: msg });
         else if (stale.has(c)) finish({ change: c, outcome: "error", message: stale.get(c) });
         else if (r?.outcome === "unchanged" && deps.has(c)) wait.push(c);
@@ -2073,17 +2168,39 @@
       const lanes = { metadata: [], records: [], xml: [], doc: [], ribbon: [] };
       const after = { metadata: [], records: [], xml: [], doc: [], ribbon: [] };
       const later2 = { metadata: [], records: [], xml: [], doc: [], ribbon: [] };
-      for (const j of jobs) (split.has(j[1]) ? later2 : j[1].some((c) => apart(c).length) ? after : lanes)[j[0].lane].push(j);
+      const renames = new Set(changes.filter((c) => c.slot.kind === "attribute" && c.slot.prop === "DisplayName" && sentIds.has(changeId(c)) && !blocked2.has(c)).map((c) => c.slot.key));
+      const asRead = /* @__PURE__ */ new Map();
+      const waitsForRename = ([, cs]) => {
+        if (!renames.size) return false;
+        const form2 = guid(cs[0].slot.ref?.formId);
+        if (!asRead.has(form2)) {
+          const fields = [...store.slots.values()].filter((s) => s.kind === "field" && guid(s.ref?.formId) === form2);
+          const shown3 = fields.filter((s) => s.ref?.sparse !== true && s.ref?.datafield).map((s) => `attribute|${s.entity}.${String(s.ref.datafield).toLowerCase()}|DisplayName`);
+          asRead.set(form2, fields.length ? new Set(shown3) : null);
+        }
+        const cols = asRead.get(form2);
+        return [...renames].some((k) => cols ? cols.has(k) : k.startsWith(`attribute|${cs[0].slot.entity}.`));
+      };
+      for (const j of jobs) (split.has(j[1]) ? later2 : j[1].some((c) => apart(c).length || renamedFirst.has(c)) || j[0].lane === "xml" && waitsForRename(j) ? after : lanes)[j[0].lane].push(j);
       const pset = new PublishSet();
       const ran2 = /* @__PURE__ */ new Set();
-      const so = { signal, publish: pset, progress: tell, force: o.force ?? /* @__PURE__ */ new Set(), ran: ran2, lang, allowPublish: o.publish };
+      const warnings = [];
+      const notices = [];
+      const forms = /* @__PURE__ */ new Map();
+      const so = { signal, publish: pset, progress: tell, force: o.force ?? /* @__PURE__ */ new Set(), ran: ran2, lang, allowPublish: o.publish, column: columnsOf(text4), forms };
       const runJob = async ([w, cs]) => {
         const got = /* @__PURE__ */ new Map();
         let err = null;
         const sending = !signal.aborted;
+        const said = /* @__PURE__ */ new Set();
+        const warn = (m, level) => {
+          if (said.has(level + m)) return;
+          said.add(level + m);
+          (level === "warning" ? warnings : notices).push(m);
+        };
         if (sending)
           try {
-            for (const r of await w.save(ctx, cs, so)) got.set(changeId(r.change), r);
+            for (const r of await w.save(ctx, cs, { ...so, warn })) got.set(changeId(r.change), r);
           } catch (e) {
             err = e;
           }
@@ -2108,7 +2225,6 @@
       };
       tell(idle);
       const offWait = lang.onWait?.((w) => tell(w ? WAITING : idle));
-      const warnings = [];
       let stuck = false;
       const restore2 = () => lang.restore(signal).catch((e) => isAbort(e) ? Promise.reject(e) : lang.restore(signal)).catch((e) => {
         if (isAbort(e)) return;
@@ -2129,7 +2245,7 @@
           if (!signal.aborted)
             for (const c of [...cs]) {
               const list2 = apart(c);
-              const why3 = list2.length ? ready(c, list2) : void 0;
+              const why3 = list2.length ? ready(c, list2) : unsaved(c, firstOf.get(c) ?? []);
               if (!why3) continue;
               cs.splice(cs.indexOf(c), 1);
               finish({ change: c, outcome: "skipped", message: why3 });
@@ -2174,7 +2290,7 @@
       if (o.publish && done && (!live || procs.length)) tell("Publishing…");
       if (o.publish && done && !live) {
         try {
-          await publishXml(ctx, pset, signal, tell);
+          await lang.quiet(() => publishXml(ctx, pset, signal, tell), signal);
           published = true;
           if (historyId) await markPublished(ctx, [historyId]);
         } catch (e) {
@@ -2219,13 +2335,16 @@
         ms: Math.round(performance.now() - t0),
         historyId
       };
+      if (forms.size) report.forms = forms;
       if (warnings.length) report.warning = warnings.join(" ");
-      if (notice) report.notice = notice;
+      if (notice) notices.push(notice);
+      if (notices.length) report.notice = notices.join(" ");
       if (false) console.log("[translator] save", report, ctx.http.stats);
       return report;
     }
     async function start(changes, o, purpose) {
-      if (running) throw new Error("A save is already running. Wait for it to finish.");
+      if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
+      if (running) throw new Error(BUSY);
       running = true;
       store.setBusy(true, purpose === "undo" ? "Undoing a save" : "Saving");
       try {
@@ -2236,7 +2355,7 @@
       }
     }
     async function pendingWork(changes, signal) {
-      const ents = [...publishTargets(changes).entities];
+      const ents = [...publishTargets(changes, ctx.managedEdits).entities];
       const mine3 = /* @__PURE__ */ new Set();
       for (const { slot: s } of changes) {
         const id = s.ref?.formId || /^(form|view|chart)$/.test(s.kind) && s.ref?.id;
@@ -2340,6 +2459,26 @@
       });
       return out;
     }
+    async function writeAgain2(changes, publish, signal, warn) {
+      if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
+      if (running) throw new Error(BUSY);
+      const by = /* @__PURE__ */ new Map();
+      for (const c of changes) {
+        const w = writerFor(c.slot.kind);
+        if (!w?.again) throw new Error("These labels can't be written again here.");
+        (by.get(w) ?? by.set(w, []).get(w)).push(c);
+      }
+      running = true;
+      try {
+        const so = { signal, publish: new PublishSet(), progress: () => {
+        }, force: /* @__PURE__ */ new Set(), lang, allowPublish: true, column: columnsOf(loaded), ...warn ? { warn } : {} };
+        const out = [];
+        for (const [w, cs] of by) out.push(...await w.again(ctx, cs, so, publish));
+        return out;
+      } finally {
+        running = false;
+      }
+    }
     function prepare(changes, o = {}) {
       const m = measure(changes, o.undo ? "undo" : "save", o);
       const given = new Map(m.changes.map((w, i) => [w, changes[i]]));
@@ -2348,11 +2487,12 @@
     return {
       validate: (changes, o) => prepare(changes, o).issues,
       prepare,
-      publishTargets,
+      publishTargets: (changes) => publishTargets(changes, ctx.managedEdits),
       pendingWork,
       save: (changes, o) => start(changes, o, "save"),
       history: () => readHistory(ctx),
       current: current2,
+      writeAgain: writeAgain2,
       undo
     };
   }
@@ -2369,6 +2509,8 @@
     edits = /* @__PURE__ */ new Map();
     status = /* @__PURE__ */ new Map();
     busy = false;
+    /** Changes to labels from managed solutions are allowed (Ctx.managedEdits, setManagedEdits). */
+    managedEdits = false;
     /**
      * Base of each pending edit (`key#lcid`): the server text the user was looking at when they made it. It is
      * the edit's Change.before and survives slot refreshes, so a reload that brings another maker's newer text
@@ -2405,6 +2547,23 @@
       }
     }
     /**
+     * Changes to labels from managed solutions allowed or not (Ctx.managedEdits): every such label its loader set up for it
+     * (model.ts managedSlot) becomes read-only, or not, as that says, a new slot object each (views redraw it); one 'slots'
+     * event. Staged edits stay: one on a label read-only again is refused at publish, with its reason.
+     */
+    setManagedEdits(on) {
+      this.managedEdits = on;
+      let any = false;
+      for (const s of [...this.slots.values()]) {
+        if (!isManaged(s) || typeof s.ref?.held !== "string") continue;
+        const ro = managedReadOnly(s, on);
+        if (s.readOnly === ro) continue;
+        this.slots.set(s.key, { ...s, readOnly: ro });
+        any = true;
+      }
+      if (any) this.emit({ type: "slots" });
+    }
+    /**
      * A tick of the store's clock, taken by a load as it starts and given to add() with what it read (`since`): a text the
      * store gets after it (another load's that started later, a save's) is newer than that read.
      */
@@ -2425,7 +2584,7 @@
     add(slots, since2) {
       const t = since2 ?? this.tick();
       for (let s of slots) {
-        if (!s.readOnly && isManaged(s)) s.readOnly = MANAGED;
+        if (isManaged(s)) s.readOnly = typeof s.ref?.held === "string" ? managedReadOnly(s, this.managedEdits) : s.readOnly || MANAGED;
         const old = this.slots.get(s.key);
         if (old) {
           let newer = null;
@@ -2478,6 +2637,15 @@
       return b === null ? "" : b ?? this.original(key, lcid);
     }
     /**
+     * before() as it is kept: null where the edit was made on no label at all (bases, Change.beforeMissing); without a
+     * pending edit, the base a new one gets now. A copy of it (the popup's Undo, the Workbench's editor) given back to set()
+     * keeps that, never the '' a reload may have stored there since.
+     */
+    base(key, lcid) {
+      const b = this.isEdited(key, lcid) ? this.bases.get(cell(key, lcid)) : void 0;
+      return b === void 0 ? this.baseOf(key, lcid) : b;
+    }
+    /**
      * A pending edit whose server text changed since it was made (a reload brought other text): saving it is a conflict.
      * So is one made where its language had no label at all that now has one stored empty (bases: null).
      */
@@ -2525,8 +2693,42 @@
      */
     standIn(key, lcid, base) {
       const s = this.slots.get(key);
-      if (!s || !this.isEdited(key, lcid) || s.readOnly || isManaged(s)) return void 0;
+      if (!s || !this.isEdited(key, lcid) || s.readOnly || managedHeld(s, this.managedEdits)) return void 0;
       return standIn(s, lcid, base, this.original(key, lcid), this.value(key, lcid), (k, l) => this.text(k, l));
+    }
+    /**
+     * Whether a main form's field label follows its column in `lcid` as loaded (model.ts follows), whatever is typed there:
+     * the popup and the editor card show it empty while nothing is (isEdited), and an input emptied again there stages
+     * nothing (ui/editor.ts typedText). With `user`, the user's language: as it is shown, a language not known yet taking
+     * the user's answer, which the inputs stage by too.
+     */
+    follows(key, lcid, base, user) {
+      const s = this.slots.get(key);
+      return !!s && follows(s, lcid, base, this.original(key, lcid), (k, l) => this.text(k, l, true), user);
+    }
+    /**
+     * Whether a main form's field label in `lcid` as loaded is the text a read fills in there (model.ts fillsIn), so that
+     * only GetClientMetadata tells whether it follows its column: the read behind the page's loads asks for a language only
+     * where some label is so (inspector/pageload.ts).
+     */
+    fillsIn(key, lcid, base) {
+      const s = this.slots.get(key);
+      return !!s && fillsIn(s, lcid, base, this.original(key, lcid), (k, l) => this.text(k, l, true));
+    }
+    /**
+     * Sets, per slot key and language, whether a main form's field label has a text of its own there (`ref.own`, model.ts
+     * follows), as the read behind the page's loads tells it (inspector/pageload.ts). Each such slot is a new copy, so the
+     * views showing it render it again: an open popup then shows a label that follows empty.
+     */
+    setOwn(own2) {
+      let any = false;
+      for (const [key, o] of own2) {
+        const s = this.slots.get(key);
+        if (!s) continue;
+        this.slots.set(key, { ...s, ref: { ...s.ref, own: { ...s.ref?.own, ...o } } });
+        any = true;
+      }
+      if (any) this.emit({ type: "slots" });
     }
     /**
      * A translation its language's users see empty on purpose (model.ts savesEmpty, a metadata description): stored
@@ -2541,14 +2743,14 @@
     /**
      * Sets a pending value. Setting it back to the server value removes the edit (and its base). A new edit
      * is measured against the server value now, or `base` when given (the server text it was really made
-     * on, e.g. a restored snapshot); an edit typed again keeps its first base. While a reload has moved the
-     * server text under an edit, typing the base text back keeps the edit pending on purpose: a cell typed
-     * through it ("Nom2" → "Nom" → "Nom3") must not lose its base, and saving it is a conflict that shows
-     * the user the other text.
+     * on, e.g. a restored snapshot; null: no label there at all, as base() gives it); an edit typed again keeps
+     * its first base. While a reload has moved the server text under an edit, typing the base text back keeps
+     * the edit pending on purpose: a cell typed through it ("Nom2" → "Nom" → "Nom3") must not lose its base,
+     * and saving it is a conflict that shows the user the other text.
      */
     set(key, lcid, text4, base) {
       const slot2 = this.slots.get(key);
-      if (!slot2 || slot2.readOnly || isManaged(slot2)) return;
+      if (!slot2 || slot2.readOnly || managedHeld(slot2, this.managedEdits)) return;
       const prev = this.edits.get(key)?.get(lcid);
       const server = slot2.labels[lcid] ?? "";
       const next = text4 === server ? void 0 : text4;
@@ -2691,6 +2893,12 @@
           const now = after.trim() ? after : "";
           const slot2 = this.slots.get(key);
           for (const s of /* @__PURE__ */ new Set([slot2, r.change.slot])) if (s) setServer(s, lcid, now);
+          for (const s of /* @__PURE__ */ new Set([slot2, r.change.slot]))
+            if (s?.ref?.own && lcid in s.ref.own) {
+              const own2 = { ...s.ref.own };
+              delete own2[lcid];
+              s.ref = { ...s.ref, own: own2 };
+            }
           this.cellAt.set(k, this.tick());
           if (cur2 === void 0 || held || cur2 === now) {
             this.write(key, lcid, void 0);
@@ -2874,7 +3082,7 @@
   }
 
   // src/ui/callout.css
-  var callout_default = ".co{position:absolute;left:0;top:0;z-index:18;pointer-events:auto;display:flex;flex-direction:column;width:min(400px,calc(100% - 16px));max-height:calc(100% - 16px);background:var(--bg1);border:1px solid var(--s2);border-radius:8px;box-shadow:var(--sh8);outline:0;animation:co-in .12s ease-out}.co.is-wide{width:min(440px,calc(100% - 16px))}.co.is-wait{opacity:0;animation:none;pointer-events:none}.co.is-below{--co-dy:-6px}.co.is-left{--co-dx:6px;--co-dy:0px}.co.is-right{--co-dx:-6px;--co-dy:0px}@keyframes co-in{0%{opacity:0;transform:translate(var(--co-dx,0px),var(--co-dy,6px))}}.co:focus-visible{outline:2px solid #000;outline-offset:1px}.co-beak{position:absolute;width:12px;height:12px;margin-left:-6px;background:var(--bg1);border:1px solid var(--s2);transform:rotate(45deg);pointer-events:none}.co.is-below .co-beak{top:-7px;border-right:0;border-bottom:0}.co.is-above .co-beak{bottom:-7px;border-left:0;border-top:0}.co.is-left .co-beak{right:-7px;margin:-6px 0 0;border-left:0;border-bottom:0}.co.is-right .co-beak{left:-7px;margin:-6px 0 0;border-right:0;border-top:0}.co.is-dock .co-beak{display:none}.co-h{display:flex;align-items:flex-start;gap:4px;padding:12px 8px 10px 16px;flex:none}.co-ht{flex:1;min-width:0}.co-k{font-size:12px;line-height:16px;color:var(--fg3)}.co-t{margin:2px 0 0;font-size:16px;line-height:22px;font-weight:600;color:var(--fg1);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.co-h .btn.icon{width:28px;height:28px;flex:none}.co-b{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;padding:12px 16px 16px;border-top:1px solid var(--s3)}.co-c{display:flex;flex-direction:column;gap:16px}.co-load{display:flex;align-items:center;gap:6px;font-size:12px;line-height:16px;color:var(--fg3)}.co-load .spin{color:var(--brand);width:12px;height:12px}.co-empty{font-size:13px;line-height:18px;color:var(--fg3)}.co-ro{display:flex;align-items:flex-start;gap:4px;font-size:12px;line-height:16px;color:var(--fg3)}.co-ro svg{flex:none;margin-top:2px}.co-blk{display:flex;flex-direction:column;gap:6px;min-width:0}.co-bh{font-size:12px;line-height:16px;font-weight:600;color:var(--fg2)}.co-bn{font-weight:400;color:var(--fg3)}.co-r{display:grid;grid-template-columns:72px minmax(0,1fr);gap:0 8px;align-items:start;min-width:0}.co-l{padding-top:6px;font-size:13px;line-height:20px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.co-v{min-width:0}.co-v .ti::placeholder{color:var(--fg4)}.co-v textarea.ti{max-height:92px}.co-v.is-miss .ti{border-color:var(--amber-s);border-bottom-color:var(--amber);background:var(--amber-bg)}.co-v.is-miss .ti:focus{background:var(--bg1);border-bottom-color:var(--brand)}.co-v.is-edit .ti{border-color:#9fd89f;border-bottom-color:#107c10;background:#f1faf1}.co-v.is-err .ti{border-color:var(--red-s);border-bottom-color:var(--red)}.co-v.is-err .ti:focus{box-shadow:inset 0 -1px 0 var(--red)}.co-m{display:flex;align-items:flex-start;gap:4px;margin-top:4px;font-size:12px;line-height:16px;color:var(--red)}.co-m>svg{flex:none;margin-top:2px}.co-m>span{flex:1;min-width:0;overflow-wrap:anywhere}.co-m .cnt{font-weight:600}.co-m.is-note{color:var(--fg3)}.co-also{display:flex;align-items:flex-start;gap:8px;padding-left:80px;font-size:13px;line-height:18px;color:var(--fg2);cursor:pointer}.co-also input{flex:none;margin:1px 0 0}.co-d{display:flex;flex-direction:column;gap:8px;min-width:0}.co-dis{display:flex;align-items:center;gap:6px;max-width:100%;min-height:28px;padding:2px 4px 2px 0;border:0;border-radius:4px;background:none;color:var(--fg2);font:inherit;font-size:13px;line-height:18px;text-align:left;cursor:pointer}.co-dis:hover{color:var(--fg1)}.co-dis:focus-visible{outline:2px solid #000;outline-offset:1px}.co-dis svg{flex:none;color:var(--fg3);transition:transform .1s}.co-dis[aria-expanded=true] svg{transform:rotate(90deg)}.co-dn.is-edit{color:var(--green)}.co-dn.is-err{color:var(--red)}.co-dc{display:flex;flex-direction:column;gap:8px;padding-left:18px;min-width:0}.co-sh{font-size:12px;line-height:16px;color:var(--fg3)}.co-ch{display:flex;flex-direction:column;gap:4px;min-width:0}.co-chh,.co-cr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 8px;min-width:0}.co-ch.is-one .co-chh,.co-ch.is-one .co-cr{grid-template-columns:minmax(0,1fr)}.co-chh{font-size:12px;line-height:16px;font-weight:600;color:var(--fg3)}.co-chh span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.co-cr{border-radius:4px}.co-cr.is-focus{background:var(--brand-bg);box-shadow:0 0 0 4px var(--brand-bg)}.co-cr .ti{min-height:28px;padding:3px 8px;font-size:13px}.co-f{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-height:48px;padding:8px 12px;border-top:1px solid var(--s3);flex:none}.co-fx{order:-1;flex-basis:100%;font-size:12px;line-height:16px;color:var(--fg3)}.co-fa{display:flex;align-items:center;gap:12px;margin-left:auto}.co-fa .link{font-size:13px;line-height:18px}@media(prefers-reduced-motion:reduce){.co{animation:none}.co-dis svg{transition:none}}";
+  var callout_default = ".co{position:absolute;left:0;top:0;z-index:18;pointer-events:auto;display:flex;flex-direction:column;width:min(400px,calc(100% - 16px));max-height:calc(100% - 16px);background:var(--bg1);border:1px solid var(--s2);border-radius:8px;box-shadow:var(--sh8);outline:0;animation:co-in .12s ease-out}.co.is-wide{width:min(440px,calc(100% - 16px))}.co.is-wait{opacity:0;animation:none;pointer-events:none}.co.is-below{--co-dy:-6px}.co.is-left{--co-dx:6px;--co-dy:0px}.co.is-right{--co-dx:-6px;--co-dy:0px}@keyframes co-in{0%{opacity:0;transform:translate(var(--co-dx,0px),var(--co-dy,6px))}}.co:focus-visible{outline:2px solid #000;outline-offset:1px}.co-beak{position:absolute;width:12px;height:12px;margin-left:-6px;background:var(--bg1);border:1px solid var(--s2);transform:rotate(45deg);pointer-events:none}.co.is-below .co-beak{top:-7px;border-right:0;border-bottom:0}.co.is-above .co-beak{bottom:-7px;border-left:0;border-top:0}.co.is-left .co-beak{right:-7px;margin:-6px 0 0;border-left:0;border-bottom:0}.co.is-right .co-beak{left:-7px;margin:-6px 0 0;border-right:0;border-top:0}.co.is-dock .co-beak{display:none}.co-h{display:flex;align-items:flex-start;gap:4px;padding:12px 8px 10px 16px;flex:none}.co-ht{flex:1;min-width:0}.co-k{font-size:12px;line-height:16px;color:var(--fg3)}.co-t{margin:2px 0 0;font-size:16px;line-height:22px;font-weight:600;color:var(--fg1);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}.co-h .btn.icon{width:28px;height:28px;flex:none}.co-b{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;padding:12px 16px 16px;border-top:1px solid var(--s3)}.co-c{display:flex;flex-direction:column;gap:16px}.co-load{display:flex;align-items:center;gap:6px;font-size:12px;line-height:16px;color:var(--fg3)}.co-load .spin{color:var(--brand);width:12px;height:12px}.co-empty{font-size:13px;line-height:18px;color:var(--fg3)}.co-ro{display:flex;align-items:flex-start;gap:4px;font-size:12px;line-height:16px;color:var(--fg3)}.co-ro svg{flex:none;margin-top:2px}.co-ro.is-warn{color:var(--amber)}.co-blk{display:flex;flex-direction:column;gap:6px;min-width:0}.co-bh{font-size:12px;line-height:16px;font-weight:600;color:var(--fg2)}.co-bn{font-weight:400;color:var(--fg3)}.co-r{display:grid;grid-template-columns:72px minmax(0,1fr);gap:0 8px;align-items:start;min-width:0}.co-l{padding-top:6px;font-size:13px;line-height:20px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.co-v{min-width:0}.co-v .ti::placeholder{color:var(--fg4)}.co-v textarea.ti{max-height:92px}.co-v.is-miss .ti{border-color:var(--amber-s);border-bottom-color:var(--amber);background:var(--amber-bg)}.co-v.is-miss .ti:focus{background:var(--bg1);border-bottom-color:var(--brand)}.co-v.is-edit .ti{border-color:#9fd89f;border-bottom-color:#107c10;background:#f1faf1}.co-v.is-err .ti{border-color:var(--red-s);border-bottom-color:var(--red)}.co-v.is-err .ti:focus{box-shadow:inset 0 -1px 0 var(--red)}.co-m{display:flex;align-items:flex-start;gap:4px;margin-top:4px;font-size:12px;line-height:16px;color:var(--red)}.co-m>svg{flex:none;margin-top:2px}.co-m>span{flex:1;min-width:0;overflow-wrap:anywhere}.co-m .cnt{font-weight:600}.co-m.is-note{color:var(--fg3)}.co-also{display:flex;align-items:flex-start;gap:8px;padding-left:80px;font-size:13px;line-height:18px;color:var(--fg2);cursor:pointer}.co-also input{flex:none;margin:1px 0 0}.co-d{display:flex;flex-direction:column;gap:8px;min-width:0}.co-dis{display:flex;align-items:center;gap:6px;max-width:100%;min-height:28px;padding:2px 4px 2px 0;border:0;border-radius:4px;background:none;color:var(--fg2);font:inherit;font-size:13px;line-height:18px;text-align:left;cursor:pointer}.co-dis:hover{color:var(--fg1)}.co-dis:focus-visible{outline:2px solid #000;outline-offset:1px}.co-dis svg{flex:none;color:var(--fg3);transition:transform .1s}.co-dis[aria-expanded=true] svg{transform:rotate(90deg)}.co-dn.is-edit{color:var(--green)}.co-dn.is-err{color:var(--red)}.co-dc{display:flex;flex-direction:column;gap:8px;padding-left:18px;min-width:0}.co-sh{font-size:12px;line-height:16px;color:var(--fg3)}.co-ch{display:flex;flex-direction:column;gap:4px;min-width:0}.co-chh,.co-cr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 8px;min-width:0}.co-ch.is-one .co-chh,.co-ch.is-one .co-cr{grid-template-columns:minmax(0,1fr)}.co-chh{font-size:12px;line-height:16px;font-weight:600;color:var(--fg3)}.co-chh span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.co-cr{border-radius:4px}.co-cr.is-focus{background:var(--brand-bg);box-shadow:0 0 0 4px var(--brand-bg)}.co-cr .ti{min-height:28px;padding:3px 8px;font-size:13px}.co-f{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-height:48px;padding:8px 12px;border-top:1px solid var(--s3);flex:none}.co-fx{order:-1;flex-basis:100%;font-size:12px;line-height:16px;color:var(--fg3)}.co-fa{display:flex;align-items:center;gap:12px;margin-left:auto}.co-fa .link{font-size:13px;line-height:18px}@media(prefers-reduced-motion:reduce){.co{animation:none}.co-dis svg{transition:none}}";
 
   // src/ui/dom.ts
   function h(tag, attrs, ...children) {
@@ -3586,6 +3794,7 @@
   var WILL_REMOVE = "Will be removed when you save.";
   var becomesText = (s, l, base, x) => standInSays(s, l, base, x);
   var isRemoval = (base, lcid, before, after) => lcid !== base && !after.trim() && before !== "";
+  var typedText = (store, key, l, base, v, user) => !v.trim() && store.follows(key, l, base, user) ? store.original(key, l) : v;
   var LOOK = { error: ["e", "error"], warn: ["w", "warn"], note: ["n", "info"] };
   var ids = 0;
   var index = /* @__PURE__ */ new WeakMap();
@@ -3682,7 +3891,7 @@
       if (s.max) inp.maxLength = s.max;
       whenEmpty(inp, (u) => u === "undo" && store.isEdited(s.key, l) ? store.original(s.key, l) : void 0);
       inp.addEventListener("input", () => {
-        store.set(s.key, l, inp.value);
+        store.set(s.key, l, typedText(store, s.key, l, base, inp.value, app.ctx.user));
         grow(inp);
       });
       let tip = "";
@@ -3707,7 +3916,7 @@
         h("div", { class: "ea" }, st, rev)
       );
       const fallback2 = () => isBase ? void 0 : fallbackOf((k) => store.get(k), s);
-      const colKey2 = fallback2()?.key || "";
+      const colKey2 = fallbackOf((k) => store.get(k), s)?.key || "";
       const showsNow = (bv) => {
         if (keepsEmpty(s)) return !store.emptyOnPurpose(s.key, l, base) && bv.trim() ? `Shows “${bv.trim()}”` : noneText(s, langName(app, l));
         if (LONG.has(s.prop)) return `No ${langName(app, l)} ${PROP_NAMES[s.prop].toLowerCase()}`;
@@ -3724,21 +3933,24 @@
         const bv = store.value(s.key, base);
         const edited = store.isEdited(s.key, l);
         const cs = store.cellStatus(s.key, l);
-        if (inp.value !== v) {
-          inp.value = v;
+        const fol = !edited && store.follows(s.key, l, base, app.ctx.user);
+        const shown3 = fol && inp.value !== v ? "" : v;
+        if (inp.value !== shown3) {
+          inp.value = shown3;
           grow(inp);
         }
         inp.disabled = ro || nl;
         const empty = edited && !ro && !nl && !isBase && store.emptyOnPurpose(s.key, l, base) ? savedEmptyText(s, langName(app, l)) : "";
         const removing = edited && !ro && !nl && isRemoval(base, l, store.original(s.key, l), v);
         const x = removing && !empty ? store.standIn(s.key, l, base) : void 0;
+        const freed2 = edited && !ro && !nl && !v.trim() && !!store.standIn(s.key, l, base)?.follow;
         const stuck = !!x && !x.text;
-        const stand = empty || (x?.text ? becomesText(s, l, base, x) : "");
-        inp.placeholder = nl ? "Not loaded" : ro ? "" : isBase ? s.baseRequired ? "Required" : "" : stuck ? "Can't be removed — type the text instead" : stand && !empty ? "" : showsNow(bv);
-        inp.classList.toggle("same", !isBase && !!v && v === bv);
+        const stand = empty || (x?.text && !x.follow ? becomesText(s, l, base, x) : "");
+        inp.placeholder = nl ? "Not loaded" : ro ? "" : fol || freed2 ? `Shows “${(filledIn(s, l, base, (k, y) => store.text(k, y)) ?? v).trim()}”` : isBase ? s.baseRequired ? "Required" : "" : stuck ? "Can't be removed — type the text instead" : stand && !empty ? "" : showsNow(bv);
+        inp.classList.toggle("same", !isBase && !!shown3 && shown3 === bv);
         const miss = !ro && !nl && !v.trim() && (isBase ? s.baseRequired : !!bv.trim() && !store.emptyOnPurpose(s.key, l, base));
         const issue = edited && !removing ? issueFor(s, l, v) : void 0;
-        const say = cs?.outcome === "error" && cs.message ? { level: "error", text: cs.message } : stuck ? { level: "error", text: noStandIn(s, l, x) } : stand ? { level: "note", text: stand } : removing ? { level: "note", text: WILL_REMOVE } : issue ? { level: issue.level, text: issue.message } : null;
+        const say = cs?.outcome === "error" && cs.message ? { level: "error", text: cs.message } : stuck ? { level: "error", text: noStandIn(s, l, x) } : stand ? { level: "note", text: stand } : removing && !freed2 ? { level: "note", text: WILL_REMOVE } : issue ? { level: issue.level, text: issue.message } : null;
         const invalid = edited && (stuck || issue?.level === "error");
         const tone = cs?.outcome === "error" ? "err" : cs?.outcome === "conflict" ? "conflict" : invalid ? "err" : edited ? "edit" : cs?.outcome === "saved" ? "saved" : miss ? "miss" : "";
         tip = tone === "err" ? say?.text || "Couldn't save" : tone === "edit" && (removing || empty) ? stand || WILL_REMOVE : TIPS[tone] || "";
@@ -3909,7 +4121,7 @@
         const id = cellId(key, lcid);
         if (into.has(id)) continue;
         const pending = e?.has(lcid) ? e.get(lcid) : void 0;
-        into.set(id, { key, lcid, value: store.value(key, lcid), pending, base: pending === void 0 ? void 0 : store.before(key, lcid) });
+        into.set(id, { key, lcid, value: store.value(key, lcid), pending, base: pending === void 0 ? void 0 : store.base(key, lcid) });
       }
     }
     return into;
@@ -3917,7 +4129,7 @@
   function restore(store, snaps) {
     let n = 0;
     const now = (s) => store.edits.get(s.key)?.get(s.lcid);
-    const based = (s) => s.base === void 0 || store.before(s.key, s.lcid) === s.base;
+    const based = (s) => s.base === void 0 || store.base(s.key, s.lcid) === s.base;
     store.group(() => {
       for (const s of snaps) {
         const was = now(s);
@@ -3951,10 +4163,10 @@
     });
     return n;
   }
-  function rowLangs(all2, base, target, shown3) {
+  function rowLangs(all, base, target, shown3) {
     const out = [base];
     if (target !== base) out.push(target);
-    for (const l of all2) if (l !== base && l !== target && shown3.includes(l)) out.push(l);
+    for (const l of all) if (l !== base && l !== target && shown3.includes(l)) out.push(l);
     return out;
   }
   var fallbackKey = (s, store) => {
@@ -3969,7 +4181,7 @@
       const s = store.get(b.key);
       if (s?.kind !== "field" || s.prop !== "Label") continue;
       const ck = fallbackKey(s);
-      return ck && blocks.some((x) => x.key === ck) ? [s.key, ck] : [];
+      return ck && blocks.some((x) => x.key === ck) ? [ck, s.key] : [];
     }
     return [];
   }
@@ -3984,13 +4196,15 @@
     const colBase = col && store.get(col)?.kind === "attribute" ? store.value(col, base).trim() : "";
     return colBase || store.value(s.key, base).trim() || (col ? store.value(col, base).trim() : "");
   }
-  function placeholderOf(store, s, l, base, heading, lang, page = "", hidden = false) {
-    if (l !== base && !s.readOnly && store.standIn(s.key, l, base)?.text) return "";
+  function placeholderOf(store, s, l, base, heading, lang, page = "") {
+    const x = s.readOnly ? void 0 : store.standIn(s.key, l, base);
+    if (x?.follow) return `Shows “${x.text.trim()}”`;
+    if (l !== base && x?.text) return "";
     if (l !== base && keepsEmpty(s)) {
       const v2 = store.emptyOnPurpose(s.key, l, base) ? "" : shows(store, s, l, base);
       return v2 ? `Shows “${v2}”` : noneText(s, lang);
     }
-    if (hidden || /tooltip|description|hint/i.test(heading)) return `No ${lang} ${heading.trim().toLowerCase()}`;
+    if (/tooltip|description|hint/i.test(heading)) return `No ${lang} ${heading.trim().toLowerCase()}`;
     const v = page.trim() || shows(store, s, l, base);
     return v ? `Shows “${v}”` : "";
   }
@@ -4020,12 +4234,12 @@
     if (l === base || s.readOnly) return "";
     if (store.isEdited(s.key, l) && store.emptyOnPurpose(s.key, l, base)) return store.original(s.key, l).trim() ? savedEmptyText(s, lang) : "";
     const x = store.standIn(s.key, l, base);
-    return x?.text ? becomesText(s, l, base, x) : "";
+    return x?.text && !x.follow ? becomesText(s, l, base, x) : "";
   }
-  function writeAlso(store, keys, l, text4) {
+  function writeAlso(store, keys, l, text4, base, user) {
     for (const k of keys) {
       const s = store.get(k);
-      if (s && !s.readOnly && !isManaged(s) && !notLoaded(s, l)) store.set(k, l, text4);
+      if (s && !s.readOnly && !managedHeld(s, store.managedEdits) && !notLoaded(s, l)) store.set(k, l, text4 === null ? store.original(k, l) : typedText(store, k, l, base, text4, user));
     }
   }
   var alsoText = (n) => n === 1 ? "Also change the other copy of this field on this form" : `Also change the ${n} other copies of this field on this form`;
@@ -4085,7 +4299,7 @@
     app.adoptStyles(callout_default);
     const { store, ctx } = app;
     const base = ctx.base;
-    const all2 = ctx.langs.map((x) => x.lcid);
+    const all = ctx.langs.map((x) => x.lcid);
     const tid = `dxt-co${++ids2}`;
     const born = performance.now();
     let opener = document.activeElement;
@@ -4156,7 +4370,7 @@
     const hasFocus = () => el.contains(active(el));
     const sigOf = (m) => `${JSON.stringify(m)}|${app.prefs.target}|${app.prefs.shown.join()}`;
     const keysOf = (m) => [.../* @__PURE__ */ new Set([...m.blocks.map((b) => b.key), ...m.blocks.flatMap((b) => b.also?.keys || []), ...m.choices?.keys || []])].filter((k) => store.get(k));
-    const langs = () => rowLangs(all2, base, app.prefs.target, app.prefs.shown);
+    const langs = () => rowLangs(all, base, app.prefs.target, app.prefs.shown);
     const listen = (key, fn) => {
       const a = cells.get(key);
       if (a) a.push(fn);
@@ -4178,10 +4392,12 @@
     const byKey = (id) => inputs().find((x) => x.getAttribute("data-k") === id);
     function type(s, l, b, v) {
       const copies = b?.also && st.also.get(b.key) ? b.also.keys : null;
-      if (!copies) return store.set(s.key, l, v);
+      const t = typedText(store, s.key, l, base, v, ctx.user);
+      if (!copies) return store.set(s.key, l, t);
       store.group(() => {
-        store.set(s.key, l, v);
-        writeAlso(store, copies, l, v);
+        store.set(s.key, l, t);
+        if (t === v) writeAlso(store, copies, l, v, base, ctx.user);
+        else restore(store, copies.flatMap((k) => snaps.get(cellId(k, l)) ?? []));
       });
     }
     function follow(b, on) {
@@ -4193,7 +4409,7 @@
       store.group(() => {
         for (const l of langs()) {
           const sn = snaps.get(cellId(b.key, l));
-          if (sn && changedHere(store, sn)) writeAlso(store, keys, l, store.value(b.key, l));
+          if (sn && changedHere(store, sn)) writeAlso(store, keys, l, store.value(b.key, l), base, ctx.user);
         }
       });
     }
@@ -4223,13 +4439,13 @@
       const v = h("div", { class: "co-v" }, inp, msg);
       let said = "\0";
       const update = () => {
-        const val2 = store.value(s.key, l);
+        const val2 = !store.isEdited(s.key, l) && store.follows(s.key, l, base, ctx.user) && inp.value !== store.original(s.key, l) ? "" : store.value(s.key, l);
         if (inp.value !== val2) {
           inp.value = val2;
           grow2(inp);
         }
         const page = l === ctx.user ? o.block?.pageText : "";
-        inp.placeholder = unread ? "Not loaded yet" : o.choice || s.readOnly ? "" : placeholderOf(store, s, l, base, o.block?.heading || "Label", n, page, !!o.block?.hidden);
+        inp.placeholder = unread ? "Not loaded yet" : o.choice || s.readOnly ? "" : placeholderOf(store, s, l, base, o.block?.heading || "Label", n, page);
         const p = problem(store, s, l, base);
         const b = p ? "" : becomes(store, s, l, base, n);
         const over = s.max > 0 && val2.length > s.max;
@@ -4256,7 +4472,7 @@
       tooltip(c, () => c.scrollWidth > c.clientWidth ? n : "");
       return c;
     }
-    const roLine = (reason2) => h("div", { class: "co-ro" }, icon("lock", 12), h("span", null, reason2.trim().replace(/[.\s]+$/, "")));
+    const roLine = (reason2, warn = false) => h("div", { class: warn ? "co-ro is-warn" : "co-ro" }, icon(warn ? "warn" : "lock", 12), h("span", null, reason2.trim().replace(/[.\s]+$/, "")));
     function block(b) {
       const s = store.get(b.key);
       if (!s) return null;
@@ -4270,6 +4486,8 @@
         { class: "co-blk", role: "group", "aria-labelledby": hid },
         h("div", { class: "co-bh", id: hid }, b.heading, b.note ? h("span", { class: "co-bn" }, ` · ${b.note}`) : null),
         s.readOnly && !model.readOnly ? roLine(s.readOnly) : null,
+        // A managed solution's label this session may change (Ctx.managedEdits): what saving it does.
+        !s.readOnly && isManaged(s) ? roLine(MANAGED_OPEN, true) : null,
         rows,
         b.also?.keys.length && !s.readOnly ? alsoBox(b) : null
       );
@@ -4291,7 +4509,7 @@
       const open = st.choices;
       const note2 = h("span", { class: "co-dn" });
       const said = () => {
-        const p = choiceNote(store, all2, keys);
+        const p = choiceNote(store, all, keys);
         note2.textContent = p ? ` · ${choicesNote(p)}` : "";
         note2.className = "co-dn" + (p ? p.failed ? " is-err" : " is-edit" : "");
       };
@@ -4338,14 +4556,14 @@
       const sc = body.scrollTop;
       cells = /* @__PURE__ */ new Map();
       const keys = keysOf(model);
-      snapshot(store, keys, all2, snaps);
+      snapshot(store, keys, all, snaps);
       used = keys.map((k) => store.get(k));
       sig = sigOf(model);
       const c = model.choices;
       const cks = (c?.keys || []).filter((k) => store.get(k));
       if (c && cks.length && !st.choicesSet) {
         st.choicesSet = true;
-        st.choices = c.open || !!host.focusKey && cks.includes(host.focusKey) || !!choiceNote(store, all2, cks);
+        st.choices = c.open || !!host.focusKey && cks.includes(host.focusKey) || !!choiceNote(store, all, cks);
       }
       el.classList.toggle("is-wide", cks.length > 0);
       kindEl.textContent = model.kind;
@@ -4369,12 +4587,16 @@
       updateFoot();
       reposition();
     }
+    function staged() {
+      const ls = langs();
+      return [...snaps.values()].filter((s) => ls.includes(s.lcid) && store.isEdited(s.key, s.lcid));
+    }
     function updateFoot() {
       if (dead) return;
-      const changed = changedCells(store, snaps.values()).length > 0;
-      if (undoB.hidden === changed) {
-        if (!changed && active(el) === undoB) doneB.focus();
-        undoB.hidden = !changed;
+      const can = changedCells(store, snaps.values()).length > 0 || staged().length > 0;
+      if (undoB.hidden === can) {
+        if (!can && active(el) === undoB) doneB.focus();
+        undoB.hidden = !can;
         later2();
       }
     }
@@ -4415,12 +4637,12 @@
     }
     const firstPending = () => {
       const ks = (model.choices?.keys || []).filter((k) => store.get(k));
-      return choiceNote(store, all2, ks)?.first;
+      return choiceNote(store, all, ks)?.first;
     };
     function focusInitial() {
       waitFocus = false;
       const target = app.prefs.target;
-      const l = host.focusLcid ?? shownLanguage(all2, ctx.user);
+      const l = host.focusLcid ?? shownLanguage(all, ctx.user);
       const named5 = model.blocks.some((b) => {
         const s = store.get(b.key);
         return s?.kind === "attribute" && s.prop === "DisplayName";
@@ -4464,7 +4686,14 @@
     }
     function undo() {
       if (dead) return;
-      restore(store, snaps.values());
+      if (changedCells(store, snaps.values()).length) restore(store, snaps.values());
+      else {
+        const back = staged();
+        store.group(() => back.forEach((s) => store.revert(s.key, s.lcid)));
+        for (const s of back) snaps.delete(cellId(s.key, s.lcid));
+        snapshot(store, keysOf(model), all, snaps);
+        updateFoot();
+      }
       announce("Changes undone.");
       focusInitial();
     }
@@ -4774,8 +5003,8 @@
       } catch {
       }
       if (one2 && of(one2) === id) return one2;
-      const all2 = items.get();
-      return (Array.isArray(all2) ? all2 : []).find((f) => of(f) === id) ?? null;
+      const all = items.get();
+      return (Array.isArray(all) ? all : []).find((f) => of(f) === id) ?? null;
     } catch {
       return null;
     }
@@ -4808,7 +5037,7 @@
   }
   var ROUNDS = 3;
   async function settle2(ops, base, todo, sent2) {
-    if (sent2.probe && ops.same(sent2.probe, base)) return null;
+    if (sent2.probe && !ops.older(sent2.probe, base) && ops.same(sent2.probe, base)) return null;
     const w = raceText(ops.noun, ops.publish);
     const err = (change2, message) => ({ change: change2, outcome: "error", message });
     const read2 = () => ops.read().catch(() => null);
@@ -4844,7 +5073,7 @@
       if (!F || !(V ? ops.same(F, V) : ops.alike(F, B3, W2) && W2.every((c) => ops.holds(F, c)))) return finish(F ?? V, false);
       let s;
       try {
-        s = await ops.send(ops.build(P2, T2), F);
+        s = await ops.send(ops.build(P2, T2, [...clash]), F);
       } catch (e) {
         if ((e instanceof Unsent || turnedAway(e) || e instanceof DvError && e.status === 412) && waits < 3) {
           await pause(2e3 << waits++);
@@ -4853,7 +5082,7 @@
         return finish(F, false);
       }
       round++;
-      if (!s.probe || !ops.same(s.probe, F) && ops.older(s.probe, F)) {
+      if (!s.probe || ops.older(s.probe, F)) {
         if (sure2 === "yes") sure2 = "unseen";
         const v2 = s.back ?? await read2();
         return finish(v2, !!v2 && ops.alike(v2, P2, T2));
@@ -4869,6 +5098,7 @@
   }
 
   // src/providers/bpf.ts
+  var notCustomizable = (w) => w?.iscustomizable?.Value === false ? "This business process flow is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here." : "";
   var SELECT = "name,primaryentity,ismanaged,iscustomizable,xaml,clientdata,versionnumber";
   var UNSAFE = "Safety check failed: the change would have modified more than the translated labels, so nothing was saved.";
   var TAG = /<(\w+):StepLabel\b((?:"[^"]*"|'[^']*'|[^>"'])*?)\/>/g;
@@ -4925,7 +5155,7 @@
       for (const k in v) visit(v[k]);
     };
     visit(cd);
-    return { xaml, cdText, cd, x, c, etag: w["@odata.etag"], ver: w.versionnumber, managed: w.ismanaged === true };
+    return { xaml, cdText, cd, x, c, etag: w["@odata.etag"], ver: w.versionnumber, managed: w.ismanaged === true, locked: notCustomizable(w) };
   }
   function walk(v, stage, entity, out) {
     if (!v || typeof v !== "object") return;
@@ -4954,6 +5184,7 @@
     }
     const name = String(w.name || "Business process flow");
     const readOnly = d.managed ? MANAGED : "";
+    const own2 = (s) => d.managed ? managedSlot(s, ctx.managedEdits, d.locked, MANAGED) : s;
     const stageTitles = /* @__PURE__ */ new Map();
     const out = /* @__PURE__ */ new Map();
     for (const n of items) {
@@ -4962,26 +5193,30 @@
       const labels2 = presentLabels(cur(d, n.id));
       const title = pick(labels2, ctx.user, ctx.base) || n.display || n.field || `Untitled ${n.kind}`;
       if (n.kind === "stage") stageTitles.set(n.id, title);
-      out.set(comp2, {
-        key: `${comp2}|Label`,
-        kind: n.kind,
-        prop: "Label",
-        entity: n.entity,
-        comp: comp2,
-        group: `bpfxaml|${id}`,
-        title,
-        path: n.kind === "step" && stageTitles.has(n.stage) ? [name, stageTitles.get(n.stage)] : [name],
-        sub: n.field || (n.entity !== primary ? n.entity : ""),
-        labels: labels2,
-        readOnly,
-        baseRequired: true,
-        // Stage names become processstage.stagename (100); 500 is the translation file limit.
-        max: n.kind === "stage" ? 100 : 500,
-        order: out.size,
-        // managed: the process is from a managed solution, so its labels are read-only (never an unmanaged layer on it).
-        // primary: the process's table, whose records GetClientMetadata answers for (loadBpfStored).
-        ref: { workflowId: id, labelId: n.id, attribute: n.field, stageId: n.stage || void 0, primary, managed: d.managed }
-      });
+      out.set(
+        comp2,
+        own2({
+          key: `${comp2}|Label`,
+          kind: n.kind,
+          prop: "Label",
+          entity: n.entity,
+          comp: comp2,
+          group: `bpfxaml|${id}`,
+          title,
+          path: n.kind === "step" && stageTitles.has(n.stage) ? [name, stageTitles.get(n.stage)] : [name],
+          sub: n.field || (n.entity !== primary ? n.entity : ""),
+          labels: labels2,
+          readOnly,
+          baseRequired: true,
+          // Stage names become processstage.stagename (100); 500 is the translation file limit.
+          max: n.kind === "stage" ? 100 : 500,
+          order: out.size,
+          // managed: the process is from a managed solution, so its labels are read-only (never an unmanaged layer on it,
+          // unless this session allows that). primary: the process's table, whose records GetClientMetadata answers for
+          // (loadBpfStored).
+          ref: { workflowId: id, labelId: n.id, attribute: n.field, stageId: n.stage || void 0, primary, managed: d.managed }
+        })
+      );
     }
     return [...out.values()];
   }
@@ -5099,7 +5334,7 @@
     ]);
     const ids3 = flows.filter(
       (w) => w.businessprocesstype !== 1 && // task flows have pages, not stages
-      (scope.includeReadOnly || w.ismanaged !== true) && // read-only: from a managed solution
+      (scope.includeReadOnly || w.ismanaged !== true || !!ctx.managedEdits && !notCustomizable(w)) && // read-only: from a managed solution
       (ents.has(w.primaryentity) || inSolution?.has(guid(w.workflowid)))
     ).map((w) => guid(w.workflowid));
     let done = 0;
@@ -5258,7 +5493,7 @@
     for (let stale = 0, waits = 0; ; ) {
       const d = await read2(o.signal);
       if (d.cdText && !d.cd) throw new Error("The process definition returned by Dataverse could not be read.");
-      if (d.managed) return [changes.map((c) => ({ change: c, outcome: "error", message: MANAGED })), []];
+      if (d.managed && (!ctx.managedEdits || d.locked)) return [changes.map((c) => ({ change: c, outcome: "error", message: ctx.managedEdits ? d.locked : MANAGED })), []];
       const out = [];
       const todo = [];
       const rm = /* @__PURE__ */ new Set();
@@ -5330,7 +5565,7 @@
       const out = [];
       const rest2 = [];
       for (const c of changes)
-        if (isManaged(c.slot)) out.push({ change: c, outcome: "error", message: MANAGED });
+        if (managedHeld(c.slot, ctx.managedEdits)) out.push({ change: c, outcome: "error", message: managedReadOnly(c.slot, ctx.managedEdits) });
         else if (clears(ctx, c) && !canClear(c.slot, c.lcid)) out.push({ change: c, outcome: "error", message: cantClearText(c.slot, c.lcid) });
         else rest2.push(c);
       if (!rest2.length) return out;
@@ -5463,9 +5698,9 @@
         const alias = lower(c.getAttribute("alias") || "");
         const to = lower(c.getAttribute("to") || "");
         if (name && alias && !out.has(alias)) {
-          const kids2 = Array.from(c.children);
-          const all2 = kids2.some((k) => k.tagName === "all-attributes");
-          out.set(alias, { entity: name, to, parent, attrs: all2 ? null : new Set(kids2.filter((k) => k.tagName === "attribute").map((k) => lower(k.getAttribute("name") || ""))) });
+          const kids3 = Array.from(c.children);
+          const all = kids3.some((k) => k.tagName === "all-attributes");
+          out.set(alias, { entity: name, to, parent, attrs: all ? null : new Set(kids3.filter((k) => k.tagName === "attribute").map((k) => lower(k.getAttribute("name") || ""))) });
         }
         if (name) walk2(c, name);
       }
@@ -5535,6 +5770,7 @@
   var WANT_RELATED = "#related|";
   var WANT_NAMES = "#names|";
   var GUID3 = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/;
+  var QUICK_KINDS = /* @__PURE__ */ new Set(["field"]);
   var isGridType = (t) => /^(subgrid|editablegrid|customsubgrid)(:|$)/i.test(t);
   function mergeUsedBy(slots, get) {
     return slots.map((s) => {
@@ -5542,8 +5778,8 @@
       const old = get(s.key)?.ref?.usedBy;
       const now = s.ref?.usedBy;
       if (!Array.isArray(old) || !old.length || !Array.isArray(now)) return s;
-      const all2 = [.../* @__PURE__ */ new Set([...now, ...old])];
-      return all2.length === now.length ? s : { ...s, ref: { ...s.ref, usedBy: all2 } };
+      const all = [.../* @__PURE__ */ new Set([...now, ...old])];
+      return all.length === now.length ? s : { ...s, ref: { ...s.ref, usedBy: all } };
     });
   }
   var Incomplete = class extends Error {
@@ -5605,14 +5841,30 @@
     want = /* @__PURE__ */ new Set();
     /** Requests whose load failed; asked again only on retry() (never in a loop). */
     failed = /* @__PURE__ */ new Set();
+    /**
+     * Side panes' and quick views' forms read in some languages only (shown()), by job key: read again on retry() alone.
+     * Nothing else asks for them again: their labels are in the store, so the scanner has what it needs.
+     */
+    again = /* @__PURE__ */ new Map();
+    /**
+     * Requests that came while a load that answers them already ran, by its key (join()): a quick view's form its host
+     * form's read asked for first, a table a sub-grid's load is reading, the page's own view name. A failed load gives
+     * them up with its own (asked again after retry()); one that succeeds has answered them.
+     */
+    joined = /* @__PURE__ */ new Map();
     timer = 0;
     ac = new AbortController();
     /**
+     * Stops the read behind the page's loads (ownLabels) as a load, a save or a publish starts, short of a language window
+     * already sent: it holds the language lock, which they may need. It runs again once none runs.
+     */
+    behind = new AbortController();
+    /**
      * Settles when the page's form and table loads have finished (they never reject). Every GET shares one
      * first-in-first-out gate (core/http), so sub-grid tables and command bar labels queued first would hold
-     * the form labels back: those loads wait for this (see later()). Waiting for the whole form read also keeps
-     * them out of its language switch window, where a read that names things in the caller's language (table
-     * names of the command bar and of the form name load) would get the other language.
+     * the form labels back: those loads wait for this (see later()). They may still run in a language switch
+     * window (ownLabels', a process's): the table names they read are picked from every language, not from
+     * UserLocalizedLabel, which follows the caller's.
      */
     head = Promise.resolve();
     /** Reads the page again. When it changed, starts loading what it shows and returns true. */
@@ -5673,7 +5925,8 @@
      * Requests what the page shows but the store lacks (Scanner.want): command bar buttons ('<table>|<control id>'),
      * tables of grids (WANT_TABLE + '<table>'), forms of side panes and quick views, grid views' queries and names, the
      * names of the forms in the form selector's list, a table's relationships and the names of tables the navigation shows
-     * (WANT_NAMES). Each is asked for once; failed ones again after retry().
+     * (WANT_NAMES). Each is asked for once; failed ones again after retry(). One a load already running answers joins it
+     * (join()), so it fails with that load too.
      */
     request(items) {
       const tables = [];
@@ -5706,16 +5959,28 @@
     get gaveUp() {
       return this.failed;
     }
-    /** "Try again": failed loads run again, failed command bar labels and grid tables are requested again. */
+    /**
+     * "Try again": failed loads run again, failed command bar labels and grid tables are requested again, and side panes'
+     * and quick views' forms read in some languages only are read again.
+     */
     retry() {
       for (const w of this.failed) this.asked.delete(w);
       this.failed.clear();
       this.errors.clear();
+      const again4 = [...this.again.values()];
+      this.again.clear();
       this.start();
+      for (const fn of again4) fn();
     }
     abort() {
       this.ac.abort();
+      this.behind.abort();
       clearTimeout(this.timer);
+    }
+    /** Stops the read behind the page's loads (`behind`), short of a language window already sent: it runs again later. */
+    stop() {
+      this.behind.abort();
+      this.behind = new AbortController();
     }
     o(lang = false) {
       return { signal: this.ac.signal, progress: () => {
@@ -5731,24 +5996,38 @@
     }
     /**
      * True when nothing with this key prefix is in the store yet. With `complete`, labels loaded for the user's
-     * language only (ref.partial) count as not loaded.
+     * language only (ref.partial) count as not loaded, except those no read can complete (ref.unreadable).
      */
     fresh(prefix, complete2 = false) {
       let hit2 = false;
       for (const s of this.app.store.slots.values())
         if (s.key.startsWith(prefix)) {
-          if (!complete2 || s.ref?.partial) return complete2;
+          if (!complete2 || s.ref?.partial && !s.ref.unreadable) return complete2;
           hit2 = true;
         }
       return !hit2;
     }
     /**
+     * Requests (`items`) that a load already running answers: they fail with it (joined). Nothing once it is done: it
+     * succeeded (a failed one leaves `jobs`), and its labels are in.
+     */
+    join(key, items) {
+      if (!items || !this.running.has(key)) return;
+      const set = this.joined.get(key) ?? /* @__PURE__ */ new Set();
+      for (const w of items) set.add(w);
+      this.joined.set(key, set);
+    }
+    /**
      * `quiet`: a load the page can do without (a side pane's form, a view's linked columns): when it fails its labels
-     * just stay unmarked, and the bar says nothing. `fn` gets the store's tick as the load started (Store.tick), for slots it
-     * adds itself before it ends.
+     * just stay unmarked, and the bar says nothing; one that got only part of them (an Incomplete that isn't quiet itself)
+     * says so as any load does, since those show, not loaded in some language. `fn` gets the store's tick as the load
+     * started (Store.tick), for slots it adds itself before it ends. `items`: the requests it answers, given up if it fails
+     * (gaveUp: asked again after retry()). While a load of `key` runs, another run() of it only adds its `items` to those
+     * (join()); once one has succeeded, nothing.
      */
     run(key, groups, what, fn, items, quiet = false) {
-      if (this.jobs.has(key)) return;
+      if (this.jobs.has(key)) return this.join(key, items);
+      this.stop();
       const bump = (d) => {
         for (const g of groups) {
           const n = (this.busy.get(g) || 0) + d;
@@ -5773,10 +6052,11 @@
             keep2(await fn(since2));
           } catch (e) {
             this.jobs.delete(key);
-            items?.forEach((w) => this.failed.add(w));
+            for (const w of [...items ?? [], ...this.joined.get(key) ?? []]) this.failed.add(w);
             if (e instanceof Incomplete) keep2(e.slots);
-            if (!quiet && !(e instanceof Incomplete && e.quiet) && !isAbort(e) && !this.ac.signal.aborted) this.errors.set(key, e instanceof Incomplete ? e.message : `Could not load ${what}. ${e?.message || e}`);
+            if (!(e instanceof Incomplete ? e.quiet : quiet) && !isAbort(e) && !this.ac.signal.aborted) this.errors.set(key, e instanceof Incomplete ? e.message : `Could not load ${what}. ${e?.message || e}`);
           } finally {
+            this.joined.delete(key);
             this.running.delete(key);
             bump(-1);
             this.changed();
@@ -5823,9 +6103,11 @@
      * The names of views shown in view selectors other than the list page's own (an associated grid's, a sub-grid's, a side
      * pane list's, the items of a list of views), and of the forms the form selector's list shows besides the page's own,
      * as the scanner asks for them (`prefix` + id): one read for those asked together. A personal view is no savedquery
-     * and gets no slot: its name is the user's own, not a label. What the read doesn't find is never asked for again.
+     * and gets no slot: its name is the user's own, not a label. What the read doesn't find is never asked for again. One
+     * whose name a load already reads (the page's own, records()) joins that load.
      */
     recordNames(kind, prefix, items) {
+      for (const w of items) this.join(`r:${kind}:${guid(w.slice(prefix.length))}`, [w]);
       const ids3 = [...new Set(items.map((w) => guid(w.slice(prefix.length))))].filter((id) => GUID3.test(id) && this.fresh(`${kind}|${id}|`) && !this.jobs.has(`r:${kind}:${id}`));
       if (!ids3.length) return;
       const { ctx, providers: pv } = this.app;
@@ -5835,7 +6117,7 @@
     /**
      * Loads the columns and choices of tables whose grids the page shows (the list, sub-grids), once each,
      * after the page's form and table (see head). `asked`: they came from request() (a failure lets retry()
-     * ask again).
+     * ask again), also when a load of the table already runs (they join it).
      */
     tables(names3, asked = false) {
       const { ctx, providers: pv } = this.app;
@@ -5843,7 +6125,10 @@
         const t = String(raw || "").toLowerCase();
         if (!/^[a-z0-9_]+$/.test(t)) continue;
         const k = `g:${t}`;
-        if (this.jobs.has(k) || this.jobs.has(`t:${t}`)) continue;
+        if (this.jobs.has(k) || this.jobs.has(`t:${t}`)) {
+          if (asked) this.join(this.jobs.has(k) ? k : `t:${t}`, [WANT_TABLE + t]);
+          continue;
+        }
         if (!asked && !this.fresh(`attribute|${t}.`) && !this.fresh(`state|${t}.`)) continue;
         this.run(k, ["Table and views", "Choices"], `the columns of the ${t} table`, this.later(() => pv.loadTables(ctx, [t], VALUES2, this.o())), asked ? [WANT_TABLE + t] : void 0);
       }
@@ -5856,8 +6141,8 @@
       if (this.page?.info.type !== "entityrecord") return;
       const xrm = this.app.ctx.xrm;
       const names3 = /* @__PURE__ */ new Set();
-      const all2 = tryGet(() => xrm.Page.ui.controls.get(), []);
-      for (const c of Array.isArray(all2) ? all2 : []) {
+      const all = tryGet(() => xrm.Page.ui.controls.get(), []);
+      for (const c of Array.isArray(all) ? all : []) {
         if (!isGridType(tryGet(() => String(c.getControlType() || ""), ""))) continue;
         const e = tryGet(() => String(c.getEntityName() || ""), "");
         if (e) names3.add(e.toLowerCase());
@@ -5866,14 +6151,16 @@
     }
     form(id, kind) {
       const { ctx, providers: pv } = this.app;
-      const all2 = ctx.langs.length > 1;
+      const all = ctx.langs.length > 1;
       this.records(kind, id, kind === "form" ? "the form name" : "the dashboard name");
       this.run(`x:${id}`, ["Form"], kind === "form" ? "the form labels" : "the dashboard labels", async () => {
-        if (!this.fresh(`${kind === "form" ? "" : "d"}tab|${id}|`, all2)) return null;
+        if (!this.fresh(`${kind === "form" ? "" : "d"}tab|${id}|`, all)) return null;
         const { store } = this.app;
         const ref = this.forms.get(id) ?? { formId: id, entity: kind === "form" ? this.page?.entity || "" : "", type: NaN, name: "" };
-        const read2 = await pv.loadFormXml(ctx, [ref], ctx.langs.map((l) => l.lcid), this.o(all2));
+        const scan2 = kind === "form" ? this.scan(id, ref.entity) : void 0;
+        const read2 = await pv.loadFormXml(ctx, [ref], ctx.langs.map((l) => l.lcid), this.o(all));
         if (!read2.length) throw new Error(`The ${kind} was not found, or you have no access to it.`);
+        this.ownLabels(read2, scan2, this.jobs.get(`x:${id}`));
         if (!this.forms.has(id)) this.forms.set(id, { formId: id, entity: read2[0].entity || "none", name: "", type: Number(read2[0].ref?.formType) });
         this.subgrids();
         this.navRelated(read2, "navitem|");
@@ -5882,9 +6169,71 @@
           return !s.ref?.partial || !o || o.ref?.partial;
         });
         this.quickViews(read2);
-        if (all2 && slots.some((s) => s.ref?.partial && !s.ref.unreadable)) throw new Incomplete(slots, `Could not load the ${kind} labels in every language.`);
+        if (all && slots.some((s) => s.ref?.partial && !s.ref.unreadable)) throw new Incomplete(slots, `Could not load the ${kind} labels in every language.`);
         return slots;
       });
+    }
+    /**
+     * The page's copies of form `id`'s GetClientMetadata answer (providers/formxml.ts pageOwnLabels), looked for from now on.
+     * `entity`: the form's table, where known.
+     */
+    scan(id, entity) {
+      const s = { done: this.app.providers.pageOwnLabels(this.app.ctx, id, entity) };
+      void s.done.then((c) => s.found = c);
+      return s;
+    }
+    /**
+     * Which field labels of a main form just read have a text of their own in each language, not their column's name filled
+     * in (`ref.own`, core/model.ts follows). What is known without a request (providers/formxml.ts knownOwnLabels: the
+     * answers kept for that version of the form, and the page's copies of it, `scan`, if found by now) is on the labels
+     * before they are stored, so a popup shows it from the start. A copy is checked against the labels as read: a cell it
+     * lists no label of its own for has the text a read fills in there (`fills`, by the column's names in the store), so
+     * copies found later, and those the column's names weren't in yet to check, are set once the labels are stored
+     * (`stored`, the load's job) and the page's table is in (`head`); until then no label shows as following its column
+     * anyway. The rest is read once none of the page's loads runs any more, and no save or publish runs (Store.busy), in the
+     * user's language, then in each other language in a switch window of its own (loadOwnLabels), only where a label's text
+     * is its column's name (Store.fillsIn), and set on the labels as each comes in. A load that starts stops it (`behind`),
+     * and so does a save or a publish that starts, short of a window already sent, which they wait for (one hold at a time;
+     * a publish runs while no window is open, LangSession.quiet); it is read again once none runs. Until a language is in, a
+     * label worded as its column's name there shows as the user's language does (core/model.ts follows), and one nothing is
+     * known of as before; a label loaded again since from another version of its form keeps what it has.
+     */
+    ownLabels(read2, scan2, stored4) {
+      const cells = read2.filter((s) => s.ref?.sparse);
+      if (!cells.length) return;
+      const { ctx, providers: pv, store } = this.app;
+      const set = (own2) => {
+        for (const s of cells) if (store.get(s.key)?.ref?.formVersion !== s.ref.formVersion) own2.delete(s.key);
+        store.setOwn(own2);
+      };
+      const fills = (s, l) => fillsIn(s, l, ctx.base, s.labels[l] ?? "", (k, y) => store.text(k, y, true));
+      const now = pv.knownOwnLabels(ctx, cells, scan2?.found, fills);
+      for (const s of cells) if (now.has(s.key)) s.ref.own = { ...s.ref.own, ...now.get(s.key) };
+      const undecided = (s, l) => store.fillsIn(s.key, l, ctx.base);
+      const off = store.on((e) => void (e.type === "busy" && e.busy && this.stop()));
+      void (async () => {
+        const copies = await scan2?.done;
+        await stored4;
+        await this.head;
+        if (copies?.length) set(pv.knownOwnLabels(ctx, cells, copies, fills));
+        for (; ; ) {
+          for (let k = this.running.values().next().value; k; k = this.running.values().next().value) await this.jobs.get(k);
+          if (store.busy) {
+            await new Promise((go) => {
+              const done = store.on((e) => void (e.type === "busy" && !e.busy && (done(), go())));
+            });
+            continue;
+          }
+          const { signal } = this.behind;
+          try {
+            set(await pv.loadOwnLabels(ctx, cells, signal, set, undecided));
+            return;
+          } catch (e) {
+            if (!signal.aborted || this.ac.signal.aborted) throw e;
+          }
+        }
+      })().catch(() => {
+      }).finally(off);
     }
     /**
      * A related menu item of the form XML without a title in some language shows its relationship's text there
@@ -5907,35 +6256,60 @@
     /**
      * A form the page shows besides its own (LIVE-FINDINGS 56, 58), behind the page's form and table (see head), and
      * its table (columns, tooltips, choices). `full`: a side pane's form, which shows tabs and sections too, in every
-     * language like the page's; else a quick view's, whose cells come in every language with one read (its tabs and
-     * sections never show). A form that can't be read leaves its labels unmarked, without a message.
+     * language like the page's; else a quick view's, of which only cells show: they come in every language with one read,
+     * and its tabs and sections are left out, never kept in the user's language alone (they would only ever show as
+     * not loaded, in the Workbench and All labels). A cell kept per language (a web resource's, an iframe's) is read in
+     * every language as the page's own form's tabs are; a quick view without one costs no language switch. A form that
+     * can't be read leaves its labels unmarked, without a message; one read in some languages only keeps what was read
+     * and counts as failed, as the page's own form does (the bar says so, Try again reads it again). A request (`item`)
+     * for a form whose read already runs joins it (the scanner asks for a quick view its host form's read asked for
+     * first): if that read fails, the request is given up with it, and asked again after Try again.
      */
     shown(id, full, item) {
       const fid = guid(id);
       const key = `${full ? "o" : "q"}:${fid}`;
-      if (!GUID3.test(fid) || this.jobs.has(key) || this.jobs.has(`o:${fid}`)) return;
+      if (!GUID3.test(fid)) return;
+      const on = this.jobs.has(key) ? key : `o:${fid}`;
+      if (this.jobs.has(on)) return this.join(on, item ? [item] : void 0);
       const { ctx, providers: pv, store } = this.app;
-      const all2 = full && ctx.langs.length > 1;
+      const all = ctx.langs.length > 1;
+      const kinds = full ? void 0 : QUICK_KINDS;
       const tableOf = () => {
         for (const s of store.slots.values()) if (s.ref?.formId === fid && s.entity) return s.entity;
         return "";
+      };
+      const partial = () => all && [...store.slots.values()].some((s) => s.ref?.formId === fid && (!kinds || kinds.has(s.kind)) && s.ref.partial && !s.ref.unreadable);
+      const failed2 = (slots) => {
+        this.again.set(key, () => this.shown(fid, full, item));
+        return new Incomplete(slots, "Could not load the form labels in every language.");
       };
       this.run(
         key,
         ["Form"],
         "the labels of a form on this page",
         this.later(async () => {
-          if (!this.fresh(`field|${fid}|`) && (!full || !this.fresh(`tab|${fid}|`, all2))) {
+          this.again.delete(key);
+          if (!this.fresh(`field|${fid}|`, all) && (!full || !this.fresh(`tab|${fid}|`, all))) {
             this.tables([tableOf()]);
             return null;
           }
-          const read2 = await pv.loadFormXml(ctx, [{ formId: fid, entity: "", type: NaN, name: "" }], ctx.langs.map((l) => l.lcid), this.o(all2));
+          let read2;
+          try {
+            read2 = await pv.loadFormXml(ctx, [{ formId: fid, entity: "", type: NaN, name: "" }], ctx.langs.map((l) => l.lcid), this.o(all), kinds);
+          } catch (e) {
+            if (!isAbort(e) && partial()) throw failed2([]);
+            throw e;
+          }
           if (read2[0]?.entity) this.tables([read2[0].entity]);
           this.quickViews(read2);
-          return read2.filter((s) => {
+          const kept2 = kinds ? read2.filter((s) => kinds.has(s.kind)) : read2;
+          this.ownLabels(kept2);
+          const slots = kept2.filter((s) => {
             const o = store.get(s.key);
             return !s.ref?.partial || !o || o.ref?.partial;
           });
+          if (all && slots.some((s) => s.ref?.partial && !s.ref.unreadable)) throw failed2(slots);
+          return slots;
         }),
         item ? [item] : void 0,
         true
@@ -6323,8 +6697,8 @@
       const dom = !sec && known(at) && areaOf(k) === "body" ? at : null;
       const sn = sec?.getName?.() || dom?.section || void 0;
       const tn = sec?.getParent?.()?.getName?.() || dom?.tab || void 0;
-      const all2 = (f.cells.get(col) || []).filter((s) => isCopyOf(s, k));
-      const cells = all2.filter((s) => s.ref.sectionName === sn && s.ref.tabName === tn);
+      const all = (f.cells.get(col) || []).filter((s) => isCopyOf(s, k));
+      const cells = all.filter((s) => s.ref.sectionName === sn && s.ref.tabName === tn);
       if (cells.length === 1) return cells[0];
       const peers = () => a.controls.get().map((o) => String(o.getName()).toLowerCase()).filter((n) => areaOf(n) === areaOf(k) && !n.startsWith("header_process_"));
       if (cells.length > 1) {
@@ -6342,8 +6716,8 @@
         }
         return cells[i];
       }
-      if (all2.length) {
-        const there = all2.filter((s) => (s.ref.area || "body") === areaOf(k));
+      if (all.length) {
+        const there = all.filter((s) => (s.ref.area || "body") === areaOf(k));
         return there.length === 1 && peers().length === 1 ? there[0] : void 0;
       }
       if ((f.cells.get(col) || []).length) return void 0;
@@ -6482,9 +6856,9 @@
   var isTimeline = (s) => String(s.ref?.classid || "").replace(/[{}]/g, "").toLowerCase() === TIMELINE_CLASS;
   var TIMELINE_HEADING = BUILTIN + "timeline|";
   var isHeading = (a) => a.key.startsWith(TIMELINE_HEADING);
-  function builtin(el, what, kind, role, text4) {
+  function builtin(el, what, kind, role2, text4) {
     const comp2 = BUILTIN + what;
-    return { el, comp: comp2, kind, key: `${comp2}|Label`, role, ...text4 ? { text: text4 } : {} };
+    return { el, comp: comp2, kind, key: `${comp2}|Label`, role: role2, ...text4 ? { text: text4 } : {} };
   }
   function rendered(el) {
     try {
@@ -6597,8 +6971,8 @@
       const fs = P2.ui.formSelector;
       const it = fs.getCurrentItem();
       if (it) return String(it.getId() || "");
-      const all2 = fs.items.get();
-      return all2.length === 1 ? String(all2[0].getId() || "") : "";
+      const all = fs.items.get();
+      return all.length === 1 ? String(all[0].getId() || "") : "";
     }, "");
     return !!cur2 && guid(cur2) !== x.formId;
   }
@@ -6868,10 +7242,7 @@
     if (s) {
       const src = navSource((k) => x.store.slots.get(k), s);
       if (!src && menuRelationship(s)) sc.want.add(WANT_RELATED + (s.entity || x.entity));
-      const t2 = shown(sc, el, src ? /* @__PURE__ */ new Set([...x.labels(s), ...x.labels(src)]) : x.labels(s), 8)?.[1];
-      const a = A(x, el, s, { role: "nav", text: t2 });
-      if (a && t2) a.orig = sc.textOf(t2);
-      return a;
+      return A(x, el, s, { role: "nav", text: shown(sc, el, src ? /* @__PURE__ */ new Set([...x.labels(s), ...x.labels(src)]) : x.labels(s), 8)?.[1] });
     }
     if (BUILT_IN_NAV.test(id) && !RELATED_NAV.has(id.toLowerCase())) return x.formReady ? builtin(el, `nav|${id}`, "navitem", "nav", shown(sc, el, null, 8)?.[1]) : null;
     const r = x.related.get(id.toLowerCase());
@@ -7558,6 +7929,7 @@
         got = (Array.isArray(r) ? r : [r]).filter((a) => !!a);
         if (got.length) break;
       }
+      for (const a of got) if (a.text && !a.part) a.orig = this.textOf(a.text);
       if (old && sameAll(old, got)) got = old;
       if (!got.length) {
         if (this.map.has(k)) this.drop(k);
@@ -7599,13 +7971,13 @@
   };
   var quoted2 = (v) => v.replace(/["\\]/g, "\\$&");
   function domShown(root = document) {
-    const all2 = (sel) => Array.from(root.querySelectorAll(sel));
+    const all = (sel) => Array.from(root.querySelectorAll(sel));
     return {
       fields(ctls) {
         const out = [];
         for (const ctl of new Set(ctls.flatMap((c) => [c, c.toLowerCase()]))) {
           if (!/^\w+$/.test(ctl)) continue;
-          for (const c of all2(`[data-id="${ctl}${FIELD}"]`)) {
+          for (const c of all(`[data-id="${ctl}${FIELD}"]`)) {
             if (otherForm(c, ctl)) continue;
             const lab = Array.from(c.querySelectorAll('label[id$="field-label"]')).find((l) => l.id === `${ctl}-field-label` || l.id.endsWith(`-${ctl}-field-label`));
             if (lab) out.push({ ctl, text: lab.textContent || "", tip: lab.parentElement?.getAttribute("title") || "", place: placeOf(c) });
@@ -7614,11 +7986,11 @@
         return out;
       },
       tab(name) {
-        const el = all2(`li[role="tab"][data-id="tablist-${quoted2(name)}"]`)[0];
+        const el = all(`li[role="tab"][data-id="tablist-${quoted2(name)}"]`)[0];
         return el ? el.getAttribute("title") || el.getAttribute("aria-label") || "" : void 0;
       },
       section(name) {
-        const el = all2(`[data-id="form-sectionHeader-${quoted2(name)}"]`)[0];
+        const el = all(`[data-id="form-sectionHeader-${quoted2(name)}"]`)[0];
         return el ? el.getAttribute("title") || el.textContent || "" : void 0;
       }
     };
@@ -7723,7 +8095,7 @@
     return ["Description", "DisplayName"].map((p) => `attribute|${c.entity}.${c.attr}|${p}`).filter((k) => !!store.get(k));
   }
   function readOnlyLook(app, s) {
-    if (s.readOnly === MANAGED) return "ro";
+    if (s.readOnly === MANAGED || s.readOnly === MANAGED_RIBBON) return "ro";
     return app.ctx.langs.every(({ lcid }) => !notLoaded(s, lcid) && !!app.store.value(s.key, lcid).trim()) ? "builtin" : "ro";
   }
   var look = (app, comp2) => {
@@ -7732,15 +8104,16 @@
     let m;
     for (const s of own2) if (!m || rank2(s) < rank2(m)) m = s;
     if (!m) return "na";
-    const all2 = [...own2];
-    for (const k of relatedKeys(store, m)) all2.push(store.get(k));
+    const all = [...own2];
+    for (const k of relatedKeys(store, m)) all.push(store.get(k));
     if (store.status.size)
-      for (const s of all2)
+      for (const s of all)
         for (const { lcid } of ctx.langs) {
           const o = store.cellStatus(s.key, lcid)?.outcome;
           if (o === "error" || o === "conflict") return "error";
         }
-    for (const s of all2) if (store.isEdited(s.key)) return "edited";
+    for (const s of all) if (store.isEdited(s.key)) return "edited";
+    if (isTimeline(m)) return "builtin";
     const t = prefs.target;
     const base = ctx.base;
     if (m.readOnly) {
@@ -7955,7 +8328,7 @@
     const mb = cellBase(app, m);
     const others = [];
     for (const s of store.slots.values()) {
-      if (s.kind !== m.kind || s.prop !== "Label" || s.key === m.key || s.ref?.formId !== r.formId || s.readOnly || isManaged(s) || notLoaded(s, t)) continue;
+      if (s.kind !== m.kind || s.prop !== "Label" || s.key === m.key || s.ref?.formId !== r.formId || s.readOnly || managedHeld(s, store.managedEdits) || notLoaded(s, t)) continue;
       if (columnOf(s)?.attr !== col.attr) continue;
       const sb = cellBase(app, s);
       if (mb !== null && sb !== null && sb !== mb) continue;
@@ -8115,8 +8488,8 @@
       case "state":
       case "boolean":
       case "globaloption": {
-        const all2 = siblings(app, m);
-        md.choices = { keys: all2.map((s) => s.key), open: true, focus: m.key, ...m.kind === "globaloption" ? { shared: sharedBy(m) } : {} };
+        const all = siblings(app, m);
+        md.choices = { keys: all.map((s) => s.key), open: true, focus: m.key, ...m.kind === "globaloption" ? { shared: sharedBy(m) } : {} };
         return;
       }
       case "globaloptionset": {
@@ -8254,7 +8627,6 @@
         md.blocks = mk(m, "Label");
         return;
       }
-      md.blocks = mk(m, "Form label").map((b) => ({ ...b, note: TIMELINE_LABEL_NOTE, hidden: true }));
       if (a && isHeading(a)) {
         md.title = pageText(a) || md.title;
         md.icon = "info";
@@ -8271,7 +8643,7 @@
     const also = duplicates(app, m);
     if (also) label.also = also;
     label.note = Number(r.formType) === QUICK_VIEW ? FIELD_NOTES.quickView : FIELD_NOTES.label;
-    md.blocks = [label, ...tip, ...name];
+    md.blocks = [...name, ...tip, label];
     const ch = choicesOf(app, c.entity, c.attr, a?.focus);
     if (ch) md.choices = ch;
   }
@@ -8285,7 +8657,6 @@
   var BUILTIN_NOTE = "Built-in Microsoft text. It's already translated into every language installed in this environment, so there's nothing to translate here.";
   var TIMELINE_NOTE = "Dynamics' own heading, already translated into every language installed in this environment. A Name given to the timeline in the form designer replaces it, the same text in every language.";
   var TIMELINE_NAME_NOTE = "The timeline's Name, set in the form designer. Dynamics shows it as it is in every language: it keeps one Name for all languages, so it can't be translated. Clear the Name there to show Dynamics' own heading instead, already translated into every language installed in this environment.";
-  var TIMELINE_LABEL_NOTE = "this form only, not shown on the page";
   var unnamedNote = (kind, base) => `This ${kind === "subarea" ? "menu item" : kind} has no name of its own: Dynamics shows the app designer's placeholder. Name it in each language; other languages will show the ${base} name until you translate them.`;
   var TABLE_COMMAND_WHY = "Microsoft builds this button's text from the table's name: its other words are already translated.";
   var TABLE_COMMAND_NOTE = `${TABLE_COMMAND_WHY} Translate the table's name here; the button follows, as does every other place that shows it.`;
@@ -8311,7 +8682,7 @@
     };
     if (!m) return md;
     fill(app, md, m, an);
-    if (!md.blocks.length && !md.choices?.keys.includes(m.key)) md.blocks = mk(m, "Label");
+    if (!md.blocks.length && !md.choices?.keys.includes(m.key) && !isTimeline(m)) md.blocks = mk(m, "Label");
     if (an) clickedFirst(app, md, an.key, m.kind === "field" && !!columnOf(m));
     const keys = /* @__PURE__ */ new Set();
     md.blocks = md.blocks.filter((b) => !keys.has(b.key) && !!keys.add(b.key));
@@ -8326,7 +8697,7 @@
   };
 
   // src/inspector/overlay.css
-  var overlay_default = `:host{all:initial}[hidden]{display:none!important}.W{position:fixed;inset:0;overflow:hidden;pointer-events:none}.L{position:absolute;inset:0}.g{display:contents;--c:#0f6cbd;--f:rgba(15,108,189,.1);--b:rgba(15,108,189,.55);--s:dashed;--r:rgba(15,108,189,.3)}.g.is-missing{--c:#c48a00;--f:rgba(255,185,0,.22);--b:#c48a00;--r:rgba(196,138,0,.3)}.g.is-edited{--c:#107c10;--f:rgba(34,197,94,.28);--b:#107c10;--s:solid;--r:rgba(16,124,16,.3)}.g.is-error{--c:#c4314b;--f:rgba(196,49,75,.14);--b:#c4314b;--s:solid;--r:rgba(196,49,75,.3)}.g.is-builtin,.g.is-ro{--c:#616161;--f:rgba(97,97,97,.08);--b:#8a8a8a;--s:dotted;--r:rgba(97,97,97,.25)}.is-builtin .pn,.is-ro .pn{display:none}.g>i{position:absolute;left:0;top:0;box-sizing:border-box;border:1px var(--s) var(--b);border-radius:4px;background:var(--f);box-shadow:0 0 0 1px #ffffff73;pointer-events:none}.g.is-edited>i{outline:1px solid var(--b);box-shadow:0 0 0 2px #ffffff73}.g.is-error>i{outline:1px solid var(--b);outline-offset:1px}.g.is-fl>i{border:2px solid var(--c);outline:0;box-shadow:0 0 0 3px var(--r);animation:dxt-fl .25s ease-out}.g.is-hv>i,.g.is-act>i{border:2px solid var(--c);outline:0}.g.is-pl>i{border:2px solid var(--c);outline:0;animation:dxt-pl .6s ease-out 3}.pn{position:absolute;left:0;top:0;z-index:1;box-sizing:border-box;border-radius:50%;background:var(--c) center/10px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M12.5 4.5l3 3L7 16H4v-3l8.5-8.5Z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/></svg>");box-shadow:0 0 0 1px #fff,0 1px 3px #0000004d;pointer-events:none}.pill{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 6px;border-radius:8px;background:#107c10;color:#fff;font:600 11px/16px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;text-align:center;box-shadow:0 0 0 1px #ffffffb3,0 1px 2px #0003;-webkit-user-select:none;user-select:none}.pill.is-n{padding:0}.pill.is-error{background:#c4314b}.ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px #00000040}.is-alt .L{opacity:.25}.is-alt .pn,.is-alt .pill,.is-alt .ptip{display:none}@keyframes dxt-fl{0%{box-shadow:0 0 0 10px transparent}}@keyframes dxt-pl{0%{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}@media(prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}@media(forced-colors:active){.g>i,.pn{forced-color-adjust:none}.g>i{background:none;box-shadow:none;border-color:Highlight}.g.is-edited>i{outline-color:Highlight;box-shadow:none}.is-missing>i,.g.is-error>i{border-color:LinkText;outline-color:LinkText}.g.is-fl>i,.g.is-hv>i,.g.is-act>i,.g.is-pl>i{border-color:Highlight;box-shadow:none}.g.is-pl>i{animation:none}.pn{background-color:Highlight;box-shadow:none}.pill{forced-color-adjust:none;background:Highlight;color:HighlightText;box-shadow:none}.pill.is-error{background:LinkText;color:Canvas}.ptip{forced-color-adjust:none;background:Canvas;color:CanvasText;border:1px solid CanvasText;box-shadow:none}}`;
+  var overlay_default = `:host{all:initial}[hidden]{display:none!important}.W{position:fixed;inset:0;overflow:hidden;pointer-events:none}.L{position:absolute;inset:0}.g{display:contents;--c:#0f6cbd;--f:rgba(15,108,189,.1);--b:rgba(15,108,189,.55);--s:dashed;--r:rgba(15,108,189,.3)}.g.is-missing{--c:#c48a00;--f:rgba(255,185,0,.22);--b:#c48a00;--r:rgba(196,138,0,.3)}.g.is-edited{--c:#107c10;--f:rgba(34,197,94,.28);--b:#107c10;--s:solid;--r:rgba(16,124,16,.3)}.g.is-error{--c:#c4314b;--f:rgba(196,49,75,.14);--b:#c4314b;--s:solid;--r:rgba(196,49,75,.3)}.g.is-builtin,.g.is-ro{--c:#616161;--f:rgba(97,97,97,.08);--b:#8a8a8a;--s:dotted;--r:rgba(97,97,97,.25)}.is-builtin .pn,.is-ro .pn{display:none}.g>i{position:absolute;left:0;top:0;box-sizing:border-box;border:1px var(--s) var(--b);border-radius:4px;background:var(--f);box-shadow:0 0 0 1px #ffffff73;pointer-events:none}.g.is-edited>i{outline:1px solid var(--b);box-shadow:0 0 0 2px #ffffff73}.g.is-error>i{outline:1px solid var(--b);outline-offset:1px}.g.is-fl>i{border:2px solid var(--c);outline:0;box-shadow:0 0 0 3px var(--r);animation:dxt-fl .25s ease-out}.g.is-hv>i,.g.is-act>i{border:2px solid var(--c);outline:0}.g.is-pl>i{border:2px solid var(--c);outline:0;animation:dxt-pl .6s ease-out 3}.pn{position:absolute;left:0;top:0;z-index:1;box-sizing:border-box;border-radius:50%;background:var(--c) center/10px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M12.5 4.5l3 3L7 16H4v-3l8.5-8.5Z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/></svg>");box-shadow:0 0 0 1px #fff,0 1px 3px #0000004d;pointer-events:none}.pill{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 6px;border-radius:8px;background:#107c10;color:#fff;font:600 11px/16px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;text-align:center;box-shadow:0 0 0 1px #ffffffb3,0 1px 2px #0003;-webkit-user-select:none;user-select:none}.pill.is-n{padding:0}.pill.is-error{background:#c4314b}.ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px #00000040}.g.is-pk{--c:#0f6cbd;--r:rgba(15,108,189,.3)}.g.is-pk>i{border:2px solid #0f6cbd;outline:0;background:#0f6cbd4d}.is-sel .g:not(.is-pk) .pn{display:none}.g.is-pk .pn{display:block;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 10.5l3.2 3.2L15 7' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>")}.lasso{position:absolute;left:0;top:0;box-sizing:border-box;border:1px solid #0f6cbd;background:#0f6cbd1f}.is-alt .L{opacity:.25}.is-alt .pn,.is-alt .pill,.is-alt .ptip,.is-alt .g.is-pk .pn{display:none}@keyframes dxt-fl{0%{box-shadow:0 0 0 10px transparent}}@keyframes dxt-pl{0%{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}@media(prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}@media(forced-colors:active){.g>i,.pn{forced-color-adjust:none}.g>i{background:none;box-shadow:none;border-color:Highlight}.g.is-edited>i{outline-color:Highlight;box-shadow:none}.is-missing>i,.g.is-error>i{border-color:LinkText;outline-color:LinkText}.g.is-fl>i,.g.is-hv>i,.g.is-act>i,.g.is-pl>i{border-color:Highlight;box-shadow:none}.g.is-pl>i{animation:none}.pn{background-color:Highlight;box-shadow:none}.pill{forced-color-adjust:none;background:Highlight;color:HighlightText;box-shadow:none}.pill.is-error{background:LinkText;color:Canvas}.ptip{forced-color-adjust:none;background:Canvas;color:CanvasText;border:1px solid CanvasText;box-shadow:none}}`;
 
   // src/inspector/overlay.ts
   var INTERCEPT = ["pointerdown", "mousedown", "pointerup", "mouseup", "click", "dblclick"];
@@ -8533,6 +8904,15 @@
   };
   var meets = (a, b) => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
   var within = (b, p) => p.x >= b[0] && p.x < b[0] + b[2] && p.y >= b[1] && p.y < b[1] + b[3];
+  var overlaps = (b, marks2) => marks2.some((m) => m[0] < b[0] + b[2] && m[0] + m[2] > b[0] && m[1] < b[1] + b[3] && m[1] + m[3] > b[1]);
+  var BOX_MIN = 6;
+  function onScrollbar(e) {
+    const el = e.target;
+    const w = el?.clientWidth ?? 0;
+    const h2 = el?.clientHeight ?? 0;
+    return w > 0 && e.offsetX >= w || h2 > 0 && e.offsetY >= h2;
+  }
+  var dragBox = (s) => [Math.min(s.x0, s.x), Math.min(s.y0, s.y), Math.abs(s.x - s.x0), Math.abs(s.y - s.y0)];
   var grow3 = (b, d) => [b[0] - d, b[1] - d, b[2] + 2 * d, b[3] + 2 * d];
   var onText = (boxes, pt) => boxes.some((b) => within(grow3(b, SLOP), pt));
   var boxOf = (r) => [r.left, r.top, r.width, r.height];
@@ -8576,7 +8956,7 @@
     constructor(o) {
       this.o = o;
       this.host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483645;pointer-events:none;contain:strict";
-      this.wrap.append(this.layer, this.pillLayer, this.tip);
+      this.wrap.append(this.layer, this.pillLayer, this.tip, this.lasso);
       this.host.attachShadow({ mode: "open" }).append(h("style", null, overlay_default), this.wrap);
     }
     host = h("div");
@@ -8654,6 +9034,16 @@
     removed = false;
     timer = 0;
     tick = 0;
+    /** Selecting labels for an export (selection()); null when not. */
+    sx = null;
+    /** A press while selecting, which draws a box once it moves (boxing); null when none. */
+    sel = null;
+    /** The labels the box being drawn covers this frame: they show as selected until it is let go. */
+    boxed = /* @__PURE__ */ new Set();
+    lasso = h("i", { class: "lasso", hidden: true });
+    /** The page's own user-select on <html> while a box is drawn (no text gets selected meanwhile); null when none is. */
+    us = null;
+    selT = 0;
     start() {
       if (this.on) return;
       this.on = true;
@@ -8709,6 +9099,7 @@
       this.onPill = null;
       this.pens = [];
       this.pt = null;
+      this.endBox();
       removeEventListener("keydown", this.onKey, true);
       removeEventListener("keyup", this.onKeyUp, true);
       removeEventListener("blur", this.reset);
@@ -8872,6 +9263,7 @@
         clearTimeout(this.plT);
         this.pl = null;
         this.pens = [];
+        this.endBox();
       }
       this.paused = on;
       this.gs.g = this.gs.end = void 0;
@@ -8885,6 +9277,128 @@
     invalidate(n = 2) {
       if (n > this.settle) this.settle = n;
       if (!this.raf && this.live()) this.raf = requestAnimationFrame(this.frame);
+    }
+    selection(s) {
+      if (!s) this.endBox();
+      this.sx = s;
+      this.wrap.classList.toggle("is-sel", !!s);
+      this.invalidate(1);
+    }
+    // ---- selection box ----
+    /**
+     * While selecting: a press anywhere but our own UI (the primary button, without Alt, not a finger, which scrolls) may
+     * draw a box. It shows once the pointer has moved BOX_MIN px, and from then on the gesture is the box's: neither the
+     * page nor a label gets its release or click. Let go, it selects the labels it covers (OverlayHooks.boxed). A press
+     * that doesn't move is a click as always, and one on a scrollbar scrolls. True when the event was the box's.
+     */
+    boxing(m, t, mine3) {
+      if (t === "pointerdown") {
+        this.endBox();
+        const p = m;
+        if (p.button !== 0 || p.altKey || mine3 || p.pointerType === "touch" || onScrollbar(p)) return false;
+        this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, on: false, done: false };
+        addEventListener("pointermove", this.onBoxMove, true);
+        addEventListener("pointercancel", this.onBoxCancel, true);
+        addEventListener("dragstart", this.onBoxDrag, true);
+        addEventListener("selectstart", this.onBoxText, true);
+        return false;
+      }
+      const s = this.sel;
+      if (!s) return false;
+      if (!s.on) {
+        if (t === "pointerup") this.endBox();
+        return false;
+      }
+      m.preventDefault();
+      m.stopImmediatePropagation();
+      if (t === "pointerup" && !s.done) this.letGo(true);
+      return true;
+    }
+    onBoxMove = (e) => {
+      const s = this.sel;
+      if (!s || s.done || e.pointerId !== s.id) return;
+      if (!(e.buttons & 1)) return s.on ? this.letGo(true) : this.endBox();
+      s.x = e.clientX;
+      s.y = e.clientY;
+      if (!s.on) {
+        if (Math.abs(s.x - s.x0) < BOX_MIN && Math.abs(s.y - s.y0) < BOX_MIN) return;
+        s.on = true;
+        this.noText(true);
+      }
+      this.invalidate(1);
+    };
+    onBoxCancel = (e) => {
+      if (this.sel && e.pointerId === this.sel.id) this.endBox();
+    };
+    /** A press while selecting never drags a link or an image of the page: the box goes on instead. */
+    onBoxDrag = (e) => {
+      if (this.sel && !this.sel.done) e.preventDefault();
+    };
+    /** Nor does it select the page's text. */
+    onBoxText = (e) => {
+      if (this.sel && !this.sel.done && !this.ours(e.composedPath())) e.preventDefault();
+    };
+    /**
+     * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go. Its release's mouseup and
+     * click are still the box's (boxing), until the next press or a moment later.
+     */
+    letGo(take) {
+      const s = this.sel;
+      if (!s || s.done) return;
+      s.done = true;
+      const got = take && s.on ? this.covered(s) : [];
+      this.boxed.clear();
+      this.noText(false);
+      removeEventListener("pointermove", this.onBoxMove, true);
+      clearTimeout(this.selT);
+      this.selT = window.setTimeout(() => this.sel === s && this.endBox(), 100);
+      this.invalidate(1);
+      if (got.length)
+        try {
+          this.o.boxed?.(got);
+        } catch (e) {
+          if (false) console.error("[translator] box", e);
+        }
+    }
+    /** Forgets the press and its box, if any. */
+    endBox() {
+      clearTimeout(this.selT);
+      if (!this.sel) return;
+      this.sel = null;
+      this.boxed.clear();
+      this.noText(false);
+      removeEventListener("pointermove", this.onBoxMove, true);
+      removeEventListener("pointercancel", this.onBoxCancel, true);
+      removeEventListener("dragstart", this.onBoxDrag, true);
+      removeEventListener("selectstart", this.onBoxText, true);
+      this.invalidate(1);
+    }
+    /** The labels a box covers that can be selected, by their marks in the last frame. */
+    covered(s) {
+      const sx = this.sx;
+      if (!sx) return [];
+      const b = dragBox(s);
+      const out = [];
+      for (const r of this.recs.values()) if (!this.dead(r.a) && overlaps(b, r.boxes) && sx.can(r.a)) out.push(r.a);
+      return out;
+    }
+    /** While a box is drawn no text of the page gets selected (user-select on <html>, put back after). */
+    noText(on) {
+      if (on === (this.us !== null)) return;
+      try {
+        const st = document.documentElement.style;
+        if (on) {
+          this.us = st.getPropertyValue("user-select");
+          st.setProperty("user-select", "none", "important");
+          getSelection()?.removeAllRanges();
+        } else {
+          if (this.us) st.setProperty("user-select", this.us);
+          else st.removeProperty("user-select");
+        }
+      } catch {
+      }
+      if (!on) this.us = null;
+      else this.us ??= "";
     }
     // ---- events ----
     live() {
@@ -8987,6 +9501,7 @@
       const path = m.composedPath();
       const mine3 = this.ours(path);
       this.altFrom(m, mine3);
+      if (this.sx && this.boxing(m, t, mine3)) return;
       const d = decide(this.gs, t, mine3 ? null : this.here(m, path, t), m.detail);
       if (!d.swallow || mine3) return;
       e.preventDefault();
@@ -9073,6 +9588,11 @@
     };
     onKey = (e) => {
       if (!this.live()) return;
+      if (e.key === "Escape" && this.sel?.on && !this.sel.done) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return this.letGo(false);
+      }
       if (e.key === "Alt") {
         if (!this.ours(e.composedPath())) this.setAlt(true);
         return;
@@ -9247,11 +9767,16 @@
         return b ? [[a, b]] : [];
       });
       this.hover = this.under();
+      const sx = this.sx;
+      const s = this.sel;
+      if (s?.on && !s.done) this.boxed = new Set(this.covered(s));
+      else if (this.boxed.size) this.boxed.clear();
+      const picked = (a) => !!sx && (this.boxed.has(a) || sx.has(a));
       const penOk = /* @__PURE__ */ new Map();
       const pens = [];
       for (const r of this.recs.values()) {
         const act = !!this.act && r.a.comp === this.act && (this.actA === void 0 || r.a === this.actA);
-        if (r.a !== this.hover && !act) continue;
+        if (r.a !== this.hover && !act && !picked(r.a)) continue;
         const b = penAt(r);
         if (!b) continue;
         const ok = !top.length || !this.covers(r.a.zone ?? r.a.el, [b], top, pops, float, () => hits-- > 0).length;
@@ -9266,8 +9791,10 @@
         const act = live && !!this.act && r.a.comp === this.act && (this.actA === void 0 || r.a === this.actA);
         const fl = live && !!this.fl && r.a.comp === this.fl;
         const pl = live && r.a === this.pl;
-        this.draw(r, `g is-${r.look || "na"}${hv ? " is-hv" : ""}${act ? " is-act" : ""}${fl ? " is-fl" : ""}${pl ? " is-pl" : ""}`, hv || act, view, dpr, penOk.get(r) ?? false, after.get(r.a));
+        const pk = live && picked(r.a);
+        this.draw(r, `g is-${r.look || "na"}${hv ? " is-hv" : ""}${act ? " is-act" : ""}${fl ? " is-fl" : ""}${pl ? " is-pl" : ""}${pk ? " is-pk" : ""}`, hv || act || pk, view, dpr, penOk.get(r) ?? false, after.get(r.a));
       }
+      this.place(this.lasso, s?.on && !s.done ? dragBox(s) : null);
       for (const p of this.pills) this.drawPill(p);
       this.drawTip(view, dpr);
       for (const fn of this.subs)
@@ -9329,11 +9856,11 @@
      * on top of the page (one that lies under the page, or takes no pointer events, leaves the marks as they are).
      * Shadow roots are looked into (a bookmarklet often draws its panel in one).
      */
-    floats(view, all2, other) {
+    floats(view, all, other) {
       const out = [];
       const w = view.r - view.l;
       const ht = view.b - view.t;
-      const roots = all2.filter((p) => p.isConnected);
+      const roots = all.filter((p) => p.isConnected);
       const share = Math.max(16, Math.ceil(MAX_VISITS / Math.max(1, roots.length)));
       let total = 2 * MAX_VISITS;
       const found = (x) => {
@@ -9369,8 +9896,8 @@
             wides.push(up2 = { el, r, up: wd, found: false });
           }
           if (depth >= MAX_DEPTH) continue;
-          const kids2 = el.shadowRoot ? [...el.children, ...el.shadowRoot.children] : el.children;
-          for (let j = kids2.length - 1; j >= 0 && queue.length - k - 1 < left; j--) queue.push([kids2[j], depth + 1, up2]);
+          const kids3 = el.shadowRoot ? [...el.children, ...el.shadowRoot.children] : el.children;
+          for (let j = kids3.length - 1; j >= 0 && queue.length - k - 1 < left; j--) queue.push([kids3[j], depth + 1, up2]);
         }
         for (let j = wides.length - 1; j >= 0; j--)
           if (!wides[j].found) {
@@ -9757,6 +10284,7 @@
   };
 
   // src/inspector/preview.ts
+  var FORM_OWN = /^(field|tab|section)$/;
   var hasEdits = (store, lcid) => {
     for (const e of store.edits.values()) if (e.has(lcid)) return true;
     return false;
@@ -9774,7 +10302,7 @@
     apply(anchors) {
       const { store, ctx } = this.app;
       const L2 = ctx.user;
-      if (!this.orig.size && !hasEdits(store, L2)) return;
+      if (!this.orig.size && !hasEdits(store, L2) && !hasEdits(store, ctx.base)) return;
       if (this.orig.size > 400) {
         for (const t of this.orig.keys()) if (!t.isConnected) this.forget(t);
       }
@@ -9782,15 +10310,18 @@
         for (const a of anchors) {
           const s = store.get(a.key);
           if (!s || !a.el.isConnected || a.part) continue;
+          const own2 = !store.isEdited(a.key, L2) && store.follows(a.key, L2, ctx.base) ? "" : store.value(a.key, L2);
           const fb = fallbackOf((k) => store.get(k), s);
           const ck = fb?.key || "";
-          const col = (l) => ck && !store.value(a.key, l).trim() ? store.value(ck, l) : "";
-          const colBase = fb?.kind === "attribute" && !store.value(a.key, L2).trim() ? store.value(ck, ctx.base) : "";
+          const col = ck && !own2.trim() ? store.value(ck, L2) : "";
+          const colBase = fb?.kind === "attribute" && !own2.trim() ? store.value(ck, ctx.base) : "";
           const shown3 = new Set(
-            [s.labels[ctx.user], ck && !s.labels[ctx.user] ? store.original(ck, ctx.user) || (fb?.kind === "attribute" ? store.original(ck, ctx.base) : "") : "", s.labels[ctx.base]].map((x) => norm(x || "")).filter(Boolean)
+            [s.labels[ctx.user], ck && !s.labels[ctx.user] ? store.original(ck, ctx.user) || (fb?.kind === "attribute" ? store.original(ck, ctx.base) : "") : "", s.labels[ctx.base], FORM_OWN.test(s.kind) ? a.orig : ""].map((x) => norm(x || "")).filter(Boolean)
           );
           const stand = L2 === ctx.base ? void 0 : store.standIn(a.key, L2, ctx.base);
-          const want = (store.value(a.key, L2) || stand?.text || col(L2) || colBase || store.value(a.key, ctx.base)).trim();
+          const byBase = !col.trim() && (fb?.kind === "attribute" && store.isEdited(ck, ctx.base) || !colBase.trim() && store.isEdited(a.key, ctx.base));
+          const edited = store.isEdited(a.key, L2) || !own2.trim() && (!!ck && store.isEdited(ck, L2) || byBase);
+          const want = edited ? [own2, stand?.text, col, colBase, store.value(a.key, ctx.base)].map((x) => (x ?? "").trim()).find(Boolean) ?? "" : "";
           const w = document.createTreeWalker(a.el, NodeFilter.SHOW_TEXT);
           for (let t; t = w.nextNode(); ) {
             const o = this.textOf(t);
@@ -9804,6 +10335,18 @@
             }
           }
         }
+      });
+    }
+    /**
+     * The form field labels among `anchors` of the column whose name is `key` (model.ts columnKey): those with no text of
+     * their own (missing, emptied, or following it) show that name as staged (apply), so they change with it as it is typed.
+     */
+    showing(key, anchors) {
+      const { store } = this.app;
+      if (store.get(key)?.kind !== "attribute") return [];
+      return anchors.filter((a) => {
+        const s = store.get(a.key);
+        return !!s && columnKey(s) === key;
       });
     }
     /** Puts every swapped text back. */
@@ -10065,6 +10608,158 @@
     } catch {
     }
     return false;
+  }
+
+  // src/inspector/selection.ts
+  var PARTS = [
+    ["label", "Form labels"],
+    ["name", "Column names"],
+    ["tip", "Tooltips"],
+    ["choice", "Choice values"],
+    ["other", "Other labels"]
+  ];
+  var Chosen = class {
+    m = /* @__PURE__ */ new Map();
+    get size() {
+      return this.m.size;
+    }
+    has(comp2) {
+      return this.m.has(comp2);
+    }
+    /** Selects the label, or unselects it (a click): true when it is selected now. */
+    toggle(a, page) {
+      if (this.m.delete(a.comp)) return false;
+      this.m.set(a.comp, { comp: a.comp, key: a.key, page });
+      return true;
+    }
+    /** Selects each label not selected yet (a box let go, Select all), never unselecting one: how many were added. */
+    add(as, page) {
+      let n = 0;
+      for (const a of as)
+        if (!this.m.has(a.comp)) {
+          this.m.set(a.comp, { comp: a.comp, key: a.key, page });
+          n++;
+        }
+      return n;
+    }
+    clear() {
+      this.m.clear();
+    }
+    list() {
+      return [...this.m.values()];
+    }
+  };
+  var partOf = (heading) => heading === "Form label" ? "label" : heading === "Column name" ? "name" : heading === "Tooltip" ? "tip" : "other";
+  function selectedTexts(app, sel, model = describe) {
+    const out = /* @__PURE__ */ new Map();
+    const add2 = (k, p) => {
+      if (!out.has(k) && app.store.get(k)) out.set(k, p);
+    };
+    for (const s of sel) {
+      let m;
+      try {
+        m = model(app, s.comp);
+      } catch (e) {
+        if (false) console.error("[translator] selection", e);
+        continue;
+      }
+      for (const b of m.blocks) add2(b.key, partOf(b.heading));
+      for (const k of m.choices?.keys ?? []) add2(k, "choice");
+      add2(s.key, "other");
+    }
+    return out;
+  }
+  var selectingText = (n) => `Click or drag over the labels you want · ${n.toLocaleString()} selected`;
+  function selectionLine(sel) {
+    const pages = new Set(sel.map((s) => s.page)).size;
+    return `${plural(sel.length, "label")} on ${plural(Math.max(1, pages), "page")}`;
+  }
+  var withEdits = (store, list2) => list2.map((s) => {
+    const e = store.edits.get(s.key);
+    return e ? { ...s, labels: { ...s.labels, ...Object.fromEntries(e) } } : s;
+  });
+  function chosenSlots(store, texts, keep2) {
+    const out = [];
+    for (const [k, p] of texts) {
+      const s = keep2.has(p) ? store.get(k) : void 0;
+      if (s) out.push(s);
+    }
+    return out;
+  }
+  function openDownload(app, sel, done) {
+    const texts = selectedTexts(app, sel);
+    if (!sel.length || !texts.size) return app.toast("Nothing to download yet. Select labels first.", "info");
+    const have = new Set(texts.values());
+    const parts = PARTS.filter(([p]) => have.has(p));
+    const langs = app.ctx.langs.map((l) => l.lcid);
+    const box = (text4) => {
+      const c = h("input", { type: "checkbox", checked: true });
+      return [c, h("label", { class: "chk" }, c, text4)];
+    };
+    void app.modal("Download selected labels", (close) => {
+      const inc = parts.map(([p, name]) => [p, ...box(name)]);
+      const lng = langs.map((l) => [l, ...box(langName(app, l))]);
+      const err = h("p", { class: "note bad", role: "alert", hidden: true });
+      const say = (t) => {
+        err.textContent = t;
+        err.hidden = !t;
+      };
+      let busy = false;
+      const go = async (k) => {
+        if (busy) return;
+        const keep2 = new Set(inc.filter(([, c]) => c.checked).map(([p]) => p));
+        const ls = lng.filter(([, c]) => c.checked).map(([l]) => l);
+        if (!keep2.size) return say("Choose at least one kind of label.");
+        if (!ls.length) return say("Choose at least one language.");
+        const slots = chosenSlots(app.store, texts, keep2);
+        const name = `Translations ${app.ctx.org} ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.${k === "csv" ? "csv" : "xlsx"}`;
+        busy = true;
+        say("");
+        try {
+          const list2 = withEdits(app.store, slots);
+          const blob = k === "csv" ? app.io.exportCsv(list2, ls) : await app.io.exportWorkbook(list2, ls, name);
+          save(app, blob, name);
+          const pending = slots.some((s) => app.store.edits.has(s.key));
+          close();
+          done();
+          app.toast(`Downloaded ${name}: ${plural(slots.length, "row")} in ${plural(ls.length, "language")}.${pending ? " Pending changes are in the file; they are not saved yet." : ""}`, "ok");
+        } catch (e) {
+          say(`The download failed: ${errMsg(e)}`);
+        } finally {
+          busy = false;
+        }
+      };
+      const fr = document.createDocumentFragment();
+      fr.append(
+        h(
+          "div",
+          { class: "dlg-body" },
+          h("p", { class: "quiet" }, selectionLine(sel)),
+          h("p", { class: "sx-h" }, "Include"),
+          h("div", { class: "sx-g" }, inc.map(([, , l]) => l)),
+          h("p", { class: "sx-h" }, "Languages"),
+          h("div", { class: "sx-g" }, lng.map(([, , l]) => l)),
+          err,
+          h("p", { class: "quiet" }, "Easy Translator compatible: edit it, then import it in the Workbench (Excel → Import workbook or CSV…).")
+        ),
+        h(
+          "div",
+          { class: "dlg-actions" },
+          h("button", { class: "btn primary", type: "button", "data-af": true, on: { click: () => void go("book") } }, "Download workbook (.xlsx)"),
+          h("button", { class: "btn", type: "button", on: { click: () => void go("csv") } }, "Download CSV (.csv)"),
+          h("button", { class: "btn", type: "button", on: { click: () => close() } }, "Cancel")
+        )
+      );
+      return fr;
+    });
+  }
+  function save(app, b, name) {
+    const u = URL.createObjectURL(b);
+    const a = h("a", { href: u, download: name, hidden: true });
+    app.layer.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 6e4);
   }
 
   // src/inspector/mode.ts
@@ -10330,7 +11025,8 @@
       open: onLabel,
       mutated,
       ours: () => [app.root.host],
-      alt: () => emit("alt")
+      alt: () => emit("alt"),
+      boxed: (as) => addSelected(as)
     };
     const overlay = new Overlay(hooks);
     const preview = new Preview(app, (fn) => overlay.quiet(fn));
@@ -10354,7 +11050,7 @@
       if (e.type === "slots") return refreshSoon();
       if (e.type === "edit") {
         const c = store.get(e.key)?.comp;
-        if (c) preview.apply(scanner.of(c));
+        if (c) preview.apply([...scanner.of(c), ...preview.showing(e.key, scanner.list)]);
       } else preview.apply(scanner.list);
       repaint();
     });
@@ -10950,21 +11646,47 @@
       if (!on || paused) return;
       const a = navigate() ? sameLabel(clicked, scanner.list) : clicked;
       if (!a) return;
+      if (selecting) return toggleSelected(a);
       const st = cur2 && !cur2.closed ? cur2 : null;
       clickLabel(a, st, {
         move: (b) => st && moveTo(st, b),
         open: (b) => present(b.comp, b, {})
       });
     }
+    const chosen = new Chosen();
+    let selecting = false;
+    const canSelect = (a) => anchorLook(a) !== "builtin";
+    function selectionLook() {
+      overlay.selection(selecting ? { has: (a) => chosen.has(a.comp), can: canSelect } : null);
+    }
+    function toggleSelected(a) {
+      if (!canSelect(a)) {
+        let why3 = "";
+        try {
+          why3 = describe(app, a.comp, a).note || "";
+        } catch (e) {
+          if (false) console.error("[translator]", e);
+        }
+        return app.toast(why3 || BUILTIN_NOTE, "info");
+      }
+      chosen.toggle(a, title());
+      overlay.invalidate(1);
+      emit("items");
+    }
+    function addSelected(as) {
+      if (!selecting || !chosen.add([...as].filter(canSelect), title())) return;
+      overlay.invalidate(1);
+      emit("items");
+    }
     const counts = () => {
       let c = null;
-      const all2 = () => c ??= countLabels(items(), store);
+      const all = () => c ??= countLabels(items(), store);
       return {
         get all() {
-          return all2().all;
+          return all().all;
         },
         get missing() {
-          return all2().missing;
+          return all().missing;
         },
         pending: store.pendingCount()
       };
@@ -10997,6 +11719,8 @@
       if (!on) return;
       cancelWait();
       closeCallout();
+      selecting = false;
+      selectionLook();
       on = false;
       clearInterval(tick);
       refreshSoon.cancel();
@@ -11044,6 +11768,22 @@
       notes,
       title,
       flash: (comp2) => overlay.flash(comp2),
+      select(v, clear = false) {
+        if (clear) chosen.clear();
+        if (v && (!on || paused)) return;
+        if (v && !selecting) {
+          cancelWait();
+          closeCallout();
+          overlay.flash("");
+        }
+        selecting = v;
+        selectionLook();
+        emit("items");
+      },
+      selecting: () => selecting,
+      selectAll: () => addSelected(scanner.list),
+      selection: () => chosen.list(),
+      download: () => openDownload(app, chosen.list(), () => mode.select(false)),
       on(fn) {
         subs.add(fn);
         return () => subs.delete(fn);
@@ -11065,11 +11805,25 @@
       }).join(",")
     ).join("\r\n") + "\r\n";
   }
-  function parseCsv(text4, guarded = true) {
+  function parseCsv(text4, guarded = true, readable) {
     if (text4.charCodeAt(0) === 65279) text4 = text4.slice(1);
-    const nl = text4.search(/[\r\n]/);
-    const head = (nl < 0 ? text4 : text4.slice(0, nl)).replace(/"[^"]*"/g, "");
-    const d = [",", ";", "	"].reduce((a, b) => head.split(b).length > head.split(a).length ? b : a);
+    const ds = [",", ";", "	"];
+    const heads = ds.map((d) => {
+      try {
+        return rowsOf(text4, d, guarded, true)[0] ?? [];
+      } catch {
+        return null;
+      }
+    });
+    const ok = readable ? ds.filter((_, i) => !!heads[i] && readable(heads[i])) : [];
+    if (ok.length > 1) {
+      const ways = ok.map((d) => `as columns split at ${d === "," ? "commas" : d === ";" ? "semicolons" : "tabs"}`);
+      throw new Error(`Which separator this CSV file uses is not clear: its header row can be read ${ways.slice(0, -1).join(", ")} and ${ways[ways.length - 1]}. Keep only the separator it uses in that row, then import again.`);
+    }
+    const ws = heads.map((h2) => h2?.length ?? 0);
+    return rowsOf(text4, ok[0] ?? ds[ws.indexOf(Math.max(...ws))], guarded, false);
+  }
+  function rowsOf(text4, d, guarded, one2) {
     const rows = [];
     let row = [];
     let f = "";
@@ -11098,6 +11852,7 @@
       else if (c === "\n" || c === "\r") {
         end();
         rows.push(row);
+        if (one2) return rows;
         row = [];
         line++;
         if (c === "\r" && text4[i + 1] === "\n") i++;
@@ -11242,10 +11997,10 @@
     end.setUint16(10, entries.length, true);
     end.setUint32(12, cdSize, true);
     end.setUint32(16, offset, true);
-    const all2 = [...parts, ...central, new Uint8Array(end.buffer)];
-    const out = new Uint8Array(all2.reduce((n, b) => n + b.length, 0));
+    const all = [...parts, ...central, new Uint8Array(end.buffer)];
+    const out = new Uint8Array(all.reduce((n, b) => n + b.length, 0));
     let o = 0;
-    for (const b of all2) {
+    for (const b of all) {
       out.set(b, o);
       o += b.length;
     }
@@ -11257,12 +12012,17 @@
     return btoa(s);
   }
   var utf8 = (s) => new TextEncoder().encode(s);
-  var fromUtf8 = (b) => new TextDecoder("utf-8").decode(b);
 
   // src/io/xlsx.ts
   var OX = "http://schemas.openxmlformats.org/";
   var MAIN = OX + "spreadsheetml/2006/main";
   var REL = OX + "officeDocument/2006/relationships";
+  var RELS = [REL, "http://purl.oclc.org/ooxml/officeDocument/relationships"];
+  var ROLES = new Map([
+    ...["officeDocument", "sharedStrings", "worksheet", "chartsheet", "dialogsheet"].flatMap((k) => RELS.map((ns) => [`${ns}/${k}`, k])),
+    ...["xlMacrosheet", "xlIntlMacrosheet"].map((k) => [`http://schemas.microsoft.com/office/2006/relationships/${k}`, k])
+  ]);
+  var role = (type) => ROLES.get(type) ?? "";
   var CT = "application/vnd.openxmlformats-officedocument.spreadsheetml.";
   var DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
   var esc = (s) => s.replace(/[^\t\n\r\x20-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu, "").replace(/_(?=x[\dA-Fa-f]{4}_)/g, "_x005F_").replace(/[&<>"\r]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "\r": "_x000D_" })[c]);
@@ -11329,17 +12089,26 @@
     const bytes = await zip(parts.map(([name, xml]) => ({ name, data: utf8(xml) })));
     return new Blob([bytes], { type: CT + "sheet" });
   }
-  var all = (n, tag) => Array.from(n.getElementsByTagNameNS("*", tag));
-  function child(el, tag) {
-    let c = el.firstElementChild;
-    while (c && c.localName !== tag) c = c.nextElementSibling;
-    return c;
+  var MAINS = [MAIN, "http://purl.oclc.org/ooxml/spreadsheetml/main"];
+  var PKG = [OX + "package/2006/relationships"];
+  var isEl = (el, tag, ns = MAINS) => !!el && el.localName === tag && ns.includes(el.namespaceURI || "");
+  function kids2(el, tag, ns = MAINS) {
+    const out = [];
+    for (let c = el.firstElementChild; c; c = c.nextElementSibling) if (isEl(c, tag, ns)) out.push(c);
+    return out;
   }
+  var child = (el, tag) => kids2(el, tag)[0] ?? null;
+  var chars = (el) => Array.from(el.childNodes, (n) => n.nodeType === 3 || n.nodeType === 4 ? n.nodeValue || "" : "").join("");
   function text(el) {
-    const t = el.firstElementChild;
-    return unesc(
-      t?.localName === "t" && !t.nextElementSibling ? t.textContent || "" : all(el, "t").filter((x) => x.parentNode.localName !== "rPh").map((x) => x.textContent || "").join("")
-    );
+    let s = "";
+    for (let c = el.firstElementChild; c; c = c.nextElementSibling) {
+      if (isEl(c, "t")) s += chars(c);
+      else if (isEl(c, "r")) {
+        const t = child(c, "t");
+        if (t) s += chars(t);
+      }
+    }
+    return unesc(s);
   }
   function normPath(p) {
     const out = [];
@@ -11360,42 +12129,72 @@
       if (parts.has(k)) throw new Error(`The workbook is damaged (it holds ${f.name} twice).`);
       parts.set(k, f.read);
     }
+    const damaged = (what) => new Error(`The workbook is damaged (${what} could not be read).`);
     const doc = async (path, what = path) => {
       const read2 = parts.get(path.toLowerCase());
       if (!read2) return null;
-      const d = new DOMParser().parseFromString(fromUtf8(await read2()), "application/xml");
-      if (d.getElementsByTagName("parsererror").length) throw new Error(`The workbook is damaged (${what} could not be read).`);
+      const b = await read2();
+      let xml;
+      try {
+        xml = new TextDecoder(b[0] === 254 && b[1] === 255 ? "utf-16be" : b[0] === 255 && b[1] === 254 ? "utf-16le" : "utf-8", { fatal: true }).decode(b);
+      } catch {
+        throw damaged(what);
+      }
+      const named5 = /^<\?xml[^?]*\sencoding\s*=\s*["']([^"']*)/.exec(xml)?.[1];
+      if (named5 && !/^utf-?(8|16)/i.test(named5) && b.some((x) => x > 127)) throw damaged(what);
+      const d = new DOMParser().parseFromString(xml, "application/xml");
+      if (d.getElementsByTagName("parsererror").length) throw damaged(what);
       return d;
     };
     const relsOf = async (path) => {
       const dir = path.slice(0, path.lastIndexOf("/") + 1);
-      const d = await doc(`${dir}_rels/${path.slice(dir.length)}.rels`);
-      return d ? all(d, "Relationship").map((r) => {
-        const t = r.getAttribute("Target") || "";
-        return [r.getAttribute("Id") || "", r.getAttribute("Type") || "", t.startsWith("/") ? t.slice(1) : normPath(dir + t)];
+      const at = `${dir}_rels/${path.slice(dir.length)}.rels`;
+      const d = (await doc(at))?.documentElement;
+      if (d && !isEl(d, "Relationships", PKG)) throw damaged(at);
+      const out2 = d ? kids2(d, "Relationship", PKG).map((r) => {
+        const t = r.getAttribute("TargetMode") === "External" ? "" : r.getAttribute("Target") || "";
+        return [r.getAttribute("Id") || "", r.getAttribute("Type") || "", t && (t.startsWith("/") ? t.slice(1) : normPath(dir + t))];
       }) : [];
+      if (new Set(out2.map((r) => r[0])).size !== out2.length) throw damaged(at);
+      return out2;
     };
-    const wbPath = (await relsOf("")).find((r) => r[1].endsWith("/officeDocument"))?.[2] || "xl/workbook.xml";
-    const wb = await doc(wbPath);
-    if (!wb) throw new Error("This file is not an Excel workbook (.xlsx).");
+    const one2 = (rels2, type, at) => {
+      const m = rels2.filter((r) => role(r[1]) === type);
+      if (m.length > 1 || m[0] && !m[0][2]) throw damaged(at);
+      return m[0]?.[2];
+    };
+    const wbPath = one2(await relsOf(""), "officeDocument", "_rels/.rels") || "xl/workbook.xml";
+    const wb = (await doc(wbPath))?.documentElement;
+    if (!isEl(wb, "workbook")) throw new Error("This file is not an Excel workbook (.xlsx).");
     const wbRels = await relsOf(wbPath);
-    const ss = wbRels.find((r) => r[1].endsWith("/sharedStrings"));
-    const ssDoc = await doc(ss ? ss[2] : "xl/sharedStrings.xml");
-    const shared = ssDoc ? all(ssDoc, "si").map(text) : [];
+    const ss = one2(wbRels, "sharedStrings", wbPath);
+    const ssPath = ss || "xl/sharedStrings.xml";
+    const sst = (await doc(ssPath))?.documentElement;
+    if (ss && !sst || sst && !isEl(sst, "sst")) throw damaged(ssPath);
+    const shared = sst ? kids2(sst, "si").map(text) : [];
+    const lists = kids2(wb, "sheets");
+    if (lists.length !== 1) throw damaged(wbPath);
     const out = [];
-    for (const s of all(wb, "sheet")) {
-      const id = Array.from(s.attributes).find((a) => a.localName === "id" && a.namespaceURI)?.value;
-      const path = wbRels.find((r) => r[0] === id)?.[2];
+    for (const s of kids2(lists[0], "sheet")) {
+      const ids3 = new Set(RELS.map((ns) => s.getAttributeNS(ns, "id")).filter(Boolean));
+      const link2 = ids3.size === 1 ? wbRels.find((r) => r[0] === [...ids3][0]) : void 0;
+      const path = link2?.[2];
       const name = s.getAttribute("name") || "";
-      const what = name ? `the ${name.length > 31 ? `${name.slice(0, 31)}…` : name} sheet` : path || "";
-      const d = path ? await doc(path, what) : null;
-      out.push({ name, ...d ? readSheet(d, shared, what) : { rows: [] } });
+      const what = name ? `the ${name.length > 31 ? `${name.slice(0, 31)}…` : name} sheet` : path || "a sheet";
+      const kind = link2 ? role(link2[1]) : "";
+      if (/^(chartsheet|dialogsheet|xl(Intl)?Macrosheet)$/.test(kind)) {
+        out.push({ name, rows: [] });
+        continue;
+      }
+      const d = kind === "worksheet" && path ? (await doc(path, what))?.documentElement : void 0;
+      if (!isEl(d, "worksheet")) throw damaged(what);
+      out.push({ name, ...readSheet(d, shared, what) });
     }
     return out;
   }
   var MAX_ROWS = 1048576;
   var MAX_COLS = 16384;
-  function readSheet(d, shared, sheet) {
+  function readSheet(ws, shared, sheet) {
     const rows = [];
     const errors = [];
     const damaged = (what) => new Error(`The workbook is damaged (${sheet} ${what}).`);
@@ -11404,7 +12203,10 @@
     const twice = (what) => damaged(`holds ${what} twice`);
     const seen = /* @__PURE__ */ new Set();
     let r = -1;
-    for (const row of all(d, "row")) {
+    const unread = (c) => new Error(`The workbook is damaged (cell ${colName(c)}${r + 1} of ${sheet} could not be read).`);
+    const data = kids2(ws, "sheetData");
+    if (data.length > 1) throw damaged("could not be read");
+    for (const row of data.length ? kids2(data[0], "row") : []) {
       const ra = row.getAttribute("r");
       if (ra && !/^\d+$/.test(ra)) throw damaged(`has a row at "${cut3(ra)}", which is not a row number`);
       r = ra ? Number(ra) - 1 : r + 1;
@@ -11415,7 +12217,7 @@
       const at = /* @__PURE__ */ new Set();
       let c = -1;
       for (let el = row.firstElementChild; el; el = el.nextElementSibling) {
-        if (el.localName !== "c") continue;
+        if (!isEl(el, "c")) continue;
         const ref = el.getAttribute("r");
         if (ref) {
           const m = /^([A-Z]+)(\d*)$/i.exec(ref);
@@ -11428,15 +12230,22 @@
         if (at.has(c)) throw twice(`cell ${colName(c)}${r + 1}`);
         at.add(c);
         const t = el.getAttribute("t");
-        const v = child(el, "v")?.textContent ?? null;
+        const vs = kids2(el, "v");
+        if (t && !/^(b|d|e|inlineStr|n|s|str)$/.test(t) || vs.length > 1 || kids2(el, "is").length > 1) throw unread(c);
+        const v = vs.length ? chars(vs[0]) : null;
         let val2 = null;
         if (t === "inlineStr") {
           const is2 = child(el, "is");
           val2 = is2 ? text(is2) : null;
         } else if (v === null) val2 = null;
-        else if (t === "s") val2 = shared[Number(v)] ?? null;
-        else if (t === "b") val2 = v.trim() === "1" ? "TRUE" : "FALSE";
-        else if (t === "str" || t === "e" || t === "d") val2 = unesc(v);
+        else if (t === "s") {
+          const i = v.trim();
+          if (!/^\d+$/.test(i) || Number(i) >= shared.length) throw unread(c);
+          val2 = shared[Number(i)];
+        } else if (t === "b") {
+          if (!/^[01]$/.test(v.trim())) throw unread(c);
+          val2 = v.trim() === "1" ? "TRUE" : "FALSE";
+        } else if (t === "str" || t === "e" || t === "d") val2 = unesc(v);
         else if (v.trim()) val2 = Number.isNaN(Number(v)) ? v : Number(v);
         if (val2 !== null) {
           cells[c] = val2;
@@ -11660,10 +12469,21 @@
   }
   function mine(grid) {
     const head = grid[0] || [];
-    const i = Array.from(head, (h2) => str(h2).trim().toLowerCase()).indexOf(CSV_KEY.toLowerCase());
-    if (i < 0) return false;
-    head[i] = "Key";
-    return true;
+    let ours3 = false;
+    Array.from(head, (h2) => str(h2).trim().toLowerCase()).forEach((h2, i) => {
+      if (h2 !== CSV_KEY.toLowerCase()) return;
+      head[i] = "Key";
+      ours3 = true;
+    });
+    return ours3;
+  }
+  function csvLayout(head) {
+    if (head.includes(CSV_KEY.toLowerCase()) || head.includes("key")) return -1;
+    let si = -2;
+    SPECS.forEach((sp, i) => {
+      if (sp.c.every((c) => c === "Display name" || head.includes(c.toLowerCase())) && (si < 0 || sp.c.length > SPECS[si].c.length)) si = i;
+    });
+    return si;
   }
   async function parse3(file) {
     const rows = [];
@@ -11688,6 +12508,10 @@
           throw new Error(`${csv ? "The file" : `Sheet "${sheet}"`} has two columns for language ${l} (${colName(j)} and ${colName(i)}). Keep one of them, then import again.`);
       }
       for (const [, l] of lc) languages.add(l);
+      for (const c of cols) {
+        const js = head.flatMap((h2, i) => h2.toLowerCase() === c.toLowerCase() ? [i] : []);
+        if (js.length > 1) throw new Error(`${csv ? "The file" : `Sheet "${sheet}"`} has two ${c} columns (${colName(js[0])} and ${colName(js[1])}). Keep one of them, then import again.`);
+      }
       const failed2 = new Set(errs.map(([r, c]) => `${r}:${c}`));
       const at = cols.map((c, i) => {
         const j = head.findIndex((h2) => h2.toLowerCase() === c.toLowerCase());
@@ -11723,20 +12547,21 @@
       }
     };
     if (csv) {
+      const bom = bytes[0] === 255 && bytes[1] === 254 ? "utf-16le" : bytes[0] === 239 && bytes[1] === 187 && bytes[2] === 191 ? "utf-8" : "";
       let text4;
       try {
-        text4 = new TextDecoder(bytes[0] === 255 && bytes[1] === 254 ? "utf-16le" : "utf-8", { fatal: true }).decode(bytes);
+        text4 = new TextDecoder(bom || "utf-8", { fatal: true }).decode(bytes);
       } catch {
+        if (bom) throw new Error("The CSV file is damaged (its text could not be read). Save or export it again, then use the new file.");
         text4 = new TextDecoder("windows-1252").decode(bytes);
       }
-      const grid = parseCsv(text4, false);
+      const grid = parseCsv(text4, false, (cells) => {
+        const h2 = cells.map((c) => c.trim().toLowerCase());
+        return csvLayout(h2) !== -2 && h2.some((c) => /^\d{4,5}$/.test(c));
+      });
       const head = (grid[0] || []).map((h2) => h2.trim().toLowerCase());
       const own2 = mine(grid);
-      let si = own2 || head.includes("key") ? -1 : -2;
-      if (si === -2)
-        SPECS.forEach((sp, i) => {
-          if (sp.c.every((c) => c === "Display name" || head.includes(c.toLowerCase())) && (si < 0 || sp.c.length > SPECS[si].c.length)) si = i;
-        });
+      const si = csvLayout(head);
       if (si === -2) throw new Error('This CSV file has no "Key" column and does not match an Easy Translator sheet, so it cannot be imported.');
       read2(si >= 0 ? SPECS[si].n : file.name, own2 ? grid.map((r) => r.map(unguard)) : grid, si, !own2 && si < 0);
     } else {
@@ -11890,7 +12715,7 @@ ${l}`;
         const guard2 = r.lit ? diff2.filter((l) => unguard(r.values[l]) === store.value(key, l)) : [];
         const put3 = diff2.filter((l) => !guard2.includes(l));
         res2.unchanged += ok.length - diff2.length;
-        const ro = slot2.readOnly || (isManaged(slot2) ? MANAGED : "");
+        const ro = slot2.readOnly || (isManaged(slot2) ? managedReadOnly(slot2, store.managedEdits) : "");
         if (ro) {
           if (put3.length) skip(key, put3, `Read-only: ${ro}`);
         } else
@@ -11917,7 +12742,7 @@ ${l}`;
           ["Base language", ctx?.base ?? null],
           ["Languages", langs.join(", ")],
           ["Exported on", (/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ") + " UTC"],
-          ["Version", "1.0.0"],
+          ["Version", "1.1.0"],
           ["Note", 'Empty cells mean "no translation" and never clear a label on import. The sheets up to "Dashboards Fields" use the XrmToolBox Easy Translator layout.']
         ];
         const blob = await writeXlsx([...layout(slots, langs), { name: INFO, rows: info }], { headerStyle: true, freezeHeader: true });
@@ -11991,7 +12816,9 @@ ${l}`;
       const title = pick(titles, ctx.user, ctx.base) || el.getAttribute("Title") || (placeholder2 ? `Unnamed ${NOUN[kind]}` : "") || entity || eid;
       for (const prop of ["Title", "Description"]) {
         const t = prop === "Title";
-        out.push({
+        const lock = dup ? "This item has no unique Id in the sitemap, so it cannot be edited safely" : sys && (t || !kid(el, "Descriptions")) ? t ? SYS : SYS_TIP : placeholder2 && !t && !kid(el, "Descriptions") ? NAME_FIRST : t && legacy ? "Uses a single-language title attribute; set the title in the app designer first, then translate it here" : t && plural2 ? "Shows the table's plural name — translate the table instead" : "";
+        const held = managed && !(sys && !dup && (t || !kid(el, "Descriptions"))) ? MANAGED : lock;
+        const s = {
           key: `${comp2}|${prop}`,
           kind,
           prop,
@@ -12002,7 +12829,7 @@ ${l}`;
           path,
           sub: eid,
           labels: t ? titles : presentLabels(labels(el, prop)),
-          readOnly: managed && !(sys && !dup && (t || !kid(el, "Descriptions"))) ? MANAGED : dup ? "This item has no unique Id in the sitemap, so it cannot be edited safely" : sys && (t || !kid(el, "Descriptions")) ? t ? SYS : SYS_TIP : placeholder2 && !t && !kid(el, "Descriptions") ? NAME_FIRST : t && legacy ? "Uses a single-language title attribute; set the title in the app designer first, then translate it here" : t && plural2 ? "Shows the table's plural name — translate the table instead" : "",
+          readOnly: held,
           baseRequired: t,
           max: 0,
           order: out.length,
@@ -12019,7 +12846,8 @@ ${l}`;
             unnamed: !named5 || void 0,
             placeholder: placeholder2 || void 0
           }
-        });
+        };
+        out.push(managed ? managedSlot(s, ctx.managedEdits, lock, held) : s);
       }
       return title;
     };
@@ -12217,7 +13045,7 @@ ${l}`;
     for (let stale = 0, waits = 0; ; ) {
       const rec2 = await read(ctx, id, o.signal);
       if (!rec2) return changes.map((c) => fail(c, GONE2));
-      if (rec2.ismanaged === true) return changes.map((c) => fail(c, MANAGED));
+      if (rec2.ismanaged === true && !ctx.managedEdits) return changes.map((c) => fail(c, MANAGED));
       const base = { xml: rec2.sitemapxml || "", doc: parseXml(rec2.sitemapxml || "", "sitemap"), etag: rec2["@odata.etag"] || "", ver: rec2.versionnumber };
       const out = [];
       let todo = [];
@@ -12295,7 +13123,7 @@ ${l}`;
     async save(ctx, changes, o) {
       const id = changes[0].slot.ref.sitemapId;
       const res2 = /* @__PURE__ */ new Map();
-      for (const c of changes) if (isManaged(c.slot)) res2.set(c, fail(c, MANAGED));
+      for (const c of changes) if (managedHeld(c.slot, ctx.managedEdits)) res2.set(c, fail(c, managedReadOnly(c.slot, ctx.managedEdits)));
       const asked = changes.filter((c) => !res2.has(c));
       if (!asked.length) return changes.map((c) => res2.get(c));
       o.progress(`Saving sitemap ${changes[0].slot.path[0] || ""}`.trim());
@@ -12318,6 +13146,349 @@ ${l}`;
     }
   };
 
+  // src/ui/refresh.ts
+  var verifyKey = (orgId) => `dxt:verify:${orgId}`;
+  var VERIFY_MAX_AGE = 36e5;
+  var KEEP_CACHES = /^(CDN_Resources|clientsdk|WebResources|sw-feature-status)/;
+  var dropKey = (k) => /^(uci-state|Form:|ActualControls\/|UCI_RESOURCE_STRINGS|Microsoft\.Crm\.BusinessProcessClientCache)/.test(k);
+  var SW_PURGE = ["PurgeUserContextGcmCacheEntry", "PurgeUserSettingsCollectionDataCacheEntry", "PurgeGcmCache", "PurgeDataCache", "PurgeMainAspxCache"];
+  var metaStore = (n) => /^(usercontext|entitymetadata|attributemetadata|applicationmetadata|metadataversionstamp|navigationdata|userpersonalization)$/i.test(n) || /^temp/i.test(n);
+  var FRESH_FLAGS = { "FCB.PersistReduxStore": false, "FCB.PersistReduxStoreV2": false };
+  var LABEL_CACHE = /^gcm_\d/;
+  var OWN_HEADER = /^(sec-|user-agent$|cookie$|host$|content-length$|connection$|origin$|referer$)/i;
+  var sameOrigin = (url, origin) => {
+    try {
+      return new URL(url).origin === origin;
+    } catch {
+      return false;
+    }
+  };
+  var sleep5 = (ms) => new Promise((r) => setTimeout(r, ms));
+  var quietly = (fn) => {
+    try {
+      return fn();
+    } catch {
+      return null;
+    }
+  };
+  function pageEnv(win = window) {
+    return {
+      caches: quietly(() => win.caches) ?? null,
+      local: quietly(() => win.localStorage),
+      session: quietly(() => win.sessionStorage),
+      port: () => {
+        const w = win.__uciStatePersistenceWorker;
+        if (w?.port) return w.port;
+        if (typeof SharedWorker === "undefined") return null;
+        return new SharedWorker("/uclient/scripts/statepersistenceworker.js", { name: "uci-state-persistence" }).port;
+      },
+      sw: async () => {
+        const c = win.navigator?.serviceWorker;
+        if (!c) return null;
+        return c.controller ?? (await c.getRegistration())?.active ?? null;
+      },
+      idb: quietly(() => win.indexedDB ? { factory: win.indexedDB, name: win.location.origin } : null),
+      labels: win.caches ? {
+        requests: async () => {
+          const out = [];
+          for (const n of (await win.caches.keys()).filter((k) => LABEL_CACHE.test(k)))
+            for (const r of await (await win.caches.open(n)).keys()) {
+              if (!sameOrigin(r.url, win.location.origin)) continue;
+              const headers = {};
+              r.headers.forEach((v, k) => void (OWN_HEADER.test(k) || (headers[k] = v)));
+              out.push({ url: r.url, headers });
+            }
+          return out;
+        },
+        fetch: (url, init) => win.fetch(url, init)
+      } : null
+    };
+  }
+  async function reprime(labels2, ms) {
+    const rep = { ok: 0, failed: 0, skipped: 0 };
+    const seen = /* @__PURE__ */ new Set();
+    const queue = (await labels2.requests()).filter((r) => !seen.has(r.url) && seen.add(r.url));
+    const end = Date.now() + ms;
+    const one2 = async (r) => {
+      try {
+        const res2 = await labels2.fetch(r.url, { headers: { ...r.headers, "x-ms-sw-skipcache": "1" }, cache: "reload", credentials: "same-origin" });
+        await res2.arrayBuffer();
+        if (res2.ok) rep.ok++;
+        else rep.failed++;
+      } catch {
+        rep.failed++;
+      }
+    };
+    const lane = async () => {
+      for (let r = queue.shift(); r; r = queue.shift()) await one2(r);
+    };
+    await Promise.race([Promise.all(Array.from({ length: 8 }, lane)), sleep5(Math.max(0, end - Date.now()))]);
+    rep.skipped = queue.length;
+    queue.length = 0;
+    return rep;
+  }
+  function clearWorker(port, ms) {
+    return new Promise((resolve) => {
+      const id = "dxt-" + Math.random().toString(36).slice(2, 10);
+      const on = (e) => {
+        const d = e?.data;
+        if (d && d.type === "clearStateResult" && d.requestId === id) done("cleared");
+      };
+      const t = setTimeout(() => done("timeout"), ms);
+      function done(v) {
+        clearTimeout(t);
+        quietly(() => port.removeEventListener("message", on));
+        resolve(v);
+      }
+      port.addEventListener("message", on);
+      port.start?.();
+      port.postMessage({ type: "clearState", requestId: id });
+    });
+  }
+  function clearDb(f, name) {
+    return new Promise((resolve, reject) => {
+      let created = false;
+      const req = f.open(name);
+      req.onupgradeneeded = () => {
+        created = true;
+        quietly(() => req.transaction?.abort());
+      };
+      req.onerror = () => created ? resolve(null) : reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const close = () => quietly(() => db.close());
+        const names3 = Array.from(db.objectStoreNames).filter(metaStore);
+        if (!names3.length) {
+          close();
+          return resolve([]);
+        }
+        try {
+          const tx = db.transaction(names3, "readwrite");
+          for (const n of names3) tx.objectStore(n).clear();
+          tx.oncomplete = () => (close(), resolve(names3));
+          tx.onerror = tx.onabort = () => (close(), reject(tx.error));
+        } catch (e) {
+          close();
+          reject(e);
+        }
+      };
+    });
+  }
+  async function purge(env, o = {}) {
+    const rep = { sw: [], caches: [], keys: [], worker: "none", stores: [], idb: "none", session: false, primed: { ok: 0, failed: 0, skipped: 0 } };
+    if (env.labels) {
+      const ms = o.prime ?? 5e3;
+      rep.primed = await Promise.race([reprime(env.labels, ms).catch(() => null), sleep5(ms + 500).then(() => null)]) ?? rep.primed;
+    }
+    const sw = async () => {
+      const w = await env.sw?.();
+      if (!w) return;
+      for (const name of SW_PURGE) if (quietly(() => (w.postMessage({ name }), true))) rep.sw.push(name);
+    };
+    const swDone = sw().catch(() => {
+    });
+    const total = o.total ?? 2500;
+    const local = env.local;
+    if (local)
+      try {
+        const all = [];
+        for (let i = 0; i < local.length; i++) {
+          const k = quietly(() => local.key(i));
+          if (k) all.push(k);
+        }
+        for (const k of all)
+          if (dropKey(k) && quietly(() => (local.removeItem(k), true))) rep.keys.push(k);
+      } catch {
+      }
+    const caches2 = async () => {
+      if (!env.caches) return;
+      const names3 = await env.caches.keys();
+      await Promise.all(
+        names3.filter((n) => !KEEP_CACHES.test(n)).map((n) => {
+          rep.caches.push(n);
+          return env.caches.delete(n).catch(() => false);
+        })
+      );
+    };
+    const worker = async () => {
+      const port = env.port?.();
+      if (!port) return;
+      rep.worker = "timeout";
+      rep.worker = await clearWorker(port, o.worker ?? 1e3);
+    };
+    const idb = async () => {
+      const d = env.idb;
+      if (!d) return;
+      rep.idb = "timeout";
+      const got = await clearDb(d.factory, d.name);
+      rep.stores = got ?? [];
+      rep.idb = got ? "cleared" : "none";
+    };
+    const step3 = (p, fail3) => p().catch(() => {
+      fail3?.();
+    });
+    await Promise.race([swDone, sleep5(Math.min(250, total / 4))]);
+    await Promise.race([
+      Promise.all([step3(caches2), step3(worker, () => rep.worker = "failed"), step3(idb, () => rep.idb = "failed"), Promise.all([swDone, sleep5(Math.min(o.sw ?? 300, total))])]),
+      sleep5(total)
+    ]);
+    if (env.session)
+      try {
+        env.session.clear();
+        rep.session = true;
+      } catch {
+      }
+    return rep;
+  }
+  function withFlags(href, flags) {
+    const u = new URL(href);
+    const names3 = new Set(Object.keys(flags).map((k) => k.toLowerCase()));
+    const dec = (s) => quietly(() => decodeURIComponent(s.replace(/\+/g, " "))) ?? s;
+    const out = [];
+    const had = [];
+    let at = -1;
+    for (const p of u.search.replace(/^\?/, "").split("&")) {
+      if (!p) continue;
+      const i = p.indexOf("=");
+      if (dec(i < 0 ? p : p.slice(0, i)).toLowerCase() !== "flags") out.push(p);
+      else {
+        if (at < 0) at = out.push("") - 1;
+        had.push(...dec(i < 0 ? "" : p.slice(i + 1)).split(","));
+      }
+    }
+    const all = [
+      ...had.map((f) => f.trim()).filter((f) => f && !names3.has(f.split("=")[0].trim().toLowerCase())),
+      ...Object.entries(flags).map(([k, b]) => `${k}=${b}`)
+    ];
+    const param = "flags=" + all.map((f) => encodeURIComponent(f).replace(/%3D/gi, "=")).join(",");
+    if (at < 0) out.push(param);
+    else out[at] = param;
+    return `${u.origin}${u.pathname}?${out.join("&")}${u.hash}`;
+  }
+  var freshUrl = (href) => quietly(() => /\/main\.aspx$/i.test(new URL(href).pathname)) ? withFlags(href, FRESH_FLAGS) : href;
+  function reloadFresh(loc = location) {
+    const to = quietly(() => freshUrl(loc.href)) ?? loc.href;
+    if (to === loc.href) loc.reload();
+    else loc.replace(to);
+  }
+  function shadowBox(tag, css) {
+    const host = document.createElement(tag);
+    const root = host.attachShadow({ mode: "open" });
+    root.append(Object.assign(document.createElement("style"), { textContent: css }));
+    document.documentElement.append(host);
+    return { host, root };
+  }
+  var STAYED = 8e3;
+  var RESTORE_WAIT = 3e3;
+  function showNote(text4) {
+    try {
+      const { host, root } = shadowBox(
+        "dxt-refresh-note",
+        'div{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:10px;padding:8px 16px;border-radius:6px;background:#242424;color:#fff;font:600 14px/20px "Segoe UI",system-ui,sans-serif;box-shadow:0 8px 16px rgba(0,0,0,.28);pointer-events:none}i{width:14px;height:14px;border-radius:50%;border:2px solid #ffffff55;border-top-color:#fff;animation:r .8s linear infinite}@keyframes r{to{transform:rotate(1turn)}}'
+      );
+      const span = Object.assign(document.createElement("span"), { textContent: text4 });
+      const box = document.createElement("div");
+      box.setAttribute("role", "status");
+      box.append(document.createElement("i"), span);
+      root.append(box);
+      return { set: (t) => void (span.textContent = t), remove: () => host.remove() };
+    } catch {
+      return { set() {
+      }, remove() {
+      } };
+    }
+  }
+  async function refreshNow(o = {}) {
+    let rep = null;
+    try {
+      rep = await purge(o.env ?? pageEnv(), o.purge);
+    } catch {
+    }
+    (o.reload ?? (() => reloadFresh()))();
+    return rep;
+  }
+  async function refreshPage(o) {
+    if (o.pending > 0) {
+      const n = o.pending;
+      const go = await o.confirm({
+        title: "Refresh the page?",
+        body: `You have ${plural(n, "unpublished change")}. Refreshing the page discards ${n === 1 ? "it" : "them"}.`,
+        ok: "Refresh anyway",
+        cancel: "Not now",
+        danger: true
+      });
+      if (!go) return false;
+    }
+    const dirty = recordDirty(o.xrm);
+    if (dirty !== false) {
+      const body = dirty ? "This record has unsaved changes. Refresh anyway and lose them?" : "This record may have unsaved changes. Refresh anyway and lose them?";
+      const go = await o.confirm({ title: "Refresh the page?", body, ok: "Refresh anyway", cancel: "Not now", danger: true });
+      if (!go) {
+        o.toast("Refresh the page later to see your changes.", "info");
+        return false;
+      }
+    }
+    if (o.prepare)
+      try {
+        await o.prepare();
+      } catch (e) {
+        o.toast(e?.message || String(e), "error");
+        return false;
+      }
+    if (!o.teardown()) {
+      o.toast("Saving is in progress. Refresh the page once it has finished.", "warn");
+      return false;
+    }
+    const note2 = (o.note ?? showNote)("Refreshing the page…");
+    let back = false;
+    const restored = o.restore().catch(() => {
+    }).finally(() => back = true);
+    for (; ; ) {
+      await Promise.race([restored, sleep5(o.restoreWait ?? RESTORE_WAIT)]);
+      if (back || !o.switching()) break;
+    }
+    const storage = o.storage === void 0 ? quietly(() => localStorage) : o.storage;
+    try {
+      if (o.items.length) storage?.setItem(verifyKey(o.orgId), JSON.stringify({ at: (o.now ?? Date.now)(), items: o.items }));
+      else storage?.removeItem(verifyKey(o.orgId));
+    } catch {
+    }
+    try {
+      const rep = await refreshNow({ env: o.env, reload: o.reload });
+      if (false) console.log("[translator] refresh", rep);
+    } catch (e) {
+      note2.remove();
+      throw e;
+    }
+    setTimeout(() => note2.remove(), o.stayed ?? STAYED);
+    return true;
+  }
+  async function switchLanguage(o) {
+    const why3 = o.busy();
+    if (why3) {
+      o.toast(why3, "warn");
+      return false;
+    }
+    return refreshPage({
+      ...o,
+      prepare: async () => {
+        o.toast(`Switching Dynamics to ${o.name}…`, "info");
+        await o.adopt();
+      }
+    });
+  }
+  function readVerify(raw, now) {
+    if (!raw) return null;
+    try {
+      const e = JSON.parse(raw);
+      if (!e || !Array.isArray(e.items) || !(now - Number(e.at) < VERIFY_MAX_AGE) || Number(e.at) > now + 6e4) return null;
+      return { at: Number(e.at), items: e.items.filter((i) => i && typeof i.key === "string" && typeof i.text === "string" && Number.isFinite(i.lcid)) };
+    } catch {
+      return null;
+    }
+  }
+  var notShowing = (missing2) => missing2 > 0 ? `${plural(missing2, "change")} ${missing2 === 1 ? "isn't" : "aren't"} showing yet` : "";
+
   // src/providers/formxml.ts
   var TYPES = {
     0: "Dashboard",
@@ -12338,6 +13509,18 @@ ${l}`;
     return e.getAttribute("name") || (id ? `{${id}}` : void 0);
   };
   var chunks = (a, n) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, i * n + n));
+  var SPARSE = /* @__PURE__ */ new Map([[2, /* @__PURE__ */ new Set(["body", "header"])]]);
+  var zoneOf = (it) => it.zone?.startsWith("Tab ") ? "tab" : it.area;
+  function sparseCell(it, type) {
+    if (it.kind !== "field" || !SPARSE.get(type)?.has(zoneOf(it))) return false;
+    const ctl = kid(it.el, "control");
+    return !!ctl && columnCell({ datafield: ctl.getAttribute("datafieldname"), controlId: ctl.getAttribute("id") });
+  }
+  var formName = (s0) => String(s0.path[1] || "").replace(/ \([^()]*\)$/, "");
+  var datafield = (it) => (kid(it.el, "control")?.getAttribute("datafieldname") || "").toLowerCase();
+  var keyOf = (it) => normId(it.el.getAttribute("labelid")) || it.id;
+  var MARK = "​";
+  var unmarked = (t) => t.endsWith(MARK) ? t.slice(0, -MARK.length) : t;
   var LAB = ["labels", "label", "languagecode", "description"];
   var NAV = ["Titles", "Title", "LCID", "Text"];
   var shape = (it) => it.kind === "navitem" ? NAV : LAB;
@@ -12461,7 +13644,7 @@ ${l}`;
   }
   var QUICK_MAX = 10;
   var pubParts = (ids3) => ids3.map((id) => ({ method: "GET", url: `systemforms(${id})?$select=formid,formxml,versionnumber` }));
-  async function quickOther(lang, L2, ids3, rows, signal) {
+  async function quickOther(lang, L2, ids3, rows, pubVersion, signal) {
     const out = /* @__PURE__ */ new Map();
     const want = ids3.filter((id) => rows.get(id)?.versionnumber != null && !rows.get(id)._pub);
     if (!want.length || want.length > QUICK_MAX) return out;
@@ -12470,6 +13653,7 @@ ${l}`;
       if (b.inLang)
         want.forEach((id, i) => {
           const r = b.results[i];
+          if (r?.ok && r.data?.versionnumber != null) pubVersion.set(id, String(r.data.versionnumber));
           if (r?.ok && r.data?.formxml && String(r.data.versionnumber) === String(rows.get(id).versionnumber)) out.set(id, r.data);
         });
     } catch (e) {
@@ -12477,7 +13661,7 @@ ${l}`;
     }
     return out;
   }
-  async function readOther(lang, L2, ids3, rows, signal) {
+  async function readOther(lang, L2, ids3, rows, pubVersion, signal) {
     const out = { rows: /* @__PURE__ */ new Map(), bad: /* @__PURE__ */ new Map() };
     const pub = ids3.filter((id) => rows.get(id)?._pub);
     for (const part2 of chunks(pub, 10)) {
@@ -12490,7 +13674,7 @@ ${l}`;
       });
     }
     const rest2 = ids3.filter((id) => !rows.get(id)?._pub);
-    const quick = await quickOther(lang, L2, rest2, rows, signal);
+    const quick = await quickOther(lang, L2, rest2, rows, pubVersion, signal);
     for (const [k, v] of quick) out.rows.set(k, v);
     const exact = rest2.filter((id) => !quick.has(id));
     if (exact.length) putRead(out, await readForms(lang, L2, exact, "formid,formxml", signal, false));
@@ -12568,7 +13752,9 @@ ${l}`;
       if (r._pub) pub.add(f.formId);
       const table = f.entity === "none" ? "Dashboards" : tables.get(f.entity) || f.entity;
       const form2 = `${f.name} (${TYPES[f.type] || "Form"})`;
-      const readOnly = r.ismanaged === true ? MANAGED : r.iscustomizable?.Value === false ? `This ${isDash(f.type) ? "dashboard" : "form"} is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.` : r._pub ? NO_UNPUB : "";
+      const managed = r.ismanaged === true;
+      const lock = r.iscustomizable?.Value === false ? `This ${isDash(f.type) ? "dashboard" : "form"} is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.` : r._pub ? NO_UNPUB : "";
+      const readOnly = managed && !ctx.managedEdits ? MANAGED : lock;
       for (const [comp2, it] of idx) {
         const lab = presentLabels(labelsOf2(it));
         const ctl = it.el.tagName === "cell" ? kid(it.el, "control") : void 0;
@@ -12576,6 +13762,7 @@ ${l}`;
         const df = ctl?.getAttribute("datafieldname") || "";
         const per = perLanguage({ kind: it.kind, ref: { datafield: df, classid: ctl?.getAttribute("classid") } }) || !!r._pub;
         const name = it.el.getAttribute(it.area === "nav" ? "Id" : "name") || "";
+        const sparse = (!managed || !!ctx.managedEdits) && !r._pub && sparseCell(it, f.type);
         const s = {
           key: comp2 + "|Label",
           kind: it.kind,
@@ -12611,7 +13798,18 @@ ${l}`;
             // A related menu item's relationship (its schema name, or `hardcoded_{…}nav<Name>` for a built-in item): in a
             // language without a title of its own the item shows that relationship's text (LIVE-FINDINGS 80).
             relationship: it.area === "nav" && it.el.getAttribute("RelationshipName")?.trim() || void 0,
-            managed: r.ismanaged === true
+            managed,
+            // A managed form's: its reason as an unmanaged one's, and MANAGED (core/model.ts managedSlot).
+            ...managed ? { lock, held: MANAGED } : {},
+            // A main form's column cell (SPARSE): a save posts it only with what it changes (LIVE-FINDINGS 104), and which of
+            // its labels are the form's own can be known (core/model.ts follows, 114).
+            sparse: sparse || void 0,
+            // The cell's label key when it has one of its own (`labelid`): its labels are stored under it, and
+            // ExportTranslation and GetClientMetadata name them by it (LIVE-FINDINGS 106).
+            labelKey: normId(it.el.getAttribute("labelid")) || void 0,
+            // Such a cell's form version: which of its labels are its own is kept by it (loadOwnLabels). The version read
+            // here; none where a read in another language finds the published one isn't it (below).
+            formVersion: sparse && r.versionnumber != null && String(r.versionnumber) || void 0
           }
         };
         slots.push(s);
@@ -12647,7 +13845,8 @@ ${l}`;
         if (!take(L2, f, r)) miss(L2, f, r ? UNREADABLE : e ? msgOf(e) : NOT_RETURNED);
       }
     };
-    const reader2 = (L2) => (list2) => readOther(lang, L2, list2, rows, signal);
+    const pubVersion = /* @__PURE__ */ new Map();
+    const reader2 = (L2) => (list2) => readOther(lang, L2, list2, rows, pubVersion, signal);
     if (need.length) {
       for (const [i, L2] of others.entries()) {
         if (signal.aborted) throw abortError();
@@ -12667,13 +13866,14 @@ ${l}`;
         takeAll(L2, left, await again2(left.map((f) => f.formId), reader2(L2)));
       }
     }
-    const all2 = ctx.langs.map((l) => l.lcid);
+    for (const s of slots) if (s.ref.formVersion && pubVersion.has(s.ref.formId) && pubVersion.get(s.ref.formId) !== s.ref.formVersion) delete s.ref.formVersion;
+    const all = ctx.langs.map((l) => l.lcid);
     for (const s of slots) {
       const f = s.ref.formId;
       const per = perLanguage(s);
       if (!per && !pub.has(f)) continue;
       const got = per ? readIn.get(f) : /* @__PURE__ */ new Set([ctx.user]);
-      if (all2.every((l) => got.has(l))) continue;
+      if (all.every((l) => got.has(l))) continue;
       s.ref.partial = true;
       for (const l of got) if (!(l in s.labels)) s.labels[l] = "";
       if (!per) {
@@ -12681,7 +13881,7 @@ ${l}`;
         continue;
       }
       const why3 = failed2.get(f);
-      const un = all2.filter((l) => !got.has(l) && why3?.has(l));
+      const un = all.filter((l) => !got.has(l) && why3?.has(l));
       if (un.length) s.ref.unread = Object.fromEntries(un.map((l) => [l, why3.get(l)]));
     }
     if (lost.length) {
@@ -12689,6 +13889,218 @@ ${l}`;
       o.progress(`Loaded with problems. The labels of ${lost.length === 1 ? `the form “${f0.name || f0.formId}”` : `${lost.length} forms`} could not be read: ${w0}`);
     }
     return slots;
+  }
+  var OWN_NAMES = '{"Exclude":["entity","ribbon","webresource"]}';
+  var ownPart = (formId2, entity) => {
+    const q2 = { MetadataType: "form", MetadataSubtype: "Main", EntityLogicalName: entity, MetadataId: formId2, MetadataNames: [OWN_NAMES], GetDefault: false, DependencyDepth: "OnDemandWithoutContext" };
+    return { method: "GET", url: `GetClientMetadata(ClientMetadataQuery=@q)?@q=${encodeURIComponent(JSON.stringify(q2))}` };
+  };
+  function metadataOf(data) {
+    const m = data?.Metadata;
+    if (typeof m !== "string") return m && typeof m === "object" ? m : null;
+    try {
+      return JSON.parse(m);
+    } catch {
+      return null;
+    }
+  }
+  var ownEntry = (e) => String(e?.LabelColumnName).toLowerCase() === "displayname";
+  function ownKeys(md, formId2) {
+    const f = Array.isArray(md?.Forms) ? md.Forms.find((x) => guid(x?.FormId) === formId2) : null;
+    if (f?.VersionNumber == null || !Array.isArray(md.Labels)) return null;
+    return { v: String(f.VersionNumber), k: md.Labels.filter(ownEntry).map((e) => guid(e.Id)) };
+  }
+  var OWN_KEY = (ctx, formId2, l) => `dxt:own:${ctx.orgId}:${formId2}:${l}`;
+  var OWN_FORMS = 100;
+  function pruneOwn(ctx, formId2, keep2) {
+    const pre2 = `dxt:own:${ctx.orgId}:`;
+    const forms = /* @__PURE__ */ new Map();
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith(pre2)) continue;
+      const f = k.slice(pre2.length, k.lastIndexOf(":"));
+      if (f !== formId2) (forms.get(f) ?? forms.set(f, []).get(f)).push(k);
+    }
+    if (forms.size <= keep2) return forms.size;
+    const at = (ks) => Math.max(...ks.map((k) => Number(/^\{"t":(\d+)/.exec(localStorage.getItem(k) ?? "")?.[1] ?? 0)));
+    const old = [...forms.values()].map((ks) => [at(ks), ks]).sort((a, b) => a[0] - b[0]);
+    for (const [, ks] of old.slice(0, forms.size - keep2)) for (const k of ks) localStorage.removeItem(k);
+    return keep2;
+  }
+  function storedOwn(ctx, formId2, l) {
+    try {
+      const e = JSON.parse(localStorage.getItem(OWN_KEY(ctx, formId2, l)) || "null");
+      return typeof e?.v === "string" && Array.isArray(e.k) && e.k.every((x) => typeof x === "string") ? e : null;
+    } catch {
+      return null;
+    }
+  }
+  function storeOwn(ctx, formId2, l, own2) {
+    try {
+      const e = JSON.stringify({ t: Date.now(), v: own2.v, k: own2.k });
+      let keep2 = pruneOwn(ctx, formId2, OWN_FORMS - 1);
+      for (; ; )
+        try {
+          return localStorage.setItem(OWN_KEY(ctx, formId2, l), e);
+        } catch (x) {
+          if (!keep2) throw x;
+          keep2 = pruneOwn(ctx, formId2, keep2 - 1);
+        }
+    } catch {
+    }
+  }
+  var COPY_WAIT = 3e3;
+  function copyLanguage(md) {
+    const ids3 = /* @__PURE__ */ new Set();
+    for (const m of JSON.stringify(md?.CustomControls ?? null).matchAll(/\.(\d{4,5})\.resx"/g)) ids3.add(Number(m[1]));
+    return ids3.size === 1 ? [...ids3][0] : null;
+  }
+  async function copyOf(c, r, formId2, entity) {
+    const q2 = JSON.parse(new URL(r.url).searchParams.get("@ClientMetadataQuery") || "null");
+    if (q2?.MetadataType !== "form" || entity && q2.EntityLogicalName && q2.EntityLogicalName !== entity) return null;
+    if ((Array.isArray(q2.MetadataNames) ? q2.MetadataNames : []).some((x) => String(x).includes('"KeepOnly"'))) return null;
+    const res2 = await c.match(r);
+    if (!res2?.ok) return null;
+    const md = metadataOf(await res2.json());
+    const own2 = ownKeys(md, formId2);
+    const l = own2 && copyLanguage(md);
+    if (!own2 || !l) return null;
+    const t = {};
+    for (const e of md.Labels) if (ownEntry(e)) t[guid(e.Id)] = String(e.Value ?? "");
+    return { form: formId2, l, ...own2, t };
+  }
+  async function pageOwnLabels(ctx, formId2, entity = "") {
+    const langs = new Set(ctx.langs.map((l) => l.lcid));
+    const found = /* @__PURE__ */ new Map();
+    const over = new AbortController();
+    const done = () => over.signal.aborted || found.size === langs.size;
+    const search = async () => {
+      const names3 = (await caches.keys()).filter((n) => LABEL_CACHE.test(n)).sort((a, b) => parseInt(b.slice(4), 10) - parseInt(a.slice(4), 10));
+      for (const n of names3) {
+        if (done()) return;
+        const c = await caches.open(n);
+        for (const r of await c.keys()) {
+          if (done()) return;
+          const copy = await copyOf(c, r, formId2, entity).catch(() => null);
+          if (copy && langs.has(copy.l) && !found.has(copy.l)) found.set(copy.l, copy);
+        }
+      }
+    };
+    await Promise.race([search().catch(() => {
+    }), pause(COPY_WAIT, over.signal).catch(() => {
+    })]);
+    over.abort();
+    return [...found.values()];
+  }
+  function ownForms(cells) {
+    const forms = /* @__PURE__ */ new Map();
+    for (const s of cells) if (s.ref?.sparse && s.ref.formVersion) (forms.get(s.ref.formId) ?? forms.set(s.ref.formId, []).get(s.ref.formId)).push(s);
+    return forms;
+  }
+  function ownKept(ctx, forms) {
+    const got = /* @__PURE__ */ new Map();
+    for (const [formId2, ss] of forms) {
+      const g = /* @__PURE__ */ new Map();
+      for (const { lcid } of ctx.langs) {
+        const e = storedOwn(ctx, formId2, lcid);
+        if (e && e.v === ss[0].ref.formVersion) g.set(lcid, e);
+      }
+      got.set(formId2, g);
+    }
+    return got;
+  }
+  function ownAnswer(forms, got) {
+    const out = /* @__PURE__ */ new Map();
+    for (const [formId2, ss] of forms) {
+      const g = got.get(formId2);
+      if (g.size) for (const s of ss) out.set(s.key, Object.fromEntries([...g].map(([l, o]) => [l, o.k.includes(s.ref.labelKey || s.ref.elId)])));
+    }
+    return out;
+  }
+  function knownOwnLabels(ctx, cells, copies = [], fills) {
+    const forms = ownForms(cells);
+    const got = ownKept(ctx, forms);
+    for (const c of copies) {
+      const ss = forms.get(c.form);
+      if (!ss || c.v !== ss[0].ref.formVersion) continue;
+      const agrees = (s) => {
+        const t = c.t[s.ref.labelKey || s.ref.elId];
+        return t === void 0 ? !!fills?.(s, c.l) : t === s.labels[c.l];
+      };
+      if (!ss.every(agrees)) continue;
+      const own2 = { v: c.v, k: c.k };
+      storeOwn(ctx, c.form, c.l, own2);
+      got.get(c.form).set(c.l, own2);
+    }
+    return ownAnswer(forms, got);
+  }
+  async function loadOwnLabels(ctx, cells, signal, known2, undecided) {
+    const lang = LangSession.of(ctx) ?? new LangSession(ctx);
+    const forms = ownForms(cells);
+    const got = ownKept(ctx, forms);
+    const needs = (formId2, ss, l) => !got.get(formId2).has(l) && (!undecided || ss.some((s) => undecided(s, l)));
+    const take = (formId2, l, r) => {
+      const own2 = r?.ok ? ownKeys(metadataOf(r.data), formId2) : null;
+      if (!own2 || own2.v !== forms.get(formId2)[0].ref.formVersion) return;
+      storeOwn(ctx, formId2, l, own2);
+      got.get(formId2).set(l, own2);
+    };
+    for (const [formId2, ss] of forms) {
+      if (!needs(formId2, ss, ctx.user)) continue;
+      try {
+        const b = await lang.hold((h2) => h2.batch(ctx.user, [ownPart(formId2, ss[0].entity)], signal), signal);
+        if (b.inLang) take(formId2, ctx.user, b.results[0]);
+      } catch (e) {
+        if (isAbort(e)) throw e;
+      }
+    }
+    const never2 = new AbortController().signal;
+    for (const L2 of ctx.langs.map((l) => l.lcid).filter((l) => l !== ctx.user)) {
+      const need = [...forms].filter(([formId2, ss]) => needs(formId2, ss, L2));
+      if (!need.length) continue;
+      known2?.(ownAnswer(forms, got));
+      try {
+        const b = await lang.hold(
+          (h2) => h2.window(async () => {
+            if (signal.aborted) throw abortError();
+            return h2.batch(L2, need.map(([formId2, ss]) => ownPart(formId2, ss[0].entity)), never2);
+          }),
+          signal
+        );
+        if (b.inLang) need.forEach(([formId2], i) => take(formId2, L2, b.results[i]));
+      } catch (e) {
+        if (isAbort(e)) throw e;
+      }
+    }
+    return ownAnswer(forms, got);
+  }
+  function carryOwnLabels(ctx, formId2, from, to, cells) {
+    const kept2 = /* @__PURE__ */ new Map();
+    for (const { lcid } of ctx.langs) {
+      const e = storedOwn(ctx, formId2, lcid);
+      if (e?.v === from) kept2.set(lcid, e);
+    }
+    const held = (k) => [...kept2.values()].some((e) => e.k.includes(k)) ? true : kept2.size === ctx.langs.length ? false : null;
+    for (const [l, e] of kept2) {
+      const now = cells.map((c) => c.own[l] === "name" ? held(c.key) : c.own[l]);
+      if (now.includes(null)) continue;
+      const k = new Set(e.k);
+      cells.forEach((c, i) => {
+        if (now[i] === true) k.add(c.key);
+        else if (now[i] === false) k.delete(c.key);
+      });
+      storeOwn(ctx, formId2, l, { v: to, k: [...k] });
+    }
+  }
+  function cellLabels(xml) {
+    if (typeof xml !== "string") return null;
+    try {
+      const out = /* @__PURE__ */ new Map();
+      for (const it of collect(parseXml(xml, "form definition"), false)) if (it.kind === "field" && !out.has(it.id)) out.set(it.id, labelsOf2(it));
+      return out;
+    } catch {
+      return null;
+    }
   }
   function formNote(slots) {
     const forms = /* @__PURE__ */ new Map();
@@ -12707,14 +14119,14 @@ ${l}`;
     }
     return forms.size ? { forms: [...forms.values()], langs: [...langs], why: [...why3] } : null;
   }
-  function mergeReads(fresh2, had, all2) {
+  function mergeReads(fresh2, had, all) {
     return fresh2.map((s) => {
       const o = had(s.key);
       if (s.ref?.partial !== true || !o) return s;
       const labels2 = { ...s.labels };
-      for (const l of o.ref?.partial === true ? Object.keys(o.labels).map(Number) : all2) if (!(l in labels2)) labels2[l] = o.labels[l] ?? "";
+      for (const l of o.ref?.partial === true ? Object.keys(o.labels).map(Number) : all) if (!(l in labels2)) labels2[l] = o.labels[l] ?? "";
       const ref = { ...s.ref };
-      if (all2.every((l) => l in labels2)) {
+      if (all.every((l) => l in labels2)) {
         for (const k of Object.keys(labels2)) if (labels2[Number(k)] === "") delete labels2[Number(k)];
         delete ref.partial;
         delete ref.unread;
@@ -12740,7 +14152,7 @@ ${l}`;
       Promise.all(filters.map((f) => ctx.http.all(`${UNPUB2}formid,name,type,objecttypecode,iscustomizable,ismanaged&$filter=${f}`, { signal }))),
       dash && scope.solutionId ? ctx.http.all(`solutioncomponents?$select=objectid&$filter=_solutionid_value eq ${guid(scope.solutionId)} and componenttype eq 60`, { signal }).then((a) => new Set(a.map((r) => guid(r.objectid)))) : null
     ]);
-    const forms = rows.flat().filter((r) => (scope.includeReadOnly || r.ismanaged !== true && r.iscustomizable?.Value !== false) && !(inSolution && isDash(r.type) && !inSolution.has(guid(r.formid)))).map((r) => ({ formId: guid(r.formid), entity: r.objecttypecode || "none", name: r.name || "", type: Number(r.type) })).sort((a, b) => a.entity.localeCompare(b.entity) || a.type - b.type || a.name.localeCompare(b.name));
+    const forms = rows.flat().filter((r) => (scope.includeReadOnly || (r.ismanaged !== true || !!ctx.managedEdits) && r.iscustomizable?.Value !== false) && !(inSolution && isDash(r.type) && !inSolution.has(guid(r.formid)))).map((r) => ({ formId: guid(r.formid), entity: r.objecttypecode || "none", name: r.name || "", type: Number(r.type) })).sort((a, b) => a.entity.localeCompare(b.entity) || a.type - b.type || a.name.localeCompare(b.name));
     const out = [];
     for (const d of [false, true]) {
       const part2 = forms.filter((f) => isDash(f.type) === d);
@@ -12751,6 +14163,23 @@ ${l}`;
   var res = (change2, outcome, message) => ({ change: change2, outcome, message });
   var errText = (e) => e instanceof DvError && e.status === 403 ? "You do not have permission to change this form. Translating needs the System Customizer or System Administrator role." : e instanceof Error && e.message || "Something went wrong while saving the form labels.";
   var clears2 = (ctx, c) => c.lcid !== ctx.base && !c.after.trim();
+  function freed(c, it, server, force, names3, form2) {
+    if (!form2 || form2.pending || !c.slot.ref.formVersion || form2.version !== c.slot.ref.formVersion) return res(c, "error", CHANGED);
+    const plain = (l, t) => !t.trim() || !!names3(l)?.includes(t);
+    if (keyOf(it) !== (c.slot.ref.labelKey || c.slot.ref.elId)) {
+      if (plain(c.lcid, server ?? "")) return res(c, "unchanged");
+      if (!force.has(changeId(c))) return { change: c, outcome: "conflict", server: server ?? "", message: CHANGED };
+    } else {
+      const got = labelsOf2(it);
+      for (const k of /* @__PURE__ */ new Set([...Object.keys(got), ...Object.keys(c.slot.labels)])) {
+        const l = Number(k);
+        const [t, v] = [got[l] ?? "", c.slot.labels[l] ?? ""];
+        if (l !== c.lcid && t !== v && !(plain(l, t) && plain(l, v))) return res(c, "error", CHANGED);
+      }
+    }
+    const r = check({ ...c, after: "" }, blank(server), force);
+    return r && r.outcome === "conflict" ? { ...r, change: c } : null;
+  }
   function compare3(c, server, remove, force) {
     const r = check({ ...c, before: blank(c.before), after: remove ? "" : blank(c.after) }, blank(server), force);
     if (r?.outcome === "unchanged" && (remove ? server !== void 0 : (server ?? "") !== c.after)) return null;
@@ -12758,6 +14187,8 @@ ${l}`;
   }
   var UNCHECKED = "Sent to Dataverse, but the result could not be checked. Reload to confirm it.";
   var GONE3 = "This label is no longer on the form. Reload to see the current form.";
+  var UNSAFE2 = "Safety check failed: the change would have modified more than the translated labels, so nothing was saved.";
+  var RACE = raceText("form", true);
   var Unrun = class extends Error {
     constructor(results) {
       super("turned away");
@@ -12769,8 +14200,21 @@ ${l}`;
   var writeParts = (formId2, xml, etag) => [
     unpubOne(formId2, "formxml,versionnumber"),
     { method: "PATCH", url: `systemforms(${formId2})`, headers: { "If-Match": etag }, body: { formxml: xml } },
-    unpubOne(formId2, "formxml")
+    unpubOne(formId2, "formxml,versionnumber")
   ];
+  var NEWEST = /* @__PURE__ */ new WeakMap();
+  var LAG_MS = 6e4;
+  var LAG_WAITS = [1e3, 2e3, 4e3];
+  function saw(ctx, formId2, ver) {
+    if (ver == null || ver === "") return;
+    const m = NEWEST.get(ctx) ?? NEWEST.set(ctx, /* @__PURE__ */ new Map()).get(ctx);
+    const had = m.get(formId2);
+    if (!had || Date.now() - had.at >= LAG_MS || olderVersion(had.ver, ver)) m.set(formId2, { ver, at: Date.now() });
+  }
+  function lagging(ctx, formId2, ver) {
+    const had = NEWEST.get(ctx)?.get(formId2);
+    return !!had && Date.now() - had.at < LAG_MS && olderVersion(ver, had.ver);
+  }
   function formOf2(b, r, etag) {
     if (!b.inLang || !r.ok || typeof r.data?.formxml !== "string") return null;
     try {
@@ -12778,6 +14222,14 @@ ${l}`;
     } catch {
       return null;
     }
+  }
+  async function readForm(ctx, h2, L2, formId2) {
+    const b = await h2.batch(L2, readParts(formId2), new AbortController().signal);
+    if (!b.inLang) throw notSaved(L2);
+    const d = formOf2(b, b.results[0], etagOf(b.results[1]));
+    if (!d) throw b.results[0].ok ? new Error("This form no longer exists.") : partError(b.results[0]);
+    saw(ctx, formId2, d.ver);
+    return d;
   }
   function pairs(idx, todo) {
     const own2 = /* @__PURE__ */ new Map();
@@ -12789,77 +14241,237 @@ ${l}`;
     const mine3 = (el) => (el.tagName === "label" || el.tagName === "Title") && !!own2.get(el.parentElement?.parentElement)?.has(lcid(el));
     return (el) => mine3(el) || (el.tagName === "labels" || el.tagName === "Titles") && !el.attributes.length && own2.has(el.parentElement) && Array.from(el.children).every(mine3);
   }
-  function formOps(ctx, h2, L2, formId2, dash) {
+  function assertSent(before, after, type, dash, pairs2, expect, may) {
+    const cells = (d) => new Set(collect(d, dash).filter((it) => sparseCell(it, type)).map((it) => it.el));
+    const was = cells(before);
+    const now = cells(after);
+    const unsafe = (why3, el) => {
+      console.warn("[translator] safety check:", why3, el.getAttribute("id"), readLabels(el, ...LAB));
+      throw new Error(UNSAFE2);
+    };
+    const cellLabels2 = (el) => el.tagName === "labels" && (was.has(el.parentElement) || now.has(el.parentElement));
+    assertOnlyChanged(before, after, (el) => cellLabels2(el) || pairs2(el));
+    for (const el of now) if (!expect.has(el)) unsafe("a column cell nothing was planned for", el);
+    for (const [el, w] of expect) {
+      const [box, ...more2] = kids(el, "labels");
+      const got = readLabels(el, ...LAB);
+      const n = box ? kids(box, "label").length : 0;
+      if (more2.length || !box !== !w || JSON.stringify(got) !== JSON.stringify(w ?? {}) || n !== Object.keys(got).length) unsafe("a column cell carries other labels than planned", el);
+    }
+    for (const el of now) {
+      const box = kid(el, "labels");
+      for (const x of box ? kids(box, "label") : [])
+        if (!may(el, Number(x.getAttribute("languagecode")), x.getAttribute("description") ?? "")) unsafe("a column cell carries a text this write was not given", el);
+    }
+  }
+  function postable(base, read2, formId2, todo, theirs, names3) {
+    const at = index2(base, formId2, false);
+    const had = index2(read2, formId2, false);
+    const edits3 = new Map(todo.map((c) => [`${c.slot.comp}#${c.lcid}`, c.after]));
+    const clash = new Set(theirs.map((c) => `${c.slot.comp}#${c.lcid}`));
+    return (el, l, t) => {
+      const comp2 = `field|${formId2}|${normId(el.getAttribute("id"))}`;
+      if (edits3.get(`${comp2}#${l}`) === t) return true;
+      const b = at.get(comp2);
+      const bt = b && labelsOf2(b)[l];
+      if (bt === void 0 || bt !== t || names3(datafield(b))?.[l]?.includes(t)) return false;
+      return clash.has(`${comp2}#${l}`) || !had.has(comp2);
+    };
+  }
+  function formOps(ctx, h2, L2, formId2, dash, pass2) {
     const indexes = /* @__PURE__ */ new WeakMap();
     const idx = (d) => indexes.get(d) ?? indexes.set(d, index2(d.doc, formId2, dash)).get(d);
     const labelIn = (d, c) => {
       const it = idx(d).get(c.slot.comp);
       return it && labelsOf2(it);
     };
-    const never2 = new AbortController().signal;
+    const sparse = SPARSE.has(pass2.type) && !dash;
+    const own2 = (it) => sparse && sparseCell(it, pass2.type);
+    const posted = /* @__PURE__ */ new Map();
+    const owns = /* @__PURE__ */ new Map();
+    const moved2 = /* @__PURE__ */ new Map();
+    const skips = /* @__PURE__ */ new WeakMap();
+    const unsent = (d) => {
+      if (!sparse) return () => false;
+      const had = skips.get(d);
+      if (had) return had;
+      const cells = new Set(collect(d.doc, dash).filter(own2).map((it) => it.el));
+      const sent2 = /* @__PURE__ */ new Map();
+      for (const c of pass2.todo) {
+        const el = idx(d).get(c.slot.comp)?.el;
+        if (el && cells.has(el)) sent2.set(el, /* @__PURE__ */ new Set([...sent2.get(el) ?? [], c.lcid]));
+      }
+      const skip = (el) => {
+        const up2 = el.parentElement;
+        if (el.tagName === "labels") return !!up2 && cells.has(up2) && !sent2.has(up2);
+        const cell2 = el.tagName === "label" ? up2?.parentElement : null;
+        return !!cell2 && cells.has(cell2) && !sent2.get(cell2)?.has(Number(el.getAttribute("languagecode")));
+      };
+      skips.set(d, skip);
+      return skip;
+    };
     return {
       noun: "form",
       publish: true,
       gone: GONE3,
       dropped: (c) => clears2(ctx, c) ? "Dataverse did not remove this translation. Reload the form to see what is saved." : "Dataverse did not keep this label. Reload the form to see what is saved.",
-      async read() {
-        const b = await h2.batch(L2, readParts(formId2), never2);
-        if (!b.inLang) throw notSaved(L2);
-        const d = formOf2(b, b.results[0], etagOf(b.results[1]));
-        if (!d) throw b.results[0].ok ? new Error("This form no longer exists.") : partError(b.results[0]);
-        return d;
-      },
-      build(base, todo) {
+      read: () => readForm(ctx, h2, L2, formId2),
+      build(base, todo, theirs = []) {
         const doc = parseXml(base.xml, "form definition");
         const now = index2(doc, formId2, dash);
+        const plan = /* @__PURE__ */ new Map();
+        const want = (it) => plan.get(it.el) ?? plan.set(it.el, /* @__PURE__ */ new Map()).get(it.el);
+        const free = /* @__PURE__ */ new Map();
         for (const c of todo) {
           const it = now.get(c.slot.comp);
           if (!it) throw new Error(GONE3);
-          const [container, item, lcidAttr, textAttr] = shape(it);
-          if (clears2(ctx, c)) removeLabel(it.el, { container, item, lcidAttr, lcid: c.lcid });
-          else upsertLabel(doc, it.el, { container, item, lcidAttr, textAttr, lcid: c.lcid, text: c.after });
+          if (own2(it)) {
+            if (!c.standIn?.follow) want(it).set(c.lcid, c.after);
+            else if (!free.has(c.slot.comp)) {
+              const id = it.el.getAttribute("id") ?? "";
+              const g = crypto.randomUUID();
+              free.set(c.slot.comp, { el: it.el, key: id.startsWith("{") ? `{${g}}` : g });
+            }
+            continue;
+          }
+          const [container2, item2, lcidAttr2, textAttr2] = shape(it);
+          if (clears2(ctx, c)) removeLabel(it.el, { container: container2, item: item2, lcidAttr: lcidAttr2, lcid: c.lcid });
+          else upsertLabel(doc, it.el, { container: container2, item: item2, lcidAttr: lcidAttr2, textAttr: textAttr2, lcid: c.lcid, text: c.after });
         }
         const was = pairs(idx(base), todo);
         const is2 = pairs(now, todo);
-        assertOnlyChanged(base.doc, doc, (el) => was(el) || is2(el));
+        if (!sparse) {
+          assertOnlyChanged(base.doc, doc, (el) => was(el) || is2(el));
+          return serializeXml(doc);
+        }
+        const read2 = idx(pass2.read);
+        const compOf = (it) => `${it.kind}|${formId2}|${it.id}`;
+        const namesOf = (it) => pass2.o.column?.(pass2.entity, datafield(it))?.names;
+        for (const c of theirs) {
+          const it = now.get(c.slot.comp);
+          if (!it || !own2(it)) continue;
+          const r = read2.get(c.slot.comp);
+          const t = labelsOf2(it)[c.lcid];
+          if (t && (!r || keyOf(r) === keyOf(it)) && !namesOf(it)?.[c.lcid]?.includes(t)) want(it).set(c.lcid, t);
+        }
+        const cells = collect(doc, dash).filter(own2);
+        for (const it of cells) {
+          if (plan.has(it.el) || read2.has(compOf(it))) continue;
+          const names3 = namesOf(it);
+          for (const [k, t] of Object.entries(labelsOf2(it))) if (t && !names3?.[Number(k)]?.includes(t)) want(it).set(Number(k), t);
+        }
+        const ownOf = (it, l, t) => {
+          const col = pass2.o.column?.(pass2.entity, datafield(it));
+          if (!col) return null;
+          if (!col.names[l]?.includes(t)) return true;
+          return col.renamed.includes(l) ? null : "name";
+        };
+        const expect = /* @__PURE__ */ new Map();
+        const first = base === pass2.read;
+        for (const it of cells) {
+          const w = plan.get(it.el);
+          expect.set(it.el, w?.size ? Object.fromEntries(w) : null);
+          if (first && w?.size) owns.set(compOf(it), { key: keyOf(it), own: Object.fromEntries([...w].map(([l, t]) => [l, ownOf(it, l, t)])) });
+        }
+        const [container, item, lcidAttr, textAttr] = LAB;
+        for (const [el, labels2] of expect) {
+          const box = kid(el, container);
+          if (!labels2) {
+            if (box) el.removeChild(box);
+            continue;
+          }
+          if (box) while (box.firstChild) box.removeChild(box.firstChild);
+          for (const [k, t] of Object.entries(labels2)) upsertLabel(doc, el, { container, item, lcidAttr, textAttr, lcid: Number(k), text: t });
+        }
+        if (first) {
+          for (const [comp2, it] of now) if (expect.has(it.el)) posted.set(comp2, { labels: expect.get(it.el) ?? null, edits: new Set(todo.filter((c) => c.slot.comp === comp2).map((c) => c.lcid)) });
+        }
+        const may = postable(base.doc, pass2.read.doc, formId2, todo, theirs, (df) => pass2.o.column?.(pass2.entity, df)?.names);
+        moved2.clear();
+        const swaps = [];
+        for (const [comp2, { el, key }] of free) {
+          el.setAttribute("labelid", key);
+          moved2.set(comp2, normId(key));
+          const b = idx(base).get(comp2);
+          if (b) swaps.push([b.el, b.el.getAttribute("labelid"), key]);
+        }
+        for (const [el, , key] of swaps) el.setAttribute("labelid", key);
+        try {
+          assertSent(base.doc, doc, pass2.type, dash, (el) => was(el) || is2(el), expect, may);
+        } finally {
+          for (const [el, old] of swaps) {
+            if (old === null) el.removeAttribute("labelid");
+            else el.setAttribute("labelid", old);
+          }
+        }
         return serializeXml(doc);
       },
       async send(xml, fresh2) {
         const b = await h2.batch(L2, writeParts(formId2, xml, fresh2.etag));
         const [vb, pr, vr] = b.results;
         if (!pr.ok) throw partError(pr);
-        return { probe: formOf2(b, vb, fresh2.etag), back: formOf2(b, vr, fresh2.etag) };
+        const sent2 = { probe: formOf2(b, vb, fresh2.etag), back: formOf2(b, vr, fresh2.etag) };
+        saw(ctx, formId2, sent2.probe?.ver);
+        saw(ctx, formId2, sent2.back?.ver);
+        return sent2;
       },
-      same: (a, b) => a.xml === b.xml || canon(a.doc.documentElement, () => false) === canon(b.doc.documentElement, () => false),
+      same: (a, b) => a.xml === b.xml || canon(a.doc.documentElement, unsent(a)) === canon(b.doc.documentElement, unsent(b)),
       older: (a, b) => olderVersion(a.ver, b.ver),
-      alike: (a, b, todo) => canon(a.doc.documentElement, pairs(idx(a), todo)) === canon(b.doc.documentElement, pairs(idx(b), todo)),
+      alike: (a, b, todo) => {
+        const [ua, ub, pa, pb] = [unsent(a), unsent(b), pairs(idx(a), todo), pairs(idx(b), todo)];
+        return canon(a.doc.documentElement, (el) => ua(el) || pa(el)) === canon(b.doc.documentElement, (el) => ub(el) || pb(el));
+      },
       state: (d, c) => {
-        const l = labelIn(d, c);
-        return l ? JSON.stringify(l[c.lcid] ?? null) : null;
+        const it = idx(d).get(c.slot.comp);
+        if (!it) return null;
+        const t = labelsOf2(it)[c.lcid];
+        return JSON.stringify((t !== void 0 && t === c.alsoBefore ? c.before : t) ?? null);
       },
       text: (d, c) => labelIn(d, c)?.[c.lcid] ?? "",
-      // A removed translation must be gone, not merely blank.
+      // A removed translation must be gone, not merely blank. A label freed of its own text is on the new key its write gave
+      // its cell: its text reads as the column's name either way.
       holds: (d, c) => {
+        const key = c.standIn?.follow ? moved2.get(c.slot.comp) : void 0;
+        if (key !== void 0) {
+          const it = idx(d).get(c.slot.comp);
+          return !!it && keyOf(it) === key;
+        }
         const l = labelIn(d, c);
         return !!l && (clears2(ctx, c) ? !(c.lcid in l) : (l[c.lcid] ?? "") === c.after);
-      }
+      },
+      sparse,
+      pass: pass2,
+      posted,
+      owns
     };
   }
   async function writePass(ctx, h2, L2, s0, cs, o, retry) {
     const { formId: formId2 } = s0.ref;
-    const dash = isDash(s0.ref.formType);
+    const type = Number(s0.ref.formType);
+    const dash = isDash(type);
     const target = () => dash ? o.publish.dashboards.add(formId2) : o.publish.entities.add(s0.entity);
-    const rb = await h2.batch(L2, readParts(formId2), o.signal);
+    const read2 = () => h2.batch(L2, readParts(formId2), o.signal);
+    const behind2 = (b) => b.inLang && b.results[0].ok && lagging(ctx, formId2, b.results[0].data?.versionnumber);
+    let rb = await read2();
+    for (const ms of LAG_WAITS) {
+      if (!behind2(rb)) break;
+      o.progress(`Waiting for Dataverse to show your last save of ${s0.path.slice(0, 2).join(" › ")}…`);
+      await pause(ms, o.signal);
+      rb = await read2();
+    }
     if (!rb.inLang) throw notSaved(L2);
     const [rr, pub] = rb.results;
     if (!rr.ok && rr.status !== 404) throw partError(rr);
     const r = rr.data;
     if (!r?.formxml) return cs.map((c) => res(c, "error", "This form no longer exists."));
-    if (r.ismanaged === true) return cs.map((c) => res(c, "error", MANAGED));
+    if (r.ismanaged === true && !ctx.managedEdits) return cs.map((c) => res(c, "error", MANAGED));
+    if (behind2(rb)) return cs.map((c) => res(c, "error", behindText("form")));
+    saw(ctx, formId2, r.versionnumber);
     const etag = etagOf(pub);
     const pending = !pub.ok || String(pub.data?.versionnumber ?? "") !== String(r.versionnumber ?? "");
+    let form2 = o.forms?.get(formId2);
+    if (o.forms && !form2?.sent) o.forms.set(formId2, form2 = { pending, version: String(pub.data?.versionnumber ?? ""), sent: false, cells: /* @__PURE__ */ new Map() });
     const base = { xml: r.formxml, doc: parseXml(r.formxml, "form definition"), etag, ver: r.versionnumber };
-    const ops = formOps(ctx, h2, L2, formId2, dash);
     const idx = index2(base.doc, formId2, dash);
     const out = [];
     const todo = [];
@@ -12870,7 +14482,7 @@ ${l}`;
         continue;
       }
       const stored4 = labelsOf2(it)[c.lcid];
-      const k = compare3(c, stored4, clears2(ctx, c), o.force);
+      const k = c.standIn?.follow ? freed(c, it, stored4, o.force, (l) => o.column?.(s0.entity, datafield(it))?.names[l], form2) : compare3(c, stored4, clears2(ctx, c), o.force);
       if (k) {
         if (k.outcome === "conflict" && c.slot.ref.partial && !(c.lcid in c.slot.labels))
           k.message = "The current label in this language was not loaded. Check the value now on the server, then save again.";
@@ -12881,10 +14493,14 @@ ${l}`;
     }
     if (pending && out.some((x) => x.outcome === "unchanged")) target();
     if (!todo.length) return out;
-    const xml = ops.build(base, todo.map(([c]) => c));
+    const ops = formOps(ctx, h2, L2, formId2, dash, { type, entity: s0.entity, todo: todo.map(([c]) => c), read: base, o });
+    const xml = ops.build(base, ops.pass.todo);
     if (o.signal.aborted) throw abortError();
     const failed2 = (e) => [...out, ...todo.map(([c]) => res(c, "error", errText(e)))];
-    const ran2 = () => todo.forEach(([c]) => o.ran?.add(changeId(c)));
+    const ran2 = () => {
+      if (form2) form2.sent = true;
+      todo.forEach(([c]) => o.ran?.add(changeId(c)));
+    };
     let wb;
     try {
       wb = await h2.batch(L2, writeParts(formId2, xml, etag));
@@ -12906,8 +14522,14 @@ ${l}`;
     }
     ran2();
     target();
+    for (const [comp2, c] of ops.owns) form2?.cells.set(comp2, c);
+    const probe = formOf2(wb, vb, etag);
     const back = formOf2(wb, vr, etag);
-    const fixed = await settle2(ops, base, todo.map(([c]) => c), { probe: formOf2(wb, vb, etag), back });
+    saw(ctx, formId2, probe?.ver);
+    saw(ctx, formId2, back?.ver);
+    const fixed = await settle2(ops, base, ops.pass.todo, { probe, back });
+    if (fixed && form2) form2.pending = true;
+    if (ops.sparse && probe && back && !ops.older(probe, base)) await nothingElse(ctx, h2, L2, s0, ops, probe, back, o);
     if (fixed) return [...out, ...fixed];
     const vi = back && index2(back.doc, formId2, dash);
     for (const [c] of todo) {
@@ -12916,6 +14538,79 @@ ${l}`;
       else out.push(ops.holds(back, c) ? res(c, "saved") : res(c, "error", ops.dropped(c)));
     }
     return out;
+  }
+  function unkept(ops, probe, back, formId2, dash) {
+    const was = index2(probe.doc, formId2, dash);
+    const now = index2(back.doc, formId2, dash);
+    const lost = [];
+    const left = [];
+    for (const [comp2, p] of ops.posted) {
+      const a = was.get(comp2);
+      const b = now.get(comp2);
+      if (!a || !b || keyOf(a) !== keyOf(b)) continue;
+      const col = ops.pass.o.column?.(ops.pass.entity, datafield(a));
+      const got = labelsOf2(b);
+      for (const [k, t] of Object.entries(labelsOf2(a))) {
+        const l = Number(k);
+        const v = got[l];
+        const names3 = col?.names[l];
+        if (!t || v === t || p.edits.has(l) || col?.renamed.includes(l) || names3?.includes(t)) continue;
+        (v && !names3?.includes(v) ? left : lost).push({ comp: comp2, l, t, v });
+      }
+    }
+    return { lost, left };
+  }
+  async function nothingElse(ctx, h2, L2, s0, ops, probe, back, o) {
+    const { formId: formId2 } = s0.ref;
+    const dash = isDash(Number(s0.ref.formType));
+    const { lost, left } = unkept(ops, probe, back, formId2, dash);
+    if (!lost.length && !left.length) return;
+    if (false) console.warn("[translator] labels this write did not send read back changed", lost, left);
+    const f = o.forms?.get(formId2);
+    if (f) f.pending = true;
+    const fixed = /* @__PURE__ */ new Set();
+    const later2 = [];
+    let raced = false;
+    try {
+      const F = await ops.read();
+      const fi = index2(F.doc, formId2, dash);
+      const now = index2(back.doc, formId2, dash);
+      const since2 = (x) => {
+        const it = fi.get(x.comp);
+        return !it || keyOf(it) !== keyOf(now.get(x.comp)) || labelsOf2(it)[x.l] !== x.v;
+      };
+      const late = lagging(ctx, formId2, F.ver);
+      const theirs = new Set([...left, ...lost.filter((x) => late || since2(x))].map((x) => x.comp));
+      const puts = [];
+      const of = /* @__PURE__ */ new Map();
+      for (const x of lost) {
+        if (theirs.has(x.comp)) continue;
+        const c = { slot: { ...s0, key: `${x.comp}|Label`, comp: x.comp, kind: "field" }, lcid: x.l, before: x.v ?? "", after: x.t };
+        puts.push(c);
+        of.set(c, x);
+      }
+      if (puts.length) {
+        const all = [...puts, ...ops.pass.todo.filter((c) => ops.posted.has(c.slot.comp) && ops.holds(F, c))];
+        const w = formOps(ctx, h2, L2, formId2, dash, { ...ops.pass, todo: all, read: F });
+        const sent2 = await w.send(w.build(F, all), F);
+        const got = await settle2(w, F, all, sent2);
+        puts.forEach((c, i) => {
+          const m = got?.[i].message;
+          const doubt = m === RACE.raced || m === RACE.unseen;
+          raced ||= doubt;
+          if (got ? got[i].outcome === "saved" || doubt : !!sent2.back && w.holds(sent2.back, c)) fixed.add(of.get(c));
+        });
+        if (sent2.probe && sent2.back && !w.older(sent2.probe, F)) {
+          const again4 = unkept(w, sent2.probe, sent2.back, formId2, dash);
+          later2.push(...again4.lost, ...again4.left);
+        }
+      }
+    } catch {
+    }
+    const form2 = formName(s0);
+    if (fixed.size) o.warn?.(droppedBack(form2, fixed.size, raced), raced ? "warning" : "notice");
+    const not2 = new Map([...left, ...lost.filter((x) => !fixed.has(x)), ...later2].map((x) => [`${x.comp}#${x.l}`, x]));
+    if (not2.size) o.warn?.(droppedLeft(form2, [...not2.values()].map((x) => ({ lang: lcidName(x.l), text: x.t }))), "warning");
   }
   async function writeLang(ctx, h2, L2, s0, cs, o) {
     const pass2 = () => writePass(ctx, h2, L2, s0, cs, o, true);
@@ -12929,11 +14624,94 @@ ${l}`;
       }
     }
   }
+  var BACK_WAITS = [5e3, 1e4, 2e4, 4e4];
+  var UNMARK_WAITS = [1e4, 3e4];
+  async function rewrite(cs, publish, write3, marked = (c) => ({ slot: c.slot, lcid: c.lcid, before: c.after, after: c.after + MARK })) {
+    const first = await write3(cs.map(marked));
+    const done = new Set(first.filter((r) => r.outcome === "saved" || r.outcome === "unchanged").map((r) => changeId(r.change)));
+    const tried = first.filter((r) => r.outcome !== "conflict" && r.outcome !== "skipped").map((r) => ({ ...r.change, before: r.change.after, after: unmarked(r.change.after) }));
+    const never2 = new AbortController().signal;
+    const clean = (r) => r.outcome === "saved" || r.outcome === "unchanged" || r.outcome === "conflict" && r.server !== void 0 && r.server !== r.change.before;
+    const exact = async () => {
+      const last = /* @__PURE__ */ new Map();
+      for (let todo = tried, i = 0; todo.length; i++) {
+        const rs = await write3(todo, never2);
+        for (const r of rs) last.set(changeId(r.change), r);
+        todo = rs.filter((r) => !clean(r)).map((r) => r.change);
+        if (!todo.length || i >= BACK_WAITS.length) break;
+        await pause(BACK_WAITS[i], never2);
+      }
+      return [...last.values()].map((r) => clean(r) || r.outcome === "error" ? r : { ...r, outcome: "error" });
+    };
+    const wrote = (second2) => done.size > 0 || second2.some((r) => r.outcome === "saved" || r.outcome === "error");
+    const again4 = (x) => isLockError(x) || turnedAway(x) || mayHaveRun(x);
+    const unmark = async () => {
+      for (let i = 0; ; i++)
+        try {
+          await publish(never2);
+          return null;
+        } catch (x) {
+          if (x instanceof PartialPublishError) return x;
+          if (i >= UNMARK_WAITS.length || !again4(x)) throw x;
+          await pause(UNMARK_WAITS[i], never2);
+        }
+    };
+    const results = (second2) => {
+      const firsts = new Map(first.map((r) => [changeId(r.change), r]));
+      const backs = new Map(second2.map((r) => [changeId(r.change), r]));
+      return cs.map((c) => {
+        const id = changeId(c);
+        const b = backs.get(id);
+        return { ...b && (b.outcome === "error" || done.has(id)) ? b : firsts.get(id), change: c };
+      });
+    };
+    try {
+      await publish();
+    } catch (e) {
+      const second2 = await exact();
+      if (!wrote(second2) || !(e instanceof PartialPublishError || mayHaveRun(e))) throw e;
+      let apps;
+      try {
+        apps = await unmark();
+      } catch {
+        throw e;
+      }
+      if (e instanceof PartialPublishError) throw e;
+      if (apps) throw apps;
+      return results(second2);
+    }
+    const second = await exact();
+    if (wrote(second))
+      try {
+        await publish();
+      } catch (e) {
+        if (e instanceof PartialPublishError || !(isAbort(e) || again4(e))) throw e;
+        await unmark();
+        if (isAbort(e)) throw e;
+      }
+    return results(second);
+  }
+  function writeAgain(ctx, cs, o, publish) {
+    return rewrite(cs, publish, async (list2, signal = o.signal) => {
+      const so = signal === o.signal ? o : { ...o, signal };
+      const forms = /* @__PURE__ */ new Map();
+      for (const c of list2) (forms.get(c.slot.group) ?? forms.set(c.slot.group, []).get(c.slot.group)).push(c);
+      const out = [];
+      for (const g of forms.values())
+        try {
+          out.push(...await o.lang.hold((h2) => writeLang(ctx, h2, ctx.user, g[0].slot, g, so), signal));
+        } catch (e) {
+          out.push(...g.map((c) => isAbort(e) ? res(c, "skipped", "Cancelled before saving.") : res(c, "error", errText(e))));
+        }
+      return out;
+    });
+  }
   var passOf = (ctx, c) => perLanguage(c.slot) ? c.lcid : ctx.user;
   var formXmlWriter = {
     kinds: ["tab", "section", "field", "navitem", "dtab", "dsection", "dfield"],
     lane: "xml",
     pass: (ctx, c) => String(passOf(ctx, c)),
+    again: writeAgain,
     async read(ctx, changes, o) {
       const ref = { formId: changes[0].slot.ref.formId, entity: "", type: NaN, name: "" };
       const slots = await loadFormXml(ctx, [ref], [...new Set(changes.map((c) => c.lcid))], { signal: o.signal, progress() {
@@ -12953,8 +14731,8 @@ ${l}`;
       const out = [];
       const passes3 = /* @__PURE__ */ new Map([[ctx.user, []]]);
       for (const c of changes) {
-        if (isManaged(c.slot)) {
-          out.push(res(c, "error", MANAGED));
+        if (managedHeld(c.slot, ctx.managedEdits)) {
+          out.push(res(c, "error", managedReadOnly(c.slot, ctx.managedEdits)));
           continue;
         }
         if (!canClear(c.slot) && clears2(ctx, c)) {
@@ -13108,13 +14886,13 @@ ${l}`;
       for (const l of layers) {
         const v = value2(l.attrs, `${key} - LocalizedLabel`);
         if (v === void 0 || v === null) continue;
-        const all2 = json(v)?.LocalizedLabels;
-        if (!all2 || typeof all2 !== "object" || Array.isArray(all2)) {
+        const all = json(v)?.LocalizedLabels;
+        if (!all || typeof all !== "object" || Array.isArray(all)) {
           odd = true;
           break;
         }
         held = true;
-        for (const [lcid, x] of Object.entries(all2)) {
+        for (const [lcid, x] of Object.entries(all)) {
           const n = Number(lcid);
           const t = x?.LocalizedLabel;
           if (n > 0 && typeof t === "string" && !(n in out)) out[n] = t;
@@ -13181,7 +14959,7 @@ ${l}`;
   var STATE_DESCRIPTION = "This Dataverse version can't translate the description of a Status option, only its label. Undo this edit.";
   var entityPath = (e) => `EntityDefinitions(LogicalName='${q(e)}')`;
   var attrPath = (e, a) => `${entityPath(e)}/Attributes(LogicalName='${q(a)}')`;
-  function notCustomizable(x, noun, managed = !!x?.IsManaged) {
+  function notCustomizable2(x, noun, managed = !!x?.IsManaged) {
     if (managed) return MANAGED;
     if (x?.IsCustomizable?.Value !== false) return "";
     return `This ${noun} is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.`;
@@ -13191,7 +14969,7 @@ ${l}`;
     const can = x?.IsRenameable?.Value === false ? x.IsRenameable.CanBeChanged : void 0;
     if (can === false && !custom && x?.IsCustomizable?.Value !== false)
       return `Microsoft locks renaming of this ${noun}: ${names3} can't be changed, in any language. Dynamics shows Microsoft's own text for ${noun === "table" ? "them" : "it"} (the language pack).`;
-    const why3 = notCustomizable(x, noun, managed);
+    const why3 = notCustomizable2(x, noun, managed);
     if (why3 || x?.IsRenameable?.Value !== false) return why3;
     if (can === false) return `The solution this ${noun} comes from locks renaming it: ${names3} can't be changed, in any language.`;
     return can === true ? `Renaming is turned off for this ${noun} (its “Display name can be modified” managed property). Turn it on in the ${noun}'s managed properties to translate it here.` : `Renaming is turned off for this ${noun}, so ${names3} can't be changed here.`;
@@ -13252,18 +15030,18 @@ ${l}`;
     return new Set(rows.map((r) => guid(r.objectid)));
   }
   async function solutionTables(ctx, solutionId, signal) {
-    const [ids3, all2] = await Promise.all([
+    const [ids3, all] = await Promise.all([
       components(ctx, solutionId, 1, signal),
       ctx.http.all("EntityDefinitions?$select=LogicalName&$filter=IsIntersect eq false", { signal })
     ]);
-    return all2.filter((e) => ids3.has(guid(e.MetadataId))).map((e) => e.LogicalName);
+    return all.filter((e) => ids3.has(guid(e.MetadataId))).map((e) => e.LogicalName);
   }
-  function keepAttr(a, names3, all2) {
+  function keepAttr(a, names3, all) {
     const n = a.LogicalName;
     const t = a.AttributeType || "";
     if (a.AttributeOf || !t || /^(CalendarRules|ManagedProperty|EntityName)$/.test(t)) return false;
     if (t === "Virtual" && !/^(MultiSelectPicklist|File|Image)Type$/.test(a.AttributeTypeName?.Value)) return false;
-    if (all2) return true;
+    if (all) return true;
     const m = /^(.+)_(state|date)$/.exec(n);
     return !(/^(BigInt|Uniqueidentifier)$/.test(t) || n.includes("yomi") || a.IsLogical && !a.IsValidForForm || n.endsWith("_base") && names3.has(n.slice(0, -5)) || m && names3.has(m[1]) && names3.has(`${m[1]}_${m[2] === "state" ? "date" : "state"}`) || !pick(toLabels(a.DisplayName)));
   }
@@ -13300,7 +15078,7 @@ ${l}`;
     if (errors.length && errors.length === ids3.length) throw new Error(`Could not read the global choices: ${errors[0]}`);
     if (errors.length) o.progress(`Loaded with problems. ${errors.length} of ${ids3.length} global choices could not be read: ${errors[0]}`);
   }
-  async function load(ctx, entities, kinds, o, all2, solutionId, everyGlobal = false) {
+  async function load(ctx, entities, kinds, o, all, solutionId, everyGlobal = false) {
     const { http } = ctx;
     const signal = o.signal;
     const name = (l, fallback2) => pick(toLabels(l), ctx.user, ctx.base) || fallback2;
@@ -13315,6 +15093,7 @@ ${l}`;
     const sets = /* @__PURE__ */ new Map();
     const rels2 = /* @__PURE__ */ new Map();
     const tables = /* @__PURE__ */ new Map();
+    const ms = (s, why3) => s.ref?.managed ? managedSlot(s, ctx.managedEdits, why3(false), why3(true)) : s;
     const table = async (e) => {
       const tp = entityPath(e);
       const exp = [
@@ -13338,17 +15117,23 @@ ${l}`;
       const out2 = [];
       if (kinds.has("entity")) {
         const ref = { entity: e, metadataId: guid(ent2.MetadataId), managed: !!ent2.IsManaged, custom: !!ent2.IsCustomEntity };
-        const b = mk2("entity", `entity|${e}`, e, tt, [tt], e, notCustomizable(ent2, "table"), 0, ref);
-        const names3 = notRenameable(ent2, "table", ref.custom);
-        out2.push(slot(b, "DisplayName", ent2.DisplayName, names3), slot(b, "DisplayCollectionName", ent2.DisplayCollectionName, names3), slot(b, "Description", ent2.Description));
+        const b = mk2("entity", `entity|${e}`, e, tt, [tt], e, notCustomizable2(ent2, "table"), 0, ref);
+        const names3 = (m) => notRenameable(ent2, "table", ref.custom, m);
+        const own2 = (m) => notCustomizable2(ent2, "table", m);
+        out2.push(
+          ms(slot(b, "DisplayName", ent2.DisplayName, names3(ref.managed)), names3),
+          ms(slot(b, "DisplayCollectionName", ent2.DisplayCollectionName, names3(ref.managed)), names3),
+          ms(slot(b, "Description", ent2.Description), own2)
+        );
       }
       if (ent2.Attributes) {
         const names3 = new Set(ent2.Attributes.map((a) => a.LogicalName));
-        ent2.Attributes.filter((a) => keepAttr(a, names3, all2)).map((a) => ({ a, t: name(a.DisplayName, a.LogicalName) })).sort((x, y) => x.t.localeCompare(y.t)).forEach(({ a, t }, i) => {
+        ent2.Attributes.filter((a) => keepAttr(a, names3, all)).map((a) => ({ a, t: name(a.DisplayName, a.LogicalName) })).sort((x, y) => x.t.localeCompare(y.t)).forEach(({ a, t }, i) => {
           const n = a.LogicalName;
           const ref = { entity: e, attribute: n, metadataId: guid(a.MetadataId), odataType: String(a["@odata.type"] || "").replace("#", ""), managed: !!a.IsManaged, custom: !!a.IsCustomAttribute };
-          const b = mk2("attribute", `attribute|${e}.${n}`, e, t, [tt, "Columns"], n, notCustomizable(a, "column"), i, ref);
-          out2.push(slot(b, "DisplayName", a.DisplayName, notRenameable(a, "column", ref.custom)), slot(b, "Description", a.Description));
+          const b = mk2("attribute", `attribute|${e}.${n}`, e, t, [tt, "Columns"], n, notCustomizable2(a, "column"), i, ref);
+          const names4 = (m) => notRenameable(a, "column", ref.custom, m);
+          out2.push(ms(slot(b, "DisplayName", a.DisplayName, names4(ref.managed)), names4), ms(slot(b, "Description", a.Description), (m) => notCustomizable2(a, "column", m)));
         });
       }
       typed.forEach((list2, i) => {
@@ -13368,11 +15153,12 @@ ${l}`;
           if (!kinds.has(kind)) continue;
           const path = [tt, `${name(a.DisplayName, n)} (${n})`, "Choices"];
           const managed = !!a.IsManaged || !!os.IsManaged;
+          const lock = (m) => notCustomizable2(a, "choice column", m) || (m ? "" : notCustomizable2(os, "choice column", false));
           opts(os).forEach((op, j) => {
             const v = Number(op.Value);
             const ref = { entity: e, attribute: n, value: v, attributeMetadataId: guid(a.MetadataId), optionMetadataId: guid(op.MetadataId), cast, managed };
-            const b = mk2(kind, `${kind}|${e}.${n}|${v}`, e, name(op.Label, String(v)), path, String(v), notCustomizable(a, "choice column", managed), j, ref);
-            out2.push(slot(b, "Label", op.Label), slot(b, "Description", op.Description));
+            const b = mk2(kind, `${kind}|${e}.${n}|${v}`, e, name(op.Label, String(v)), path, String(v), notCustomizable2(a, "choice column", managed), j, ref);
+            out2.push(ms(slot(b, "Label", op.Label), lock), ms(slot(b, "Description", op.Description), lock));
           });
         }
       });
@@ -13409,7 +15195,8 @@ ${l}`;
     }
     sides.sort((x, y) => x.t.localeCompare(y.t)).forEach(({ r, side, owner, other, m, t }, i) => {
       const beh = String(m?.Behavior);
-      const ro = notCustomizable(r, "relationship") || (/^(UseLabel|1)$/.test(beh) ? "" : /^(DoNotDisplay|2)$/.test(beh) ? "Not shown in the related menu" : "Uses the related table's plural name");
+      const lock = (managed) => notCustomizable2(r, "relationship", managed) || (/^(UseLabel|1)$/.test(beh) ? "" : /^(DoNotDisplay|2)$/.test(beh) ? "Not shown in the related menu" : "Uses the related table's plural name");
+      const ro = lock(!!r.IsManaged);
       const group = `relationship|${r.SchemaName}`;
       const ref = {
         schemaName: r.SchemaName,
@@ -13427,7 +15214,7 @@ ${l}`;
         managed: !!r.IsManaged
       };
       const sub = side ? `${r.SchemaName} (${owner} → ${other})` : r.SchemaName;
-      out.push(slot(mk2("relationship", side ? `${group}|${side}` : group, owner, t, [tables.get(owner)?.[0] || owner, "Relationships"], sub, ro, i, ref, group), "Label", m?.Label));
+      out.push(ms(slot(mk2("relationship", side ? `${group}|${side}` : group, owner, t, [tables.get(owner)?.[0] || owner, "Relationships"], sub, ro, i, ref, group), "Label", m?.Label), lock));
     });
     if (solutionId && glob) {
       const ids3 = await components(ctx, solutionId, 9, signal);
@@ -13451,21 +15238,22 @@ ${l}`;
       }
     [...sets].map(([n, g]) => ({ n, g, t: name(g.set.DisplayName, n) })).sort((x, y) => x.t.localeCompare(y.t)).forEach(({ n, g, t }, i) => {
       const s = g.set;
-      const ro = notCustomizable(s, "global choice");
+      const ro = notCustomizable2(s, "global choice");
+      const lock = (m) => notCustomizable2(s, "global choice", m);
       const boolean = !!s.TrueOption;
       if (kinds.has("globaloptionset")) {
         const b = mk2("globaloptionset", `globaloptionset|${n}`, "", t, [GLOBAL], n, ro, i, { name: n, metadataId: guid(s.MetadataId), boolean, usedBy: g.usedBy, managed: !!s.IsManaged });
-        out.push(slot(b, "DisplayName", s.DisplayName), slot(b, "Description", s.Description));
+        out.push(ms(slot(b, "DisplayName", s.DisplayName), lock), ms(slot(b, "Description", s.Description), lock));
       }
       if (kinds.has("globaloption"))
         opts(s).forEach((op, j) => {
           const v = Number(op.Value);
           const ref = { name: n, value: v, optionMetadataId: guid(op.MetadataId), setId: guid(s.MetadataId), usedBy: g.usedBy, boolean, managed: !!s.IsManaged };
           const b = mk2("globaloption", `globaloption|${n}|${v}`, "", name(op.Label, String(v)), [GLOBAL, t], String(v), ro, j, ref);
-          out.push(slot(b, "Label", op.Label), slot(b, "Description", op.Description));
+          out.push(ms(slot(b, "Label", op.Label), lock), ms(slot(b, "Description", op.Description), lock));
         });
     });
-    return all2 ? out : out.filter((s) => !s.readOnly);
+    return all ? out : out.filter((s) => !s.readOnly);
   }
   function loadTables(ctx, entities, kinds, o) {
     return load(ctx, entities, kinds, o, true);
@@ -13478,7 +15266,7 @@ ${l}`;
   var LOCK2 = /cannot start another|0x80071151|customizationlock|another \[/i;
   var CANCELLED2 = "Cancelled before saving";
   function refusal(ctx, c) {
-    if (isManaged(c.slot)) return MANAGED;
+    if (managedHeld(c.slot, ctx.managedEdits)) return managedReadOnly(c.slot, ctx.managedEdits);
     if (c.after.trim()) return "";
     if (c.lcid !== ctx.base) return savesEmpty(c.slot, c.lcid, ctx.base, c.untranslated) ? "" : CANT_CLEAR_TEXT;
     return c.slot.baseRequired ? `The ${lcidName(ctx.base)} text can't be blank: it is the base language.` : "";
@@ -13553,9 +15341,11 @@ ${l}`;
       throw e;
     }
   }
-  var guard = (noun) => (cur2, c) => {
+  var guard = (ctx, noun) => (cur2, c) => {
     const managed = cur2?.IsManaged === true || cur2?.OptionSet?.IsManaged === true || !!c.slot.ref?.managed;
-    return (noun === "table" || noun === "column") && c.slot.prop !== "Description" ? notRenameable(cur2, noun, !!c.slot.ref?.custom, managed) : notCustomizable(cur2, noun, managed);
+    const held = managed && !ctx.managedEdits;
+    const why3 = (noun === "table" || noun === "column") && c.slot.prop !== "Description" ? notRenameable(cur2, noun, !!c.slot.ref?.custom, held) : notCustomizable2(cur2, noun, held);
+    return why3 || (managed && !held && cur2?.OptionSet ? notCustomizable2(cur2.OptionSet, noun, false) : "");
   };
   var sentence = (m) => /[.!?]$/.test(m.trim()) ? m.trim() : `${m.trim()}.`;
   function moved(before, after) {
@@ -13866,7 +15656,7 @@ ${l}`;
     if (!m || !recent(m.w)) return true;
     return m.text === text2(c) && (!m.olds.some(([, , a]) => a) || shown2(rec2, cur2, c, label));
   }
-  var behindMsg = (s) => `Not saved: Dataverse doesn't show your last change to this ${KIND_NAMES[s.kind][0].toLowerCase()} yet, and saving now could undo it. Try again in a minute.`;
+  var behindMsg = (s) => behindText(KIND_NAMES[s.kind][0].toLowerCase());
   function behind(cur2, todo, label) {
     return todo.some((c) => {
       const known2 = c.slot.labels;
@@ -13898,14 +15688,14 @@ ${l}`;
     const rec2 = mine2(ctx, url, s.group);
     const sent2 = (m) => back === "all" || asked.some((c) => c.slot.key === m.c.slot.key && (back === "labels" || c.lcid === m.c.lcid));
     const seen = /* @__PURE__ */ new Map();
-    const saw = (id, t) => {
+    const saw2 = (id, t) => {
       let s2 = seen.get(id);
       if (!s2) seen.set(id, s2 = /* @__PURE__ */ new Set());
       s2.add(blank2(t));
     };
     for (const c of asked) {
-      saw(idOf(c), c.before);
-      saw(idOf(c), c.slot.labels?.[c.lcid]);
+      saw2(idOf(c), c.before);
+      saw2(idOf(c), c.slot.labels?.[c.lcid]);
     }
     let cur2;
     let asking = [];
@@ -13917,7 +15707,7 @@ ${l}`;
           const own2 = asking.find((a) => a.slot.key === c.slot.key && a.lcid === Number(l));
           const m = own2 && rec2.own.get(idOf(own2));
           const mine3 = !!own2 && blank2(t) === text2(own2) && m?.text === text2(own2) && recent(m.w);
-          if (!mine3 && (own2 || blank2(t) !== textIn(cur2, { ...c, lcid: Number(l) }, label))) saw(`${c.slot.key}#${l}`, t);
+          if (!mine3 && (own2 || blank2(t) !== textIn(cur2, { ...c, lcid: Number(l) }, label))) saw2(`${c.slot.key}#${l}`, t);
         }
     };
     for (let i = 0, again4 = 0; ; i++) {
@@ -13930,14 +15720,14 @@ ${l}`;
       const found = [];
       asking = [];
       for (const c of asked) {
-        saw(idOf(c), textIn(cur2, c, label));
-        for (const [l, t] of Object.entries(toLabels(label(cur2, c)))) saw(`${c.slot.key}#${l}`, t);
+        saw2(idOf(c), textIn(cur2, c, label));
+        for (const [l, t] of Object.entries(toLabels(label(cur2, c)))) saw2(`${c.slot.key}#${l}`, t);
         const why3 = allowed(cur2, c);
         const r = why3 ? { change: c, outcome: "error", message: why3 } : compare4(c, toLabels(label(cur2, c))[c.lcid], o.force, savesEmpty(c.slot, c.lcid, ctx.base, c.untranslated));
         if (r && (r.outcome !== "unchanged" || sure(rec2, cur2, c, label))) found.push(r);
         else asking.push(c);
       }
-      const rewrites = (m) => asking.some((c) => idOf(c) === idOf(m.c) && text2(c) === m.text);
+      const rewrites = (m) => asking.some((c) => idOf(c) === idOf(m.c) && (text2(c) === m.text || c.alsoBefore !== void 0 && blank2(c.before) === m.text));
       const old = lags(rec2, cur2, label, sent2, rewrites) || found.some((r) => r.outcome === "unchanged") && lags(rec2, cur2, label, () => true, rewrites) || !!layer && asking.length > 0 && await dbBehind(ctx, cur2, label, rec2, asking, layer, o.signal);
       const lag = old || !persisted && (found.some((r) => r.outcome === "conflict" || r.outcome === "unchanged") || back !== "langs" && behind(cur2, asking.filter((c) => ![...rec2.own.values()].some((m) => m.c.slot.key === c.slot.key)), label));
       const waits = old ? SETTLE_WAITS : CONFLICT_WAITS;
@@ -14041,8 +15831,9 @@ ${l}`;
       const langs = back === "langs" ? cs.map((c) => c.lcid) : [...new Set([...Object.keys(was), ...Object.keys(seen), ...cs.map((c) => String(c.lcid))].map(Number))];
       for (const l of langs) {
         if (db && !(l in db)) continue;
-        if (blank2(seen[l]) === blank2(was[l]) || !db && lagged((x) => x.slot.key === key, l, was[l], seen[l])) continue;
         const c = cs.find((x) => x.lcid === l);
+        const read2 = db && c?.alsoBefore !== void 0 && todo.includes(c) ? blank2(c.before) : blank2(was[l]);
+        if (blank2(seen[l]) === read2 || !db && lagged((x) => x.slot.key === key, l, was[l], seen[l])) continue;
         const ours3 = c && todo.includes(c) ? text2(c) : blank2(was[l]);
         if (blank2(seen[l]) === ours3) continue;
         hits.push({ c: c ?? cs[0], l, own: !!c, theirs: seen[l] ?? "", ours: ours3, db: !!db });
@@ -14122,9 +15913,9 @@ ${l}`;
       const sent2 = /* @__PURE__ */ new Map();
       const cur22 = { ...cur2 };
       for (const p of new Set(syn.map((x) => x.slot.prop))) {
-        const all2 = { ...toLabels((now ?? cur2)?.[p]), ...dn.props[p] };
-        cur22[p] = { LocalizedLabels: Object.entries(all2).map(([l, t]) => ({ Label: t, LanguageCode: Number(l) })) };
-        sent2.set(p, { ...all2, ...Object.fromEntries(syn.filter((x) => x.slot.prop === p).map((x) => [x.lcid, x.after])) });
+        const all = { ...toLabels((now ?? cur2)?.[p]), ...dn.props[p] };
+        cur22[p] = { LocalizedLabels: Object.entries(all).map(([l, t]) => ({ Label: t, LanguageCode: Number(l) })) };
+        sent2.set(p, { ...all, ...Object.fromEntries(syn.filter((x) => x.slot.prop === p).map((x) => [x.lcid, x.after])) });
       }
       const pr = { url, db: layersPath(layer, id), kind: layer };
       let err = null;
@@ -14248,6 +16039,12 @@ ${l}`;
     url: `${attrPath(cs[0].slot.ref.entity, cs[0].slot.ref.attribute)}?$select=LogicalName,DisplayName,Description,IsRenameable,IsCustomizable,IsManaged,AttributeType,AttributeTypeName`,
     label: ownLabel
   });
+  async function columnLabels(ctx, entity, attribute, signal) {
+    const x = await ctx.http.get(`${attrPath(entity, attribute)}?$select=DisplayName,Description`, { headers: STRONG, signal });
+    if (!x?.DisplayName) throw new Error("No column names.");
+    return { DisplayName: toLabels(x.DisplayName), Description: toLabels(x.Description) };
+  }
+  var showsWritten = (labels2, c, base) => blank2(labels2[c.lcid]) === text2(c) && !(!text2(c) && savesEmpty(c.slot, c.lcid, base, c.untranslated) && labels2[c.lcid] === void 0);
   var globalSetSource = (cs) => ({
     url: `GlobalOptionSetDefinitions(Name='${q(cs[0].slot.ref.name)}')?$select=MetadataId,Name,DisplayName,Description,IsCustomizable,IsManaged`,
     label: ownLabel
@@ -14286,7 +16083,7 @@ ${l}`;
     const e = changes[0].slot.ref.entity;
     const path = entityPath(e);
     const { url, label } = entitySource(changes);
-    return flow(ctx, changes, o, url, label, guard("table"), () => o.publish.entities.add(e), async (cur2, todo) => {
+    return flow(ctx, changes, o, url, label, guard(ctx, "table"), () => o.publish.entities.add(e), async (cur2, todo) => {
       await put2(ctx, path, { "@odata.type": T + "EntityMetadata", LogicalName: cur2.LogicalName, ...props(cur2, todo) });
     }, "labels", keep((x, p) => x[p], ["DisplayName", "DisplayCollectionName", "Description"]), "Entity");
   }
@@ -14294,16 +16091,38 @@ ${l}`;
     const { entity: e, attribute: a, odataType } = changes[0].slot.ref;
     const path = attrPath(e, a);
     const { url, label } = attributeSource(changes);
-    return flow(ctx, changes, o, url, label, guard("column"), () => o.publish.entities.add(e), async (cur2, todo) => {
+    return flow(ctx, changes, o, url, label, guard(ctx, "column"), () => o.publish.entities.add(e), async (cur2, todo) => {
       const type = String(cur2["@odata.type"] || odataType || T + "AttributeMetadata").replace("#", "");
       const kind = /LookupAttributeMetadata$/.test(type) && cur2.AttributeType ? { AttributeType: cur2.AttributeType, AttributeTypeName: cur2.AttributeTypeName } : {};
       await put2(ctx, path, { "@odata.type": type, LogicalName: cur2.LogicalName, ...kind, ...props(cur2, todo) });
     }, "labels", keep((x, p) => x[p], ["DisplayName", "Description"]), "Attribute");
   }
+  var againAttribute = (ctx, cs, o, publish) => rewrite(
+    cs,
+    publish,
+    async (list2, signal = o.signal) => {
+      const so = signal === o.signal ? o : { ...o, signal };
+      const columns = /* @__PURE__ */ new Map();
+      for (const c of list2) (columns.get(c.slot.group) ?? columns.set(c.slot.group, []).get(c.slot.group)).push(c);
+      const out = [];
+      for (const g of columns.values())
+        try {
+          out.push(...await o.lang.quiet(() => saveAttribute(ctx, g, so), signal));
+        } catch (e) {
+          out.push(...g.map((change2) => isAbort(e) ? { change: change2, outcome: "skipped", message: CANCELLED2 } : { change: change2, outcome: "error", message: friendly(e) }));
+        }
+      return out;
+    },
+    (c) => {
+      const t = text2(c);
+      const was = blank2(c.before);
+      return { slot: c.slot, lcid: c.lcid, before: t, after: t + MARK, ...was !== t ? { alsoBefore: was } : {} };
+    }
+  );
   function saveGlobalSet(ctx, changes, o) {
     const { name, boolean } = changes[0].slot.ref;
     const { url, label } = globalSetSource(changes);
-    return flow(ctx, changes, o, url, label, guard("global choice"), () => o.publish.optionsets.add(name), async (cur2, todo) => {
+    return flow(ctx, changes, o, url, label, guard(ctx, "global choice"), () => o.publish.optionsets.add(name), async (cur2, todo) => {
       const type = String(cur2["@odata.type"] || `${T}${boolean ? "Boolean" : ""}OptionSetMetadata`).replace("#", "");
       await put2(ctx, `GlobalOptionSetDefinitions(${guid(cur2.MetadataId)})`, { "@odata.type": type, Name: cur2.Name, IsGlobal: true, ...props(cur2, todo) });
     }, "labels", keep((x, p) => x[p], ["DisplayName", "Description"]), "OptionSet");
@@ -14320,7 +16139,7 @@ ${l}`;
       o,
       url,
       label,
-      (cur2, c) => gone(cur2) || guard(global ? "global choice" : "choice column")(cur2, c),
+      (cur2, c) => gone(cur2) || guard(ctx, global ? "global choice" : "choice column")(cur2, c),
       () => global ? o.publish.optionsets.add(r.name) : o.publish.entities.add(r.entity),
       async (cur2, todo) => {
         const op = opt3(cur2);
@@ -14425,15 +16244,15 @@ ${l}`;
     };
   }
   function complete(label, cs) {
-    const all2 = toLabels(label);
-    for (const c of cs) all2[c.lcid] = text2(c);
-    return fromChanges(Object.entries(all2).map(([l, t]) => ({ lcid: Number(l), text: t })));
+    const all = toLabels(label);
+    for (const c of cs) all[c.lcid] = text2(c);
+    return fromChanges(Object.entries(all).map(([l, t]) => ({ lcid: Number(l), text: t })));
   }
   function saveRelationship(ctx, changes, o) {
     const { metadataId: id, type } = changes[0].slot.ref;
     const t = `${T}${type}RelationshipMetadata`;
     const { url, label, menu: menu2 } = relationshipSource(changes);
-    return flow(ctx, changes, o, url, label, guard("relationship"), (cur2) => {
+    return flow(ctx, changes, o, url, label, guard(ctx, "relationship"), (cur2) => {
       for (const e of [cur2.ReferencedEntity, cur2.ReferencingEntity, cur2.Entity1LogicalName, cur2.Entity2LogicalName]) if (e) o.publish.entities.add(e);
     }, async (cur2, todo) => {
       const body = { ...stripAnnotations(cur2), "@odata.type": t };
@@ -14453,7 +16272,7 @@ ${l}`;
   }
   var metadataWriters = [
     { kinds: ["entity"], lane: "metadata", save: saveEntity, read: reader(entitySource) },
-    { kinds: ["attribute"], lane: "metadata", save: saveAttribute, read: reader(attributeSource) },
+    { kinds: ["attribute"], lane: "metadata", save: saveAttribute, read: reader(attributeSource), again: againAttribute },
     { kinds: ["option", "status", "state", "boolean", "globaloption"], lane: "metadata", save: saveOption, read: reader(optionSource) },
     { kinds: ["globaloptionset"], lane: "metadata", save: saveGlobalSet, read: reader(globalSetSource) },
     { kinds: ["relationship"], lane: "metadata", save: saveRelationship, read: reader(relationshipSource) }
@@ -14573,6 +16392,7 @@ ${l}`;
   var isGuid3 = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s);
   var locPath = (ctx, set, id, column2) => ctx.http.fn("RetrieveLocLabels", { EntityMoniker: { "@odata.id": `${set}(${id})` }, AttributeName: column2, IncludeUnpublished: true });
   var locked = (r) => r?.ismanaged === true;
+  var notCustomizable3 = (kind, r) => r?.iscustomizable?.Value === false ? `This ${kind === "customapi" ? "custom API" : KIND_NAMES[kind][0].toLowerCase()} is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.` : "";
   var why = (e) => {
     const m = e?.message || String(e);
     return /0x80071151|Cannot start another/i.test(m) ? "Dataverse is busy with another customization. Your edits are still pending — try Save again in a minute." : m;
@@ -14655,7 +16475,7 @@ ${l}`;
         const url = (extra) => `${d.set}?$select=${d.sel}` + (d.filter || extra ? `&$filter=${[d.filter, extra].filter(Boolean).map((f) => `(${f})`).join(" and ")}` : "");
         try {
           const rows = by ? (await Promise.all(chunks2(by, 20).map((c) => ctx.http.all(url(or(d.ent, c.map(str2))), { signal: o.signal })))).flat() : await ctx.http.all(url(), { signal: o.signal });
-          return rows.filter((r) => (scope.includeReadOnly || !locked(r)) && (!aware || !sol || [d.pk, "appmoduleidunique"].some((k) => sol.has(guid(r[k]))))).map((r) => [kind, r]);
+          return rows.filter((r) => (scope.includeReadOnly || !locked(r) || !!ctx.managedEdits && !notCustomizable3(kind, r)) && (!aware || !sol || [d.pk, "appmoduleidunique"].some((k) => sol.has(guid(r[k]))))).map((r) => [kind, r]);
         } catch (e) {
           if (isAbort(e)) throw e;
           errors.push(`${KIND_NAMES[kind][1]}: ${why(e)}`);
@@ -14699,21 +16519,23 @@ ${l}`;
         path: r.ent ? [tables.get(r.ent) || r.ent] : [],
         sub
       };
-      const lock = locked(row) ? MANAGED : "";
-      return r.props.map(
-        ([prop, column2, max], j) => ({
+      const managed = locked(row);
+      return r.props.map(([prop, column2, max], j) => {
+        const unread = got[j].ok ? "" : `Could not read its translations: ${got[j].error}`;
+        const s = {
           ...base,
           key: slotKey(kind, r.id, prop),
           prop,
           labels: labels2[j],
-          readOnly: lock || (got[j].ok ? "" : `Could not read its translations: ${got[j].error}`),
+          readOnly: (managed ? MANAGED : "") || unread,
           // SetLocLabels is never sent with an empty base-language label, so it can't be cleared here.
           baseRequired: true,
           max,
           order: i * 8 + j,
           ref: { id: r.id, table: r.d.table, entitySet: r.d.set, column: column2, entity: r.ent, type: r.type, managed: !!row.ismanaged, app: guid(row._appmoduleid_value) || void 0 }
-        })
-      );
+        };
+        return managed ? managedSlot(s, ctx.managedEdits, notCustomizable3(kind, row) || unread, MANAGED) : s;
+      });
     });
   }
   async function tableNames2(ctx, entities, signal) {
@@ -14722,7 +16544,7 @@ ${l}`;
       chunks2(entities, 40).map(
         (c) => ctx.http.get(`EntityDefinitions?$select=LogicalName,DisplayName&$filter=${or("LogicalName", c.map(str2))}`, { signal }).then(
           (r) => {
-            for (const e of r.value || []) m.set(e.LogicalName, e.DisplayName?.UserLocalizedLabel?.Label || e.LogicalName);
+            for (const e of r.value || []) m.set(e.LogicalName, pick(toLabels(e.DisplayName), ctx.user, ctx.base) || e.LogicalName);
           },
           (e) => {
             if (isAbort(e)) throw e;
@@ -14861,19 +16683,19 @@ ${l}`;
       const wrote = /* @__PURE__ */ new Set();
       let managedNow;
       const fromManaged = (r) => managedNow ??= ctx.http.get(`${r.entitySet}(${guid(r.id)})?$select=ismanaged`, { signal: o.signal, headers: { Consistency: "Strong" } }).then((x) => x?.ismanaged === true);
-      for (const [slot2, all2] of bySlot) {
+      for (const [slot2, all] of bySlot) {
         const r = slot2.ref;
         if (slot2.readOnly) {
-          put3(all2, "skipped", slot2.readOnly);
+          put3(all, "skipped", slot2.readOnly);
           continue;
         }
-        if (isManaged(slot2)) {
-          put3(all2, "error", MANAGED);
+        if (managedHeld(slot2, ctx.managedEdits)) {
+          put3(all, "error", managedReadOnly(slot2, ctx.managedEdits));
           continue;
         }
-        const cs = all2.filter((c) => c.lcid !== ctx.base || c.after.trim());
+        const cs = all.filter((c) => c.lcid !== ctx.base || c.after.trim());
         put3(
-          all2.filter((c) => !cs.includes(c)),
+          all.filter((c) => !cs.includes(c)),
           "error",
           `The ${lcidName(ctx.base)} text can't be blank: it is the base language.`
         );
@@ -14882,16 +16704,17 @@ ${l}`;
           put3(cs, "skipped", CANCELLED3);
           continue;
         }
-        try {
-          if (await fromManaged(r)) {
-            put3(cs, "error", MANAGED);
+        if (!ctx.managedEdits)
+          try {
+            if (await fromManaged(r)) {
+              put3(cs, "error", MANAGED);
+              continue;
+            }
+          } catch (e) {
+            if (isAbort(e)) put3(cs, "skipped", CANCELLED3);
+            else put3(cs, "error", `Could not read the current text: ${why(e)}`);
             continue;
           }
-        } catch (e) {
-          if (isAbort(e)) put3(cs, "skipped", CANCELLED3);
-          else put3(cs, "error", `Could not read the current text: ${why(e)}`);
-          continue;
-        }
         o.progress(`Saving ${KIND_NAMES[slot2.kind][0].toLowerCase()} “${slot2.title}” › ${PROP_NAMES[slot2.prop]}`);
         for (let i = 0; ; i++) {
           let server;
@@ -15010,7 +16833,7 @@ ${l}`;
     const pages = await Promise.all(
       chunks3.map((c) => ctx.http.all(`EntityDefinitions?$select=LogicalName,DisplayName&$filter=${c.map((e) => `LogicalName eq '${q(e)}'`).join(" or ")}`, { signal }).catch(soft))
     );
-    for (const r of pages.flatMap((p) => p || [])) m.set(r.LogicalName, r.DisplayName?.UserLocalizedLabel?.Label || r.LogicalName);
+    for (const r of pages.flatMap((p) => p || [])) m.set(r.LogicalName, pick(toLabels(r.DisplayName), ctx.user, ctx.base) || r.LogicalName);
     return m;
   }
   async function loadRibbonLabels(ctx, entities, o) {
@@ -15020,8 +16843,8 @@ ${l}`;
     const [diffs, names3] = await Promise.all([readDiffs(ctx, list2, o.signal), tableNames3(ctx, list2.filter((e) => e !== APP), o.signal)]);
     const slots = [];
     for (const [e, m] of diffs)
-      for (const [id, d] of m)
-        slots.push({
+      for (const [id, d] of m) {
+        const s = {
           key: slotKey("ribbon", `${e}|${id}`, "Label"),
           kind: "ribbon",
           prop: "Label",
@@ -15038,7 +16861,9 @@ ${l}`;
           max: 0,
           order: d.order,
           ref: { entity: e, locLabelId: id, managed: d.managed }
-        });
+        };
+        slots.push(d.managed ? managedSlot(s, ctx.managedEdits, MANAGED_RIBBON) : s);
+      }
     return slots;
   }
   var loadRibbonScope = async (ctx, scope, o) => scope.kinds.has("ribbon") ? (await loadRibbonLabels(ctx, [...scope.entities, APP], o)).filter((s) => !s.readOnly || scope.includeReadOnly) : [];
@@ -15083,7 +16908,7 @@ ${l}`;
       const d = server.get(c.slot.ref.locLabelId);
       let r;
       if (!d) r = fail2(c, "This label no longer exists on the server. Reload and try again.");
-      else if (d.managed || isManaged(c.slot)) r = fail2(c, MANAGED);
+      else if (d.managed || isManaged(c.slot)) r = fail2(c, ctx.managedEdits ? MANAGED_RIBBON : MANAGED);
       else if (c.lcid === ctx.base && !c.after.trim()) r = fail2(c, `The ${lcidName(ctx.base)} label can't be blank: it is the base language.`);
       else if (/[\0-\x08\x0b\x0c\x0e-\x1f]/.test(c.after)) r = fail2(c, "The text contains control characters that a command label cannot store. Remove them and save again.");
       else if (!canClear(c.slot) && clears3(ctx.base, c)) r = fail2(c, CANT_CLEAR_TEXT);
@@ -15549,7 +17374,8 @@ ${l}`;
         const note2 = st.busy ? `The temporary solution "${sol.name}" was kept because its import may still be running. Deleting it removes only the solution, not the table or its command bar; the translator also removes it automatically during one of your classic command saves an hour or more from now.` : await deleteSolution(ctx, sol, say) ? "" : `The temporary solution "${sol.name}" could not be deleted. Deleting it removes only the solution, not the table or its command bar: delete it from Solutions in Power Apps, or let the translator remove it automatically during one of your classic command saves an hour or more from now.`;
         await dropStale(ctx).catch(() => {
         });
-        if (note2) results = results.map((r) => ({ ...r, message: r.message ? `${r.message} ${note2}` : note2 }));
+        if (note2 && o.warn) o.warn(note2, "notice");
+        else if (note2) results = results.map((r) => ({ ...r, message: r.message ? `${r.message} ${note2}` : note2 }));
       }
       return results;
     }
@@ -15582,6 +17408,10 @@ ${l}`;
     loadRecords,
     findCommands,
     loadFormXml,
+    pageOwnLabels,
+    knownOwnLabels,
+    loadOwnLabels,
+    carryOwnLabels,
     getForm,
     viewQuery,
     appSitemapId,
@@ -15979,17 +17809,17 @@ ${l}`;
         else openRow(t.dataset.c || "", t);
         return;
       }
-      const all2 = shown3();
-      const i = all2.indexOf(t);
-      const j = e.key === "ArrowDown" ? i + 1 : e.key === "ArrowUp" ? i - 1 : e.key === "Home" ? 0 : e.key === "End" ? all2.length - 1 : null;
+      const all = shown3();
+      const i = all.indexOf(t);
+      const j = e.key === "ArrowDown" ? i + 1 : e.key === "ArrowUp" ? i - 1 : e.key === "Home" ? 0 : e.key === "End" ? all.length - 1 : null;
       if (j === -1 && i === 0 && !e.altKey) {
         e.preventDefault();
         search.focus();
         return;
       }
-      if (j === null || j < 0 || j >= all2.length) return;
+      if (j === null || j < 0 || j >= all.length) return;
       e.preventDefault();
-      focusRow(all2[j]);
+      focusRow(all[j]);
     }
     function group(key, name, n, body) {
       const open = !isShut(key);
@@ -16034,9 +17864,9 @@ ${l}`;
     function render() {
       renderSoon.cancel();
       if (closed) return;
-      const all2 = mode.items();
-      const n = { all: all2.length, todo: 0, changed: 0 };
-      for (const i of all2) {
+      const all = mode.items();
+      const n = { all: all.length, todo: 0, changed: 0 };
+      for (const i of all) {
         if (passes2(i, "todo")) n.todo++;
         if (passes2(i, "changed")) n.changed++;
       }
@@ -16048,7 +17878,7 @@ ${l}`;
       const keepComp = keep2?.dataset.c || "";
       const keepBand = keep2?.dataset.g;
       const keepWhat = keep2?.tagName === "SUMMARY" ? "sum" : keep2?.classList.contains("pl-hm") ? "more" : keep2?.classList.contains("pl-am") ? "away" : "";
-      const pass2 = all2.filter((i) => passes2(i, filter) && (!q2.length || hit(haystack(i), q2)));
+      const pass2 = all.filter((i) => passes2(i, filter) && (!q2.length || hit(haystack(i), q2)));
       const away2 = pass2.filter((i) => i.away);
       const inline = filter === "changed";
       const vis = pass2.filter((i) => (i.visible || inline) && !i.away);
@@ -16096,7 +17926,7 @@ ${l}`;
       if (!vis.length && !hidden.length && !away2.length && !sk) {
         const tl = langName(app, app.prefs.target);
         out.push(
-          all2.length ? filter === "todo" && !q2.length ? emptyState("check", "Nothing left to translate", `Everything on this page is translated into ${tl}.`, [], "ok") : filter === "changed" && !q2.length ? emptyState("edit", "No changes yet", "Labels you change show here until you publish them.") : emptyState("search", "No labels match", "Try another filter or search.") : mode.loading() ? emptyState("list", "No translatable labels found yet", "Labels appear as the page loads.") : emptyState("list", "Nothing to translate here", "Open a record, a list or a dashboard of an app to translate its labels.")
+          all.length ? filter === "todo" && !q2.length ? emptyState("check", "Nothing left to translate", `Everything on this page is translated into ${tl}.`, [], "ok") : filter === "changed" && !q2.length ? emptyState("edit", "No changes yet", "Labels you change show here until you publish them.") : emptyState("search", "No labels match", "Try another filter or search.") : mode.loading() ? emptyState("list", "No translatable labels found yet", "Labels appear as the page loads.") : emptyState("list", "Nothing to translate here", "Open a record, a list or a dashboard of an app to translate its labels.")
         );
       }
       put(listEl, ...out);
@@ -16218,6 +18048,9 @@ ${l}`;
     tooltip(allB, "All labels on this page");
     const wbB = h("button", { class: "btn subtle", type: "button", on: { click: () => o.workbench() } }, icon("table"), h("span", { class: "tb-c1" }, "Workbench"));
     tooltip(wbB, "Every label of a table or solution in a spreadsheet");
+    const selAllB = h("button", { class: "btn subtle", type: "button", hidden: true, on: { click: () => mode.selectAll() } }, "Select all");
+    const dlB = h("button", { class: "btn primary", type: "button", hidden: true, on: { click: () => mode.download() } }, "Download…");
+    const cancelB = h("button", { class: "btn subtle", type: "button", hidden: true, on: { click: () => mode.select(false, true) } }, "Cancel");
     const moreB = ibtn("more", "More options", () => moreMenu(), "subtle");
     moreB.setAttribute("aria-haspopup", "menu");
     const exitB = ibtn("close", "Close the translator", () => o.exit(), "subtle");
@@ -16232,6 +18065,9 @@ ${l}`;
       pubB,
       allB,
       wbB,
+      selAllB,
+      dlB,
+      cancelB,
       moreB,
       exitB
     );
@@ -16248,7 +18084,8 @@ ${l}`;
       o.publish();
     }
     const count2 = () => safe2(() => mode.counts().pending, store.pendingCount());
-    function status(loading, notes, n) {
+    function status(loading, notes, n, selected) {
+      if (selected !== null) return { tone: "", text: selectingText(selected) };
       if (loading) return { tone: "busy", text: "Loading translations…" };
       const retry = notes.find((nt) => nt.action && nt.run);
       if (notes.length) return { tone: "error", text: "Couldn't load some labels.", act: retry ? [retry.action, () => retry.run()] : void 0, tip: notes.map((nt) => nt.text).join("\n") };
@@ -16261,7 +18098,10 @@ ${l}`;
       const loading = safe2(() => mode.loading(), false);
       const notes = safe2(() => mode.notes(), []);
       const pending = count2();
-      const s = status(loading, notes, pending);
+      const selecting = safe2(() => mode.selecting(), false);
+      const s = status(loading, notes, pending, selecting ? safe2(() => mode.selection().length, 0) : null);
+      for (const b of [pubB, allB, wbB, moreB]) b.hidden = selecting;
+      for (const b of [selAllB, dlB, cancelB]) b.hidden = !selecting;
       statusTip = s.tip || "";
       const sk = [s.tone, s.text, s.act?.[0] || ""].join("");
       if (sk !== stKey) {
@@ -16386,7 +18226,20 @@ ${l}`;
       layout2();
     });
     function moreMenu() {
-      menu(moreB, [{ label: "Recent publishes", icon: "history", run: () => o.history() }, ...dynamicsItems(app), "-", { head: `Dynamics Translator ${"1.0.0"}` }], { end: true });
+      menu(
+        moreB,
+        [
+          { label: "Select labels to export", icon: "download", run: () => o.select() },
+          { label: "Recent publishes", icon: "history", run: () => o.history() },
+          ...dynamicsItems(app),
+          "-",
+          { head: "Settings" },
+          app.managedMenuItem(),
+          "-",
+          { head: `Dynamics Translator ${"1.1.0"}` }
+        ],
+        { end: true }
+      );
     }
     const onPrefs = () => {
       syncLang();
@@ -16432,343 +18285,6 @@ ${l}`;
       }
     };
   };
-
-  // src/ui/refresh.ts
-  var verifyKey = (orgId) => `dxt:verify:${orgId}`;
-  var VERIFY_MAX_AGE = 36e5;
-  var KEEP_CACHES = /^(CDN_Resources|clientsdk|WebResources|sw-feature-status)/;
-  var dropKey = (k) => /^(uci-state|Form:|ActualControls\/|UCI_RESOURCE_STRINGS|Microsoft\.Crm\.BusinessProcessClientCache)/.test(k);
-  var SW_PURGE = ["PurgeUserContextGcmCacheEntry", "PurgeUserSettingsCollectionDataCacheEntry", "PurgeGcmCache", "PurgeDataCache", "PurgeMainAspxCache"];
-  var metaStore = (n) => /^(usercontext|entitymetadata|attributemetadata|applicationmetadata|metadataversionstamp|navigationdata|userpersonalization)$/i.test(n) || /^temp/i.test(n);
-  var FRESH_FLAGS = { "FCB.PersistReduxStore": false, "FCB.PersistReduxStoreV2": false };
-  var LABEL_CACHE = /^gcm_\d/;
-  var OWN_HEADER = /^(sec-|user-agent$|cookie$|host$|content-length$|connection$|origin$|referer$)/i;
-  var sameOrigin = (url, origin) => {
-    try {
-      return new URL(url).origin === origin;
-    } catch {
-      return false;
-    }
-  };
-  var sleep5 = (ms) => new Promise((r) => setTimeout(r, ms));
-  var quietly = (fn) => {
-    try {
-      return fn();
-    } catch {
-      return null;
-    }
-  };
-  function pageEnv(win = window) {
-    return {
-      caches: quietly(() => win.caches) ?? null,
-      local: quietly(() => win.localStorage),
-      session: quietly(() => win.sessionStorage),
-      port: () => {
-        const w = win.__uciStatePersistenceWorker;
-        if (w?.port) return w.port;
-        if (typeof SharedWorker === "undefined") return null;
-        return new SharedWorker("/uclient/scripts/statepersistenceworker.js", { name: "uci-state-persistence" }).port;
-      },
-      sw: async () => {
-        const c = win.navigator?.serviceWorker;
-        if (!c) return null;
-        return c.controller ?? (await c.getRegistration())?.active ?? null;
-      },
-      idb: quietly(() => win.indexedDB ? { factory: win.indexedDB, name: win.location.origin } : null),
-      labels: win.caches ? {
-        requests: async () => {
-          const out = [];
-          for (const n of (await win.caches.keys()).filter((k) => LABEL_CACHE.test(k)))
-            for (const r of await (await win.caches.open(n)).keys()) {
-              if (!sameOrigin(r.url, win.location.origin)) continue;
-              const headers = {};
-              r.headers.forEach((v, k) => void (OWN_HEADER.test(k) || (headers[k] = v)));
-              out.push({ url: r.url, headers });
-            }
-          return out;
-        },
-        fetch: (url, init) => win.fetch(url, init)
-      } : null
-    };
-  }
-  async function reprime(labels2, ms) {
-    const rep = { ok: 0, failed: 0, skipped: 0 };
-    const seen = /* @__PURE__ */ new Set();
-    const queue = (await labels2.requests()).filter((r) => !seen.has(r.url) && seen.add(r.url));
-    const end = Date.now() + ms;
-    const one2 = async (r) => {
-      try {
-        const res2 = await labels2.fetch(r.url, { headers: { ...r.headers, "x-ms-sw-skipcache": "1" }, cache: "reload", credentials: "same-origin" });
-        await res2.arrayBuffer();
-        if (res2.ok) rep.ok++;
-        else rep.failed++;
-      } catch {
-        rep.failed++;
-      }
-    };
-    const lane = async () => {
-      for (let r = queue.shift(); r; r = queue.shift()) await one2(r);
-    };
-    await Promise.race([Promise.all(Array.from({ length: 8 }, lane)), sleep5(Math.max(0, end - Date.now()))]);
-    rep.skipped = queue.length;
-    queue.length = 0;
-    return rep;
-  }
-  function clearWorker(port, ms) {
-    return new Promise((resolve) => {
-      const id = "dxt-" + Math.random().toString(36).slice(2, 10);
-      const on = (e) => {
-        const d = e?.data;
-        if (d && d.type === "clearStateResult" && d.requestId === id) done("cleared");
-      };
-      const t = setTimeout(() => done("timeout"), ms);
-      function done(v) {
-        clearTimeout(t);
-        quietly(() => port.removeEventListener("message", on));
-        resolve(v);
-      }
-      port.addEventListener("message", on);
-      port.start?.();
-      port.postMessage({ type: "clearState", requestId: id });
-    });
-  }
-  function clearDb(f, name) {
-    return new Promise((resolve, reject) => {
-      let created = false;
-      const req = f.open(name);
-      req.onupgradeneeded = () => {
-        created = true;
-        quietly(() => req.transaction?.abort());
-      };
-      req.onerror = () => created ? resolve(null) : reject(req.error);
-      req.onsuccess = () => {
-        const db = req.result;
-        const close = () => quietly(() => db.close());
-        const names3 = Array.from(db.objectStoreNames).filter(metaStore);
-        if (!names3.length) {
-          close();
-          return resolve([]);
-        }
-        try {
-          const tx = db.transaction(names3, "readwrite");
-          for (const n of names3) tx.objectStore(n).clear();
-          tx.oncomplete = () => (close(), resolve(names3));
-          tx.onerror = tx.onabort = () => (close(), reject(tx.error));
-        } catch (e) {
-          close();
-          reject(e);
-        }
-      };
-    });
-  }
-  async function purge(env, o = {}) {
-    const rep = { sw: [], caches: [], keys: [], worker: "none", stores: [], idb: "none", session: false, primed: { ok: 0, failed: 0, skipped: 0 } };
-    if (env.labels) {
-      const ms = o.prime ?? 5e3;
-      rep.primed = await Promise.race([reprime(env.labels, ms).catch(() => null), sleep5(ms + 500).then(() => null)]) ?? rep.primed;
-    }
-    const sw = async () => {
-      const w = await env.sw?.();
-      if (!w) return;
-      for (const name of SW_PURGE) if (quietly(() => (w.postMessage({ name }), true))) rep.sw.push(name);
-    };
-    const swDone = sw().catch(() => {
-    });
-    const total = o.total ?? 2500;
-    const local = env.local;
-    if (local)
-      try {
-        const all2 = [];
-        for (let i = 0; i < local.length; i++) {
-          const k = quietly(() => local.key(i));
-          if (k) all2.push(k);
-        }
-        for (const k of all2)
-          if (dropKey(k) && quietly(() => (local.removeItem(k), true))) rep.keys.push(k);
-      } catch {
-      }
-    const caches = async () => {
-      if (!env.caches) return;
-      const names3 = await env.caches.keys();
-      await Promise.all(
-        names3.filter((n) => !KEEP_CACHES.test(n)).map((n) => {
-          rep.caches.push(n);
-          return env.caches.delete(n).catch(() => false);
-        })
-      );
-    };
-    const worker = async () => {
-      const port = env.port?.();
-      if (!port) return;
-      rep.worker = "timeout";
-      rep.worker = await clearWorker(port, o.worker ?? 1e3);
-    };
-    const idb = async () => {
-      const d = env.idb;
-      if (!d) return;
-      rep.idb = "timeout";
-      const got = await clearDb(d.factory, d.name);
-      rep.stores = got ?? [];
-      rep.idb = got ? "cleared" : "none";
-    };
-    const step3 = (p, fail3) => p().catch(() => {
-      fail3?.();
-    });
-    await Promise.race([swDone, sleep5(Math.min(250, total / 4))]);
-    await Promise.race([
-      Promise.all([step3(caches), step3(worker, () => rep.worker = "failed"), step3(idb, () => rep.idb = "failed"), Promise.all([swDone, sleep5(Math.min(o.sw ?? 300, total))])]),
-      sleep5(total)
-    ]);
-    if (env.session)
-      try {
-        env.session.clear();
-        rep.session = true;
-      } catch {
-      }
-    return rep;
-  }
-  function withFlags(href, flags) {
-    const u = new URL(href);
-    const names3 = new Set(Object.keys(flags).map((k) => k.toLowerCase()));
-    const dec = (s) => quietly(() => decodeURIComponent(s.replace(/\+/g, " "))) ?? s;
-    const out = [];
-    const had = [];
-    let at = -1;
-    for (const p of u.search.replace(/^\?/, "").split("&")) {
-      if (!p) continue;
-      const i = p.indexOf("=");
-      if (dec(i < 0 ? p : p.slice(0, i)).toLowerCase() !== "flags") out.push(p);
-      else {
-        if (at < 0) at = out.push("") - 1;
-        had.push(...dec(i < 0 ? "" : p.slice(i + 1)).split(","));
-      }
-    }
-    const all2 = [
-      ...had.map((f) => f.trim()).filter((f) => f && !names3.has(f.split("=")[0].trim().toLowerCase())),
-      ...Object.entries(flags).map(([k, b]) => `${k}=${b}`)
-    ];
-    const param = "flags=" + all2.map((f) => encodeURIComponent(f).replace(/%3D/gi, "=")).join(",");
-    if (at < 0) out.push(param);
-    else out[at] = param;
-    return `${u.origin}${u.pathname}?${out.join("&")}${u.hash}`;
-  }
-  var freshUrl = (href) => quietly(() => /\/main\.aspx$/i.test(new URL(href).pathname)) ? withFlags(href, FRESH_FLAGS) : href;
-  function reloadFresh(loc = location) {
-    const to = quietly(() => freshUrl(loc.href)) ?? loc.href;
-    if (to === loc.href) loc.reload();
-    else loc.replace(to);
-  }
-  function shadowBox(tag, css) {
-    const host = document.createElement(tag);
-    const root = host.attachShadow({ mode: "open" });
-    root.append(Object.assign(document.createElement("style"), { textContent: css }));
-    document.documentElement.append(host);
-    return { host, root };
-  }
-  var STAYED = 8e3;
-  function showNote(text4) {
-    try {
-      const { host, root } = shadowBox(
-        "dxt-refresh-note",
-        'div{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;display:flex;align-items:center;gap:10px;padding:8px 16px;border-radius:6px;background:#242424;color:#fff;font:600 14px/20px "Segoe UI",system-ui,sans-serif;box-shadow:0 8px 16px rgba(0,0,0,.28);pointer-events:none}i{width:14px;height:14px;border-radius:50%;border:2px solid #ffffff55;border-top-color:#fff;animation:r .8s linear infinite}@keyframes r{to{transform:rotate(1turn)}}'
-      );
-      const span = Object.assign(document.createElement("span"), { textContent: text4 });
-      const box = document.createElement("div");
-      box.setAttribute("role", "status");
-      box.append(document.createElement("i"), span);
-      root.append(box);
-      return { set: (t) => void (span.textContent = t), remove: () => host.remove() };
-    } catch {
-      return { set() {
-      }, remove() {
-      } };
-    }
-  }
-  async function refreshNow(o = {}) {
-    let rep = null;
-    try {
-      rep = await purge(o.env ?? pageEnv(), o.purge);
-    } catch {
-    }
-    (o.reload ?? (() => reloadFresh()))();
-    return rep;
-  }
-  async function refreshPage(o) {
-    if (o.pending > 0) {
-      const n = o.pending;
-      const go = await o.confirm({
-        title: "Refresh the page?",
-        body: `You have ${plural(n, "unpublished change")}. Refreshing the page discards ${n === 1 ? "it" : "them"}.`,
-        ok: "Refresh anyway",
-        cancel: "Not now",
-        danger: true
-      });
-      if (!go) return false;
-    }
-    const dirty = recordDirty(o.xrm);
-    if (dirty !== false) {
-      const body = dirty ? "This record has unsaved changes. Refresh anyway and lose them?" : "This record may have unsaved changes. Refresh anyway and lose them?";
-      const go = await o.confirm({ title: "Refresh the page?", body, ok: "Refresh anyway", cancel: "Not now", danger: true });
-      if (!go) {
-        o.toast("Refresh the page later to see your changes.", "info");
-        return false;
-      }
-    }
-    if (o.prepare)
-      try {
-        await o.prepare();
-      } catch (e) {
-        o.toast(e?.message || String(e), "error");
-        return false;
-      }
-    if (!o.teardown()) {
-      o.toast("Saving is in progress. Refresh the page once it has finished.", "warn");
-      return false;
-    }
-    const note2 = (o.note ?? showNote)("Refreshing the page…");
-    await Promise.race([o.restore().catch(() => {
-    }), sleep5(3e3)]);
-    const storage = o.storage === void 0 ? quietly(() => localStorage) : o.storage;
-    try {
-      if (o.items.length) storage?.setItem(verifyKey(o.orgId), JSON.stringify({ at: (o.now ?? Date.now)(), items: o.items }));
-      else storage?.removeItem(verifyKey(o.orgId));
-    } catch {
-    }
-    try {
-      const rep = await refreshNow({ env: o.env, reload: o.reload });
-      if (false) console.log("[translator] refresh", rep);
-    } catch (e) {
-      note2.remove();
-      throw e;
-    }
-    setTimeout(() => note2.remove(), o.stayed ?? STAYED);
-    return true;
-  }
-  async function switchLanguage(o) {
-    const why3 = o.busy();
-    if (why3) {
-      o.toast(why3, "warn");
-      return false;
-    }
-    return refreshPage({
-      ...o,
-      prepare: async () => {
-        o.toast(`Switching Dynamics to ${o.name}…`, "info");
-        await o.adopt();
-      }
-    });
-  }
-  function readVerify(raw, now) {
-    if (!raw) return null;
-    try {
-      const e = JSON.parse(raw);
-      if (!e || !Array.isArray(e.items) || !(now - Number(e.at) < VERIFY_MAX_AGE) || Number(e.at) > now + 6e4) return null;
-      return { at: Number(e.at), items: e.items.filter((i) => i && typeof i.key === "string" && typeof i.text === "string" && Number.isFinite(i.lcid)) };
-    } catch {
-      return null;
-    }
-  }
-  var notShowing = (missing2) => missing2 > 0 ? `${plural(missing2, "change")} ${missing2 === 1 ? "isn't" : "aren't"} showing yet` : "";
 
   // src/ui/review.ts
   var CSS2 = ".pd-sub{margin:-8px 0 0;color:var(--fg3)}.pd-g{border:1px solid var(--s2);border-radius:8px;flex:none}.pd-h{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 6px;padding:8px 12px;background:var(--bg2);border-radius:8px 8px 0 0;font-size:12px;color:var(--fg3)}.pd-h b{font-size:14px;font-weight:600;color:var(--fg1);overflow-wrap:anywhere}.pd-r{display:grid;grid-template-columns:minmax(56px,max-content) minmax(0,1fr) auto;align-items:baseline;gap:2px 12px;padding:8px 12px;border-top:1px solid var(--s3)}.pd-r.is-bad{background:var(--red-bg)}.pd-r.is-amb{background:var(--amber-bg)}.pd-r.is-off .wd{color:var(--fg3)}.pd-r:last-child{border-radius:0 0 8px 8px}.pd-ok{color:var(--green)}.pd-he{border-bottom:1px solid var(--s3)}.pd-he:last-child{border-bottom:0}.pd-he>.hr{border-bottom:0}.pd-hh{flex:1;min-width:0;margin:0;font:inherit}.pd-ht{display:flex;align-items:flex-start;gap:8px;width:100%;padding:0;border:0;background:none;text-align:left;cursor:pointer}.pd-ht>svg{flex:none;margin-top:2px;color:var(--fg3);transition:transform .1s}.pd-ht[aria-expanded=true]>svg{transform:rotate(90deg)}.pd-ht:hover b{text-decoration:underline}.pd-hd{display:flex;flex-direction:column;gap:8px;padding:0 4px 12px 28px}.pd-nu{margin:-4px 0 0;padding:0 4px 12px 28px;font-size:12px;line-height:16px;color:var(--fg3)}@media (prefers-reduced-motion:reduce){.pd-ht>svg{transition:none}}.pd-ul{display:flex;flex-direction:column;gap:12px}.pd-r .chk{font-size:12px}.pd-l{font-size:12px;color:var(--fg3)}.pd-r>.iss,.pd-r>.cf,.pd-r>.pd-n{grid-column:2/4;margin-top:0}.pd-n{font-size:12px;line-height:16px;color:var(--fg3)}.pd-gn{margin-top:-12px}.pd-o{flex:1 1 240px;margin:0;font-size:12px;line-height:16px;color:var(--fg2)}.pd-ow{flex:1 1 240px;display:flex;flex-direction:column;gap:4px;min-width:0}.pd-ow>.pd-o{flex:none}.pd-sc{margin:0;font-size:12px;line-height:16px;color:var(--fg3)}.pd-o .spin{color:var(--brand)}.pd-st{flex:none}.pd-st .spin{color:var(--brand)}.pd-st .pt small{margin-left:8px;font-variant-numeric:tabular-nums}.pd-done{color:var(--fg1)}";
@@ -16914,6 +18430,7 @@ ${l}`;
   var standInNote = (app, s, l, w) => {
     const from = w?.standIn?.from;
     if (!s || !from) return null;
+    if (w.standIn.follow) return rowNote("note", `Shows “${w.after.trim()}”`);
     return rowNote("note", bareText(w.after) === bareText(w.before) ? `Already ${standInWhat(from, l, app.ctx.base)}: nothing changes` : standInTag(s, l, app.ctx.base, from));
   };
   var bareText = (t) => t.trim() ? t : "";
@@ -16956,36 +18473,110 @@ ${l}`;
     for (const r of results) if (r.outcome === "conflict" || (r.outcome === "error" || r.outcome === "skipped") && !refusedBlank(r, app.ctx.base)) ids3.add(changeId(r.change));
     return app.store.changes().filter((c) => ids3.has(changeId(c)) && app.store.cellStatus(c.slot.key, c.lcid)?.outcome !== "conflict");
   }
-  async function publishAgain(app, saved, historyIds, signal, onRetry) {
+  var toldOf = (t) => ({
+    ...t.warning.length ? { warning: t.warning.join(" ") } : {},
+    ...t.notice.length ? { notice: t.notice.join(" ") } : {}
+  });
+  var both = (a, b) => {
+    const t = (k) => [a[k], b[k]].filter(Boolean).join(" ");
+    return { theirs: /* @__PURE__ */ new Set([...a.theirs, ...b.theirs]), ...t("warning") ? { warning: t("warning") } : {}, ...t("notice") ? { notice: t("notice") } : {} };
+  };
+  async function publishAgain(app, saved, historyIds, signal, onRetry, missing2 = [], told = { warning: [], notice: [] }) {
     const set = app.saver.publishTargets(saved);
-    if (!set.empty) await publishXml(app.ctx, set, signal, onRetry);
+    const publish = (s = signal) => set.empty ? Promise.resolve() : app.lang.quiet(() => publishXml(app.ctx, set, s, onRetry), s);
+    const rs = missing2.length ? await app.saver.writeAgain([...missing2], publish, signal ?? new AbortController().signal, (m, level) => void told[level].push(m)) : (await publish(), []);
+    const bad = rs.find((r) => r.outcome === "error" || r.outcome === "skipped");
+    if (bad) throw new Error(bad.message || "A label couldn't be written again.");
     await markPublished(app.ctx, historyIds);
+    return { theirs: new Set(rs.filter((r) => r.outcome === "conflict").map((r) => changeId(r.change))), ...toldOf(told) };
   }
-  async function unpublishedForms(app, saved, signal, wait = 1e3) {
+  async function unpublishedForms(app, saved, signal, wait = 1e3, theirs = /* @__PURE__ */ new Set()) {
+    const { user, base } = app.ctx;
     const forms = /* @__PURE__ */ new Map();
-    for (const { slot: s } of saved) if (FORMISH.test(s.kind) && s.ref?.formId) forms.set(guid(s.ref.formId), s.path[1] || "A form");
-    const differs = async (id) => {
-      const [pub, un] = await Promise.all([
-        app.ctx.http.get(`systemforms(${id})?$select=versionnumber`, { signal }),
-        app.ctx.http.get(`systemforms(${id})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=versionnumber`, { signal })
-      ]);
+    const labels2 = /* @__PURE__ */ new Map();
+    const cols = /* @__PURE__ */ new Map();
+    for (const c of saved) {
+      const s = c.slot;
+      if (s.kind === "attribute" && s.ref?.entity && s.ref.attribute && !theirs.has(changeId(c))) {
+        const k = `${s.ref.entity}|${s.ref.attribute}`;
+        (cols.get(k) ?? cols.set(k, []).get(k)).push(c);
+      }
+      if (!FORMISH.test(s.kind) || !s.ref?.formId) continue;
+      const id = guid(s.ref.formId);
+      forms.set(id, s.path[1] || "A form");
+      if (s.kind === "field" && c.lcid === user && s.ref.elId && columnKey(s) && !theirs.has(changeId(c))) (labels2.get(id) ?? labels2.set(id, []).get(id)).push(c);
+    }
+    const shows3 = (c, t) => (t ?? "") === (c.after.trim() ? c.after : "");
+    const read2 = async (id) => {
+      const [pub, un] = await app.lang.quiet(
+        () => Promise.all([
+          app.ctx.http.get(`systemforms(${id})?$select=formxml,versionnumber`, { signal }),
+          app.ctx.http.get(`systemforms(${id})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=versionnumber`, { signal })
+        ]),
+        signal
+      );
       if (pub?.versionnumber == null || un?.versionnumber == null) throw new Error("No version number.");
-      return String(pub.versionnumber) !== String(un.versionnumber);
+      if (String(pub.versionnumber) !== String(un.versionnumber)) return null;
+      const ls = labels2.get(id) ?? [];
+      if (!ls.length) return { v: String(pub.versionnumber), off: [] };
+      const cells = cellLabels(pub.formxml);
+      if (!cells) throw new Error("No form definition.");
+      return { v: String(pub.versionnumber), off: ls.filter((c) => cells.has(c.slot.ref.elId) && !shows3(c, cells.get(c.slot.ref.elId)[user])) };
+    };
+    const column2 = async (cs) => {
+      const got = await columnLabels(app.ctx, cs[0].slot.ref.entity, cs[0].slot.ref.attribute, signal);
+      return cs.filter((c) => !showsWritten(got[c.slot.prop] ?? {}, c, base));
+    };
+    const twice = async (get, done) => {
+      try {
+        const r = await get();
+        if (done(r)) return r;
+        await sleep6(wait);
+        return await get();
+      } catch {
+        return "unread";
+      }
     };
     const ids3 = [...forms.keys()];
-    const found = await Promise.all(
-      ids3.map(async (id) => {
-        try {
-          if (!await differs(id)) return "ok";
-          await sleep6(wait);
-          return await differs(id) ? "left" : "ok";
-        } catch {
-          return "unread";
-        }
-      })
-    );
-    const named5 = (x) => [...new Set(ids3.filter((_, i) => found[i] === x).map((id) => forms.get(id)))];
-    return { left: named5("left"), unread: named5("unread") };
+    const keys = [...cols.keys()];
+    const [found, served] = await Promise.all([
+      Promise.all(ids3.map((id) => twice(() => read2(id), (r) => !!r && !r.off.length))),
+      Promise.all(keys.map((k) => twice(() => column2(cols.get(k)), (off) => !off.length)))
+    ]);
+    const named5 = (x) => [...new Set(ids3.filter((_, i) => x(found[i])).map((id) => forms.get(id)))];
+    const tables = (x) => keys.filter((_, i) => x(served[i])).map((k) => `${tableName2(app, cols.get(k)[0].slot.ref.entity)} (table)`);
+    const left = (r) => r === null || r !== "unread" && r.off.length > 0;
+    return {
+      left: [.../* @__PURE__ */ new Set([...named5(left), ...tables((r) => r !== "unread" && r.length > 0)])],
+      unread: [.../* @__PURE__ */ new Set([...named5((r) => r === "unread"), ...tables((r) => r === "unread")])],
+      missing: [...found.flatMap((r) => r && r !== "unread" ? r.off : []), ...served.flatMap((r) => r === "unread" ? [] : r)],
+      published: new Map(ids3.flatMap((id, i) => {
+        const r = found[i];
+        return r && r !== "unread" && !r.off.length ? [[id, r.v]] : [];
+      }))
+    };
+  }
+  function keepOwnLabels(app, rep, published) {
+    for (const [id, w] of rep.forms ?? []) {
+      const v = published.get(guid(id));
+      if (!v || w.pending || !w.sent) continue;
+      if (rep.results.some((r) => guid(r.change.slot.ref?.formId) === guid(id) && r.outcome !== "saved" && r.outcome !== "unchanged")) continue;
+      const at = [...app.store.slots.values()].find((s) => s.ref?.formVersion && guid(s.ref.formId) === guid(id))?.ref.formVersion;
+      if (at === w.version) app.providers.carryOwnLabels(app.ctx, id, w.version, v, [...w.cells.values()]);
+    }
+  }
+  async function checkRepaired(app, saved, historyIds, signal, steps, theirs = /* @__PURE__ */ new Set()) {
+    const found = await unpublishedForms(app, saved, signal, void 0, theirs);
+    if (!found.left.length) return { found, repaired: false, said: { theirs: /* @__PURE__ */ new Set() }, error: "" };
+    steps.repair();
+    const told = { warning: [], notice: [] };
+    try {
+      const said = await publishAgain(app, saved.filter((c) => FORMISH.test(c.slot.kind) || c.slot.kind === "attribute"), historyIds, signal, steps.now, found.missing, told);
+      steps.check();
+      return { found: await unpublishedForms(app, saved, signal, void 0, /* @__PURE__ */ new Set([...theirs, ...said.theirs])), repaired: true, said, error: "" };
+    } catch (e) {
+      return { found, repaired: true, said: { theirs: /* @__PURE__ */ new Set(), ...toldOf(told) }, error: pubFail(e) };
+    }
   }
   function publishNames(app, cs, t) {
     const names3 = /* @__PURE__ */ new Set();
@@ -17204,12 +18795,16 @@ ${l}`;
       /** Saved but not published yet (the publish failed, or the forms check found them unpublished), and their journal entries. */
       needPub: [],
       needHist: [],
+      /** Those of them the forms check found missing from the published form while its versions agree, or not served as saved by their column: written again (publishAgain). */
+      stuck: [],
       /** Something was published (the page needs a refresh to show it). */
       published: false,
+      /** The check after a publish wrote or published again what a form or column didn't serve (checkRepaired): never "nothing was written". */
+      repaired: false,
       /** Rows that failed or conflicted. */
       probs: [],
       pubErr: "",
-      /** Published, but the forms check couldn't read some forms: not known to be published (they are in needPub). */
+      /** Published, but the forms check couldn't read some forms or columns: not known to be published (they are in needPub). */
       chkErr: "",
       warning: "",
       /** Saved, but the page may not show it yet (a process could not be updated): said, never tried again. */
@@ -17234,6 +18829,20 @@ ${l}`;
         else if (dlg.isConnected && !dlg.contains(active(dlg))) dlg.focus();
       };
       const blockedWhy2 = /* @__PURE__ */ new Map();
+      const undoAll = async (b, e) => {
+        if (e.detail > 1 || st.busy) return;
+        const go = await confirm2({
+          title: "Undo all changes?",
+          body: `All ${plural(store.changes(filter).length, "change")} in this list go back to the text they had before. Nothing is published. Ctrl+Z brings them back.`,
+          ok: "Undo all",
+          cancel: "Not now",
+          danger: true
+        });
+        if (!go || st.busy || !dlg.isConnected) return keepFocus(b.isConnected ? b : void 0);
+        const all = store.changes(filter);
+        store.group(() => all.forEach((c) => store.revert(c.slot.key, c.lcid)));
+        render();
+      };
       const render = (at = -1) => {
         st.ac.abort();
         st.ac = new AbortController();
@@ -17260,7 +18869,8 @@ ${l}`;
           return {
             lang: ln,
             before: c.before,
-            after: w.after,
+            // The field's last label of its own emptied: empty, as typed; its note says what shows (standInNote).
+            after: w.standIn?.follow ? "" : w.after,
             blankBefore: missingSide(app, c, w),
             tone: why3 !== void 0 ? "bad" : "",
             end: undo,
@@ -17280,19 +18890,20 @@ ${l}`;
         const gs = mergeCopies(grouped(changes, isBad), clean);
         const rows = (cg) => cg.length === 1 ? cg[0].map(row) : cg[0].map((c, i) => {
           const same4 = cg.map((g) => g.find((x) => x.lcid === c.lcid && x.after === c.after) ?? g[i]);
-          const all2 = link("Undo", (e) => {
+          const all = link("Undo", (e) => {
             if (e.detail > 1) return;
             store.group(() => same4.forEach((x) => store.revert(x.slot.key, x.lcid)));
-            render(undos().indexOf(all2));
+            render(undos().indexOf(all));
           });
-          all2.dataset.u = "";
-          all2.setAttribute("aria-label", `Undo the ${langName(app, c.lcid)} change of ${titleOf(app, c.slot)} in its ${cg.length} places`);
-          return { ...row(c), end: all2 };
+          all.dataset.u = "";
+          all.setAttribute("aria-label", `Undo the ${langName(app, c.lcid)} change of ${titleOf(app, c.slot)} in its ${cg.length} places`);
+          return { ...row(c), end: all };
         });
         const rest2 = gs.slice(CAP).reduce((a, cg) => a + cg.reduce((b, g) => b + g.length, 0), 0);
+        const may = app.ctx.customizer !== false;
         const others = h("p", { class: "pd-o", role: "status", hidden: true });
-        const scope = plan.send.length ? scopeText(app, plan.send) : "";
-        const checked2 = plan.send.length ? othersNote(app, plan.send, signal) : Promise.resolve("");
+        const scope = may && plan.send.length ? scopeText(app, plan.send) : "";
+        const checked2 = may && plan.send.length ? othersNote(app, plan.send, signal) : Promise.resolve("");
         let said = null;
         void checked2.then((t) => {
           if (signal.aborted) return;
@@ -17305,8 +18916,9 @@ ${l}`;
           for (const [id, m] of plan.blocked) blockedWhy2.set(id, m);
           void run(plan.send);
         };
-        const cancel = btn("Cancel", () => close());
-        const pub = btn("Publish", (e) => {
+        const cancel = may ? btn("Cancel", () => close()) : btn("Close", () => close(), "primary");
+        const undoB = changes.length > 1 ? btn("Undo all", (e) => void undoAll(undoB, e)) : null;
+        const pub = may ? btn("Publish", (e) => {
           if (e.detail > 1 || waiting) return;
           if (said !== null) return go();
           waiting = true;
@@ -17316,41 +18928,45 @@ ${l}`;
             waiting = false;
             if (!signal.aborted && said === "") go();
           });
-        }, "primary");
-        pub.setAttribute("aria-keyshortcuts", "Control+Enter");
-        pub.disabled = !plan.send.length;
-        (pub.disabled ? cancel : pub).dataset.af = "";
+        }, "primary") : null;
+        if (pub) {
+          pub.setAttribute("aria-keyshortcuts", "Control+Enter");
+          pub.disabled = !plan.send.length;
+        }
+        (pub && !pub.disabled ? pub : cancel).dataset.af = "";
         ctrlEnter = pub;
         const top = ui.querySelector(".dlg-body")?.scrollTop ?? 0;
+        const mg = may ? plan.send.filter((c) => isManaged(c.slot)).length : 0;
         put(
           ui,
           h(
             "div",
             { class: "dlg-body" },
-            h("p", { class: "pd-sub" }, page ? "They're saved and published, then the page refreshes so you see them." : "They're saved and published."),
+            may ? h("p", { class: "pd-sub" }, page ? "They're saved and published, then the page refreshes so you see them." : "They're saved and published.") : note("warn", NOT_CUSTOMIZER, "amb"),
+            mg ? note("warn", mg === 1 ? "1 change is to a label from a managed solution: it adds an unmanaged layer on top of its solution." : `${mg} changes are to labels from managed solutions: each adds an unmanaged layer on top of its solution.`, "amb") : null,
             plan.notes.length ? h("div", { class: "pd-gn" }, plan.notes.map((n) => h("div", { class: "iss note" }, icon("info"), h("span", null, n)))) : null,
             gs.slice(0, CAP).map((cg) => changeGroup({ ...header(app, cg), rows: rows(cg) })),
-            rest2 ? h("p", { class: "quiet" }, `and ${plural(rest2, "more change")}. They're published too.`) : null
+            rest2 ? h("p", { class: "quiet" }, may ? `and ${plural(rest2, "more change")}. They're published too.` : `and ${plural(rest2, "more change")}.`) : null
           ),
-          h("div", { class: "dlg-actions" }, h("div", { class: "pd-ow" }, others, scope ? h("p", { class: "pd-sc" }, scope) : null), cancel, pub)
+          h("div", { class: "dlg-actions" }, may ? h("div", { class: "pd-ow" }, others, scope ? h("p", { class: "pd-sc" }, scope) : null) : null, undoB, cancel, pub)
         );
         const body = ui.querySelector(".dlg-body");
         if (body) body.scrollTop = top;
         const us3 = at < 0 ? [] : undos();
         keepFocus(us3[Math.min(at, us3.length - 1)]);
       };
-      const progress = (save, pubSet) => {
+      const progress = (save2, pubSet) => {
         let t = new PublishSet();
         try {
           t = app.saver.publishTargets(pubSet);
-          t.processes = save ? app.saver.publishTargets(save).processes : /* @__PURE__ */ new Map();
+          t.processes = save2 ? app.saver.publishTargets(save2).processes : /* @__PURE__ */ new Map();
         } catch {
         }
         const live = h("div", { class: "vh", "aria-live": "polite" });
         const p = {
           list: h("div", { class: "pl pd-st" }),
           live,
-          save: save ? step2(`Saving ${plural(save.length, "change")}`, live) : null,
+          save: save2 ? step2(`Saving ${plural(save2.length, "change")}`, live) : null,
           pub: t.empty && !t.processes.size ? null : step2(`Publishing ${publishNames(app, pubSet, t)}`, live),
           chk: step2("Checking", live),
           ref: page ? step2("Refreshing the page", live) : null
@@ -17368,32 +18984,59 @@ ${l}`;
         keepFocus();
       };
       const republish = async (p, signal) => {
-        if (!S2.needPub.length) return;
+        if (!S2.needPub.length) return /* @__PURE__ */ new Set();
         S2.chkErr = "";
         p.pub?.set("run");
+        const told = { warning: [], notice: [] };
         try {
-          await publishAgain(app, S2.needPub, S2.needHist, signal, (m) => p.pub?.now(m));
+          const r = await publishAgain(app, S2.needPub, S2.needHist, signal, (m) => p.pub?.now(m), S2.stuck, told);
           S2.published = true;
           S2.needPub = [];
           S2.needHist = [];
+          S2.stuck = [];
           S2.pubErr = "";
+          if (r.warning) S2.warning = [S2.warning, r.warning].filter(Boolean).join(" ");
+          if (r.notice) S2.notice = [S2.notice, r.notice].filter(Boolean).join(" ");
           if (last) last = { ...last, published: true, publishError: void 0 };
+          return r.theirs;
         } catch (e) {
           S2.pubErr = pubFail(e);
+          const t = toldOf(told);
+          if (t.warning) S2.warning = [S2.warning, t.warning].filter(Boolean).join(" ");
+          if (t.notice) S2.notice = [S2.notice, t.notice].filter(Boolean).join(" ");
+          return /* @__PURE__ */ new Set();
         }
       };
-      const check2 = async (p, cs, ids3, signal) => {
+      const check2 = async (p, cs, ids3, signal, o = {}) => {
         p.chk.set("run");
-        const { left: left2, unread } = await unpublishedForms(app, cs, signal);
-        if (left2.length) S2.pubErr = `${and2(left2)} still ${left2.length === 1 ? "has" : "have"} unpublished changes.`;
+        const steps = {
+          repair: () => {
+            p.chk.set("wait");
+            p.pub?.set("run");
+          },
+          now: (m) => p.pub?.now(m),
+          check: () => {
+            p.pub?.set("ok");
+            p.chk.set("run");
+          }
+        };
+        const { found, repaired, said, error } = o.repair ? await checkRepaired(app, cs, ids3, signal, steps, o.theirs) : { found: await unpublishedForms(app, cs, signal, void 0, o.theirs), repaired: false, said: { theirs: /* @__PURE__ */ new Set() }, error: "" };
+        const { left: left2, unread, missing: missing2, published } = found;
+        if (repaired) S2.repaired = true;
+        if (repaired && !error) S2.published = true;
+        if (said.warning) S2.warning = [S2.warning, said.warning].filter(Boolean).join(" ");
+        if (said.notice) S2.notice = [S2.notice, said.notice].filter(Boolean).join(" ");
+        if (left2.length) S2.pubErr = error || `${and2(left2)} still ${left2.length === 1 ? "has" : "have"} unpublished changes.`;
         if (unread.length) S2.chkErr = unreadText(unread, "Publish again to publish");
         if (left2.length || unread.length) {
-          S2.needPub.push(...cs.filter((c) => FORMISH.test(c.slot.kind)));
+          S2.needPub.push(...cs.filter((c) => FORMISH.test(c.slot.kind) || c.slot.kind === "attribute"));
           S2.needHist.push(...ids3);
+          S2.stuck.push(...missing2);
           await markPublished(app.ctx, ids3, false);
           if (left2.length) p.pub?.set("bad");
           p.chk.set("bad");
         } else p.chk.set("ok");
+        if (o.rep && !repaired) keepOwnLabels(app, o.rep, published);
       };
       const run = async (cs) => {
         if (store.busy) return app.toast("Publishing can start once the save running now has finished. Try again in a moment.", "warn");
@@ -17449,14 +19092,20 @@ ${l}`;
           S2.needHist.push(...hist2);
           p.pub?.set("bad");
         } else {
-          if (rep?.published && doneNow.length) S2.published = true;
-          const prev = { cs: S2.needPub, ids: S2.needHist };
-          if (!ac.signal.aborted) await republish(p, ac.signal);
-          const repub = S2.needPub.length ? { cs: [], ids: [] } : prev;
-          if (S2.pubErr) p.pub?.set("bad");
-          else if (S2.published) p.pub?.set("ok");
-          if (!S2.pubErr && (doneNow.length || repub.cs.length)) await check2(p, [...doneNow, ...repub.cs], [...hist2, ...repub.ids], ac.signal);
-          else if (!S2.pubErr && !bad.length) p.chk.set("ok");
+          const held = !store.busy;
+          if (held) store.setBusy(true, "Publishing");
+          try {
+            if (rep?.published && doneNow.length) S2.published = true;
+            const prev = { cs: S2.needPub, ids: S2.needHist };
+            const theirs = ac.signal.aborted ? void 0 : await republish(p, ac.signal);
+            const repub = S2.needPub.length ? { cs: [], ids: [] } : prev;
+            if (S2.pubErr) p.pub?.set("bad");
+            else if (S2.published) p.pub?.set("ok");
+            if (!S2.pubErr && (doneNow.length || repub.cs.length)) await check2(p, [...doneNow, ...repub.cs], [...hist2, ...repub.ids], ac.signal, { theirs, rep: rep ?? void 0, repair: true });
+            else if (!S2.pubErr && !bad.length) p.chk.set("ok");
+          } finally {
+            if (held) store.setBusy(false);
+          }
         }
         busy(false);
         void settle4(p);
@@ -17472,14 +19121,14 @@ ${l}`;
         showProgress(p, null);
         store.setBusy(true, "Publishing");
         try {
-          await republish(p, ac.signal);
+          const theirs = await republish(p, ac.signal);
+          if (S2.pubErr) p.pub?.set("bad");
+          else {
+            p.pub?.set("ok");
+            await check2(p, cs, ids3, ac.signal, { theirs });
+          }
         } finally {
           store.setBusy(false);
-        }
-        if (S2.pubErr) p.pub?.set("bad");
-        else {
-          p.pub?.set("ok");
-          await check2(p, cs, ids3, ac.signal);
         }
         busy(false);
         void settle4(p);
@@ -17494,7 +19143,7 @@ ${l}`;
         const f = Math.min(S2.found, S2.saved.length);
         const n = S2.saved.length - f;
         const already = f ? `${plural(f, "change")} ${f === 1 ? "was" : "were"} already on the server` : "";
-        const said = n ? `Done. Published ${plural(n, "change")}.${already ? ` ${already}, so Undo of this publish leaves ${f === 1 ? "it" : "them"} alone.` : ""}` : already ? `Done. ${already}: nothing was written.` : "Done. Nothing needed publishing.";
+        const said = n ? `Done. Published ${plural(n, "change")}.${already ? ` ${already}, so Undo of this publish leaves ${f === 1 ? "it" : "them"} alone.` : ""}` : already ? `Done. ${already}${S2.repaired ? "." : ": nothing was written."}` : "Done. Nothing needed publishing.";
         if (page && S2.published && auto) {
           h3.textContent = "Published";
           p.ref?.set("run");
@@ -17536,7 +19185,7 @@ ${l}`;
           return {
             lang: langName(app, c.lcid),
             before: c.before,
-            after: w.after,
+            after: w.standIn?.follow ? "" : w.after,
             blankBefore: missingSide(app, c, w),
             tone: conflict || msg ? "bad" : "",
             // A failed metadata row: what this page sent and Dataverse answered for its component, for support.
@@ -17778,6 +19427,25 @@ ${l}`;
             }
           }
         });
+        const cs = rep.published && !rep.publishError ? rep.results.filter((r) => r.outcome === "saved" || r.outcome === "unchanged").map((r) => r.change) : [];
+        if (cs.length) {
+          const ids3 = rep.historyId ? [rep.historyId] : [];
+          const held = !app.store.busy;
+          if (held) app.store.setBusy(true, "Publishing");
+          try {
+            pub.set("run");
+            const steps = { repair: () => pub.set("run"), now: (m) => pub.now(m), check: () => pub.set("run") };
+            const { found, said, error } = await checkRepaired(app, cs, ids3, ac.signal, steps);
+            const { left, unread } = found;
+            const problem4 = error ? `Publishing failed: ${error}` : [left.length ? `${and2(left)} still ${left.length === 1 ? "has" : "have"} unpublished changes.` : "", unread.length ? unreadText(unread, "Publish") : ""].filter(Boolean).join(" ");
+            if (problem4) await markPublished(app.ctx, ids3, false);
+            pub.set(problem4 ? "bad" : "ok");
+            const join = (a, b) => [a, b].filter(Boolean).join(" ") || void 0;
+            rep = { ...rep, ...problem4 ? { publishError: problem4 } : {}, warning: join(rep.warning, said.warning), notice: join(rep.notice, said.notice) };
+          } finally {
+            if (held) app.store.setBusy(false);
+          }
+        }
       } catch (e) {
         err = e;
       } finally {
@@ -18055,19 +19723,30 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       dlg.focus();
       pub.set("run");
       let err = "";
-      let found = { left: [], unread: [] };
+      let found = { left: [], unread: [], missing: [], published: /* @__PURE__ */ new Map() };
+      let said = { theirs: /* @__PURE__ */ new Set() };
+      const told = { warning: [], notice: [] };
+      let back = false;
       app.store.setBusy(true, "Publishing");
       try {
-        await publishAgain(app, cs, [e.id], ac.signal, (m) => pub.now(m));
+        const { missing: missing2 } = await unpublishedForms(app, cs, ac.signal, 0);
+        said = await publishAgain(app, cs, [e.id], ac.signal, (m) => pub.now(m), missing2, told);
+        back = true;
         pub.set("ok");
         chk.set("run");
-        found = await unpublishedForms(app, cs, ac.signal);
-        const stays2 = found.left.length + found.unread.length > 0;
+        const steps = { repair: () => (chk.set("wait"), pub.set("run")), now: (m) => pub.now(m), check: () => (pub.set("ok"), chk.set("run")) };
+        const r = await checkRepaired(app, cs, [e.id], ac.signal, steps, said.theirs);
+        found = r.found;
+        said = both(said, r.said);
+        err = r.error;
+        if (err) pub.set("bad");
+        const stays2 = !!err || found.left.length + found.unread.length > 0;
         if (stays2) await markPublished(app.ctx, [e.id], false);
         chk.set(stays2 ? "bad" : "ok");
       } catch (x) {
         err = pubFail(x);
         pub.set("bad");
+        if (!back) said = { ...said, ...toldOf(told) };
       } finally {
         app.store.setBusy(false);
         busy(false);
@@ -18084,7 +19763,10 @@ ${byId.get(itemId(it))?.now ?? ""}`);
           "div",
           { class: "dlg-body" },
           list2,
-          ok ? h("p", { class: "pd-done", role: "status" }, "Done. Refresh the page to see the changes.") : note("warn", problem4, "amb")
+          ok ? h("p", { class: "pd-done", role: "status" }, "Done. Refresh the page to see the changes.") : note("warn", problem4, "amb"),
+          // What the labels written again told (publishAgain), as the Publish dialog says a save's.
+          said.warning ? note("error", said.warning, "bad") : null,
+          said.notice ? note("warn", said.notice, "amb") : null
         ),
         h("div", { class: "dlg-actions" }, tryB, ok ? btn("Refresh page", () => void app.refreshPage()) : null, closeB)
       );
@@ -18132,17 +19814,18 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         ];
       };
       const uid2 = "pd" + Math.random().toString(36).slice(2, 8);
+      const may = app.ctx.customizer !== false;
       const row = (e, i) => {
         const at = when(e.at);
         const titles = [...new Set(e.items.map((x) => x.title))];
         const fixed = namings(e.items, app.ctx.base);
         const only = fixed.size > 0 && e.items.every((it) => fixed.has(itemId(it)));
-        const undo = only ? null : btn("Undo", () => void R.undoEntry(e), "sm");
+        const undo = only || !may ? null : btn("Undo", () => void R.undoEntry(e), "sm");
         if (undo) {
           undo.disabled = !!e.undoneAt || !e.items.length;
           undo.setAttribute("aria-label", `Undo the publish of ${at}`);
         }
-        const pub = !e.undoneAt && !e.published && e.items.length ? btn("Publish", () => void R.publishEntry(e), "sm") : null;
+        const pub = may && !e.undoneAt && !e.published && e.items.length ? btn("Publish", () => void R.publishEntry(e), "sm") : null;
         if (pub) pub.setAttribute("aria-label", `Publish the ${plural(e.items.length, "label")} saved ${at}`);
         const panel = h("div", { class: "pd-hd", id: `${uid2}-${i}`, role: "region", "aria-label": `What the publish of ${at} changed`, hidden: true });
         const open = h(
@@ -18167,7 +19850,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       };
       put(
         ui,
-        h("div", { class: "dlg-body" }, list2.length ? list2.map(row) : emptyState("history", "No publishes yet", "What you publish with the translator in this environment is listed here, so you can see it and undo it.")),
+        h("div", { class: "dlg-body" }, may ? null : note("warn", NOT_CUSTOMIZER, "amb"), list2.length ? list2.map(row) : emptyState("history", "No publishes yet", "What you publish with the translator in this environment is listed here, so you can see it and undo it.")),
         h("div", { class: "dlg-actions" }, btn("Close", () => close(), "primary"))
       );
       return ui;
@@ -18400,7 +20083,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
   }
 
   // src/ui/styles.css
-  var styles_default = `:host{all:initial}*{box-sizing:border-box}[hidden]{display:none!important}.app{--brand:#0f6cbd;--brand-h:#115ea3;--brand-p:#0f548c;--brand-bg:#ebf3fc;--brand-bg2:#dcebfb;--brand-s:#b4d6fa;--fg1:#242424;--fg2:#424242;--fg3:#616161;--fg4:#707070;--bg1:#fff;--bg2:#fafafa;--bg3:#f5f5f5;--bg4:#ebebeb;--s1:#d1d1d1;--s2:#e0e0e0;--s3:#f0f0f0;--red:#c50f1f;--red-h:#a80d1a;--red-bg:#fdf3f4;--red-s:#eeacb2;--green:#0e700e;--green-bg:#f1faf1;--green-s:#9fd89f;--amber:#8a3707;--amber-bg:#fff9f5;--amber-s:#fdcfb4;--sh8:0 0 2px rgba(0,0,0,.12),0 8px 16px rgba(0,0,0,.14);--sh64:0 0 2px rgba(0,0,0,.12),0 32px 64px rgba(0,0,0,.24);--mono:"Cascadia Mono",Consolas,monospace;--ease:cubic-bezier(.1,.9,.2,1);position:fixed;inset:0;pointer-events:none;font:14px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;color:var(--fg1);text-align:left;-webkit-font-smoothing:antialiased;animation:fade .15s ease-out}@keyframes fade{0%{opacity:0}}@keyframes rise{0%{opacity:0;transform:translateY(10px)}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes shimmer{0%{background-position:100% 0}to{background-position:-100% 0}}@keyframes toastOut{to{opacity:0;transform:translateY(8px)}}@keyframes slideIn{0%{opacity:0;transform:translate(24px)}}@keyframes fadeOut{to{opacity:0}}@keyframes ind{0%{transform:translate(-100%)}to{transform:translate(340%)}}button{font:inherit;color:inherit}:focus-visible{outline:2px solid #000;outline-offset:1px}.spacer{flex:1}.quiet{color:var(--fg3)}.vh{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.win{position:absolute;z-index:1;pointer-events:auto;display:flex}.panel{flex:1;min-width:0;background:var(--bg1);border-radius:8px;box-shadow:var(--sh64);display:flex;flex-direction:column;overflow:hidden;position:relative;z-index:0;container-type:inline-size;outline:0;animation:rise .22s var(--ease)}.win.max .panel,.win.dock .panel{border-radius:0}.win.dock .panel{box-shadow:0 0 2px #0000001f,-12px 0 40px #00000029;animation:slideIn .22s var(--ease)}.rz{position:absolute;z-index:1}.win.max .rz,.win.dock .rz:not(.w){display:none}.rz.n,.rz.s{left:14px;right:14px;height:8px;cursor:ns-resize}.rz.n{top:-6px}.rz.s{bottom:-6px}.rz.e,.rz.w{top:14px;bottom:14px;width:8px;cursor:ew-resize}.rz.e{right:-6px}.rz.w{left:-6px}.win.dock .rz.w{top:0;bottom:0;left:-4px}.rz.ne,.rz.nw,.rz.se,.rz.sw{width:18px;height:18px}.rz.ne{top:-6px;right:-6px;cursor:nesw-resize}.rz.sw{bottom:-6px;left:-6px;cursor:nesw-resize}.rz.nw{top:-6px;left:-6px;cursor:nwse-resize}.rz.se{bottom:-6px;right:-6px;cursor:nwse-resize}.app.moving,.app.sizing{pointer-events:auto}.app.moving .panel,.app.sizing .panel{-webkit-user-select:none;user-select:none}.top{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;height:56px;min-width:0;padding:0 8px 0 16px;border-bottom:1px solid var(--s2);flex:none;overflow:hidden;cursor:move;-webkit-user-select:none;user-select:none}.top button{cursor:pointer}.top h1{font-size:16px;line-height:22px;font-weight:600;margin:0;white-space:nowrap;flex:none}.top .spacer{min-width:0}.tnav{display:flex;align-items:center;gap:8px;flex:0 1 auto;min-width:0;overflow:hidden}.tbtns{display:flex;align-items:center;gap:2px;flex:none}.logo{width:28px;height:28px;border-radius:6px;background:var(--brand);color:#fff;display:grid;place-items:center;flex:none}.top .orgb{flex:0 1 auto;min-width:40px;max-width:220px;gap:6px;overflow:hidden;cursor:default}.orgb .bt{min-width:0;overflow:hidden;text-overflow:ellipsis}.orgb .dot{display:none;width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}.top .langbtn{gap:4px;padding:0 8px;min-width:0;flex:0 1 auto;font-weight:600}.top .btn.langbtn{color:var(--fg1)}.langbtn svg{color:var(--fg3);flex:none}.langbtn .ln{min-width:0;overflow:hidden;text-overflow:ellipsis}.langbtn .ls,.langbtn .lt{display:none;min-width:0;overflow:hidden;text-overflow:ellipsis}.btn.icon[aria-pressed=true]{background:var(--brand-bg);color:var(--brand)}@container (max-width:669px){.langbtn .ln{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.langbtn .ls{display:inline}.top .orgb{max-width:160px}}@container (max-width:599px){.top h1{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0)}}@container (max-width:519px){.top .orgb{flex:none;min-width:0;width:20px;padding:0;justify-content:center}.orgb .bt{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.orgb .dot{display:block}}@container (max-width:399px){.top{gap:6px;padding:0 4px 0 12px}.langbtn>svg:first-child{display:none}}@container (max-width:359px){.langbtn .ls{display:none}.langbtn .lt{display:inline}}@container (max-width:319px){.top{padding:0 4px 0 10px}.top .logo{display:none}.tbtns .btn.icon{width:28px}}.stage{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}.stage>:not(.sheet){flex:1;min-height:0}.lban{display:flex;align-items:center;gap:8px;padding:8px 16px;background:var(--amber-bg);color:var(--amber);border-top:1px solid var(--amber-s);font-size:13px;line-height:18px;flex:none}.lban svg{flex:none}.bar{position:relative;display:flex;align-items:center;gap:8px;height:64px;padding:0 16px;border-top:1px solid var(--s2);background:var(--bg1);flex:none}.msg{flex:1;min-width:0;color:var(--fg3);display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}.msg>span{overflow:hidden;text-overflow:ellipsis;min-width:0}.msg .spin{color:var(--brand)}.msg .link{flex:none}.fprog{position:absolute;left:0;right:0;top:-1px;height:2px;overflow:hidden}.fprog i{display:block;height:100%;width:0;background:var(--brand);transition:width .25s ease-out}.fprog.ind i{width:30%;animation:ind 1.2s ease-in-out infinite}.pend{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border-radius:14px;border:1px solid var(--brand-s);background:var(--brand-bg);color:var(--brand);font-weight:600;font-size:13px;white-space:nowrap;cursor:pointer;flex:none;transition:background .1s}.pend:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.pend:hover{background:var(--brand-bg2)}.bar .btn.primary .sh{display:none}@container (max-width:400px){.bar .btn.primary .lg{display:none}.bar .btn.primary .sh{display:inline}}.sheet{position:absolute;top:0;right:0;bottom:0;z-index:12;width:min(600px,100%);background:var(--bg1);border-left:1px solid var(--s2);box-shadow:-8px 0 24px #00000014;display:flex;flex-direction:column;animation:slideIn .18s var(--ease)}.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;border-radius:4px;border:1px solid var(--s1);background:var(--bg1);color:var(--fg1);font-weight:600;font-size:14px;white-space:nowrap;cursor:pointer;transition:background .1s,border-color .1s,color .1s;flex:none}.btn:hover{background:var(--bg3);border-color:#c7c7c7}.btn:active{background:var(--bg4)}.btn.primary{background:var(--brand);border-color:transparent;color:#fff}.btn.primary:hover{background:var(--brand-h)}.btn.primary:active{background:var(--brand-p)}.btn.danger{background:var(--red);border-color:transparent;color:#fff}.btn.danger:hover{background:var(--red-h)}.btn.subtle{border-color:transparent;background:transparent;color:var(--fg2)}.btn.subtle:hover{background:var(--bg3);color:var(--fg1)}.btn:disabled,.btn:disabled:hover,.btn[aria-disabled=true],.btn[aria-disabled=true]:hover{cursor:default;background:#f0f0f0;border-color:#e0e0e0;color:#bdbdbd}.btn.primary:disabled,.btn.danger:disabled,.btn.primary[aria-disabled=true],.btn.primary[aria-disabled=true]:hover,.btn.primary[aria-disabled=true]:active{background:#f0f0f0;border-color:transparent;color:#bdbdbd}.btn.subtle:disabled,.btn.subtle:disabled:hover{background:transparent;border-color:transparent;color:#bdbdbd}.btn.icon{width:32px;padding:0}.btn.sm{height:28px;padding:0 10px;font-size:13px}.btn.icon.sm{width:28px;padding:0}.btn:focus-visible{outline:0;border-color:#000;box-shadow:inset 0 0 0 1px #000}.btn.primary:focus-visible,.btn.danger:focus-visible{box-shadow:inset 0 0 0 1px #000,inset 0 0 0 2px #fff}.link{border:0;background:none;padding:0;color:var(--brand-h);font-weight:400;font-size:inherit;line-height:inherit;cursor:pointer}.link:hover{color:var(--brand-p);text-decoration:underline}.link:disabled{color:#bdbdbd;cursor:default;text-decoration:none}.input{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;background:var(--bg1);color:var(--fg3)}.input:focus-within{border-bottom-color:var(--brand);box-shadow:inset 0 -1px 0 var(--brand)}.input input{border:0;outline:0;background:transparent;font:inherit;color:var(--fg1);flex:1;min-width:0;height:100%;padding:0}.input input::placeholder{color:var(--fg4)}.input input::-webkit-search-cancel-button{-webkit-appearance:none;width:16px;height:16px;cursor:pointer;background:center/12px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 5l10 10M15 5 5 15' stroke='%23616161' stroke-width='1.6' stroke-linecap='round'/></svg>")}.sel{height:32px;max-width:280px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;font:inherit;color:var(--fg1);padding:0 32px 0 12px;cursor:pointer;appearance:none;-webkit-appearance:none;text-overflow:ellipsis;background:var(--bg1) no-repeat right 8px center/16px url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M6 8l4 4 4-4' fill='none' stroke='%23616161' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>")}input[type=checkbox],input[type=radio]{width:16px;height:16px;margin:0;accent-color:var(--brand);cursor:pointer;flex:none}.chk{display:inline-flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap;color:var(--fg2)}.seg{display:inline-flex;border:1px solid var(--s1);border-radius:4px;overflow:hidden;flex:none;background:var(--bg1)}.seg button{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border:0;background:var(--bg1);cursor:pointer;color:var(--fg2);white-space:nowrap}.seg button:focus-visible{outline:2px solid #000;outline-offset:-2px}.seg button+button{border-left:1px solid var(--s1)}.seg button:hover{background:var(--bg3)}.seg button[aria-pressed=true]{background:var(--brand-bg);color:var(--brand);font-weight:600}.fp{display:inline-flex;align-items:center;gap:4px;height:28px;max-width:280px;min-width:0;padding:0 12px;border-radius:14px;border:1px solid var(--s1);background:var(--bg1);color:var(--fg1);font-size:14px;cursor:pointer;white-space:nowrap;flex:0 1 auto;transition:background .1s,border-color .1s}.fp:has(svg){padding-right:8px}.fp:hover{background:var(--bg3)}.fp .k{font-weight:600;flex:none}.fp .v{color:var(--fg3);overflow:hidden;text-overflow:ellipsis;min-width:0}.fp svg{flex:none;color:var(--fg3)}.fp.on{background:var(--brand-bg);border-color:var(--brand)}.fp.on .v,.fp.on svg{color:var(--brand)}.fp[aria-expanded=true]{border-color:var(--brand)}.fp:disabled{cursor:default;opacity:.5}.badge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:12px;line-height:16px;font-weight:600;background:var(--bg3);color:var(--fg2);border:1px solid var(--s2);white-space:nowrap;flex:none}.badge.prod,.badge.bad{background:var(--red-bg);color:var(--red);border-color:var(--red-s)}.badge.dev,.badge.amb{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-s)}.badge.ok{background:var(--green-bg);color:var(--green);border-color:var(--green-s)}.badge.brand{background:var(--brand-bg);color:var(--brand);border-color:var(--brand-s)}.count{font-size:12px;line-height:20px;font-weight:600;color:var(--brand);background:var(--brand-bg);border-radius:10px;padding:0 8px;flex:none}.tag{display:inline-block;padding:0 6px;border-radius:4px;background:var(--bg4);color:var(--fg2);font-size:12px;font-weight:600;line-height:16px}.card{border:1px solid var(--s2);border-radius:8px;display:flex;flex-direction:column;min-height:0;background:var(--bg1)}.card-h{display:flex;align-items:center;gap:12px;min-height:48px;padding:0 12px 0 16px;border-bottom:1px solid var(--s3);flex:none}.card-t{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;white-space:nowrap}.nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.un{font-size:12px;line-height:16px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spin{width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite;flex:none;display:inline-block}.sk{display:flex;align-items:center;gap:12px;height:52px;padding:0 16px;border-bottom:1px solid var(--s3)}.sk i{display:block;border-radius:4px;background:linear-gradient(90deg,var(--bg3) 0,var(--bg4) 50%,var(--bg3) 100%);background-size:200% 100%;animation:shimmer 1.2s linear infinite}.sk .ln2{margin-top:8px}.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px;padding:48px 24px;color:var(--fg3)}.empty .ic{width:48px;height:48px;border-radius:24px;display:grid;place-items:center;background:var(--bg3);color:var(--fg3);margin-bottom:4px}.empty .ic.ok{background:var(--green-bg);color:var(--green)}.empty .ic.bad{background:var(--red-bg);color:var(--red)}.empty .ic.brand{background:var(--brand-bg);color:var(--brand)}.empty b{color:var(--fg1);font-size:16px;line-height:22px;font-weight:600}.empty .acts{display:flex;gap:8px;margin-top:8px}.note{display:flex;align-items:flex-start;gap:8px;padding:8px 12px;border-radius:4px;background:var(--bg3);color:var(--fg2);border:1px solid var(--s2)}.note>svg{flex:none;margin-top:2px}.note>div{flex:1;min-width:0}.note.bad{background:var(--red-bg);color:var(--red);border-color:var(--red-s)}.note.amb{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-s)}.note.ok{background:var(--green-bg);color:var(--green);border-color:var(--green-s)}.note.info{background:var(--brand-bg);color:var(--fg1);border-color:var(--brand-s)}.note.info>svg{color:var(--brand)}.pbar{height:4px;border-radius:2px;background:var(--s3);overflow:hidden;flex:none}.pbar i{display:block;height:100%;width:0;background:var(--brand);border-radius:2px;transition:width .25s ease-out}.pbar.ind i{width:30%;animation:ind 1.2s ease-in-out infinite}kbd{font:12px/18px var(--mono);padding:0 6px;border:1px solid var(--s1);border-bottom-width:2px;border-radius:4px;background:var(--bg2);color:var(--fg1);white-space:nowrap}.pop{position:absolute;z-index:40;pointer-events:auto;min-width:200px;max-width:min(420px,calc(100% - 16px));overflow:auto;background:var(--bg1);border-radius:6px;box-shadow:var(--sh8);animation:rise .12s ease-out}.menu{padding:4px;min-width:240px}.mi{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;border:0;background:none;padding:6px 8px;border-radius:4px;cursor:pointer;text-align:left;color:var(--fg1)}.mi:hover,.mi:focus-visible{background:var(--bg3);outline:0}.mi:disabled{color:#bdbdbd;cursor:default;background:none}.mi.danger{color:var(--red)}.mi>svg{color:var(--fg3);flex:none}.mi .ck{width:16px;display:grid;color:var(--brand);flex:none}.mi .tx{flex:1;min-width:0}.mi small{display:block;color:var(--fg3);font-size:12px;line-height:16px}.mh{padding:8px 8px 4px;font-size:12px;line-height:16px;font-weight:600;color:var(--fg3)}.msep{height:1px;background:var(--s2);margin:4px -4px}.tip{position:absolute;z-index:60;max-width:280px;padding:5px 8px;border-radius:4px;background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);font-size:12px;line-height:16px;pointer-events:none;white-space:pre-line;overflow-wrap:anywhere;animation:fade .1s ease-out}.scrim{position:absolute;inset:0;z-index:20;pointer-events:auto;background:#0006;display:flex;align-items:center;justify-content:center;padding:24px;animation:fade .12s ease-out}.dialog{width:min(560px,100%);max-height:min(880px,100%);display:flex;flex-direction:column;background:var(--bg1);border-radius:8px;box-shadow:var(--sh64);padding:24px;gap:16px;outline:0;animation:rise .18s var(--ease)}.dialog.wide{width:min(880px,100%)}.dlg-h{display:flex;align-items:flex-start;gap:8px;margin:-4px -8px 0 0;flex:none}.dlg-h h3{flex:1;margin:0;font-size:20px;line-height:28px;font-weight:600}.dlg-body{color:var(--fg2);overflow:auto;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;gap:12px}.dlg-body p{margin:0}.dlg-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex:none;flex-wrap:wrap}.dlg-actions .quiet{margin-right:auto;font-size:12px}.toasts{position:absolute;right:24px;bottom:80px;z-index:50;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;max-width:calc(100% - 16px)}.toast{pointer-events:auto;display:flex;align-items:flex-start;gap:8px;width:360px;max-width:100%;padding:12px;border-radius:4px;background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);animation:rise .18s ease-out}.toast.out{animation:toastOut .15s ease-in forwards}.toast .ic{flex:none;margin-top:2px;color:var(--brand);display:grid}.toast.ok .ic{color:var(--green)}.toast.warn .ic{color:var(--amber)}.toast.error .ic{color:var(--red)}.toast .txt{flex:1;min-width:0;overflow-wrap:anywhere}.toast .act{display:block;margin-top:4px;font-weight:600}.toast .x{width:24px;height:24px;border:0;border-radius:4px;background:none;display:grid;place-items:center;color:var(--fg3);cursor:pointer;flex:none}.toast .x:hover{background:var(--bg3);color:var(--fg1)}.kt{display:grid;grid-template-columns:max-content 1fr;gap:10px 16px;align-items:center;color:var(--fg2)}.mini{position:absolute;right:24px;bottom:24px;z-index:2;pointer-events:auto;display:flex;align-items:center;gap:10px;height:44px;padding:0 16px 0 8px;border-radius:22px;border:1px solid var(--s2);background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);font-weight:600;cursor:pointer;animation:rise .18s ease-out}.mini:hover{background:var(--bg3)}.mini .logo{width:28px;height:28px;border-radius:14px}.mini .spin{color:var(--brand);width:16px;height:16px}.mini small{font-weight:400;font-size:13px;color:var(--fg3)}.mini small.p{color:var(--brand);font-weight:600}.ed{display:flex;flex-direction:column;min-height:0;flex:1;container-type:inline-size}.ed-h{display:flex;align-items:flex-start;gap:12px;padding:16px 8px 12px 20px;border-bottom:1px solid var(--s3);flex:none}.ki{width:36px;height:36px;border-radius:8px;background:var(--brand-bg);color:var(--brand);display:grid;place-items:center;flex:none}.ed-t{flex:1;min-width:0}.ed-k{display:flex;align-items:center;gap:8px;font-size:12px;line-height:16px;color:var(--fg3)}.ed-t h2{margin:2px 0 0;font-size:18px;line-height:24px;font-weight:600;overflow-wrap:anywhere}.crumb{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;margin-top:4px;font-size:12px;line-height:16px;color:var(--fg3)}.crumb svg{color:var(--fg4);flex:none}.lnm{display:inline-block;margin-top:6px;padding:1px 6px;border-radius:4px;background:var(--bg3);color:var(--fg2);font:12px/16px var(--mono);overflow-wrap:anywhere}.ed-b{flex:1;min-height:0;overflow:auto;padding:12px 20px 24px;display:flex;flex-direction:column;gap:16px}.ed-n{display:flex;flex-direction:column;gap:8px}.ed-n .note{font-size:13px;line-height:18px}.eb-h{margin:0 0 4px;font-size:12px;line-height:16px;font-weight:600;color:var(--fg2)}.er{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:0 10px;align-items:start;padding:6px 8px;margin:0 -8px;border-radius:6px}.er.tgt{background:var(--brand-bg)}.lc{display:inline-flex;align-items:center;gap:8px;height:32px;min-width:0;font-size:12px;color:var(--fg2);white-space:nowrap}.lc b{display:inline-grid;place-items:center;min-width:34px;height:20px;padding:0 5px;border-radius:4px;background:var(--bg4);color:var(--fg2);font-size:11px;font-weight:600;letter-spacing:.02em}.lc.b b{background:var(--fg2);color:#fff}.lc.t b{background:var(--brand);color:#fff}.lc .nm{display:none;font-weight:400}.lc small{display:none;color:var(--fg3)}@container (min-width:540px){.er{grid-template-columns:150px minmax(0,1fr) auto}.lc .nm{display:block}.lc.b small{display:inline}}.ti{display:block;width:100%;min-height:32px;margin:0;padding:5px 10px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;background:var(--bg1);font:inherit;color:var(--fg1);outline:0;resize:none}textarea.ti{field-sizing:content;max-height:220px;overflow:auto}.ti:focus{border-bottom-color:var(--brand);box-shadow:inset 0 -1px 0 var(--brand)}.ti:disabled{background:var(--bg3);color:var(--fg3);border-color:var(--s2)}input.ti{text-overflow:ellipsis}.ti::placeholder{color:var(--fg4);font-style:italic}.ti.same{text-decoration:underline dashed var(--fg4);text-underline-offset:4px}.er[data-s=miss] .ti{border-color:var(--amber-s);border-bottom-color:var(--amber);background:var(--amber-bg)}.er[data-s=miss] .ti:focus{background:var(--bg1)}.er[data-s=edit] .ti{box-shadow:inset 3px 0 0 var(--brand)}.er[data-s=edit] .ti:focus{box-shadow:inset 3px 0 0 var(--brand),inset 0 -1px 0 var(--brand)}.er[data-s=err] .ti,.er[data-s=conflict] .ti{border-color:var(--red-s);border-bottom-color:var(--red)}.ef{min-width:0}.ea{display:flex;align-items:center;height:32px}.ea .btn{opacity:.6}.er:hover .ea .btn,.er:focus-within .ea .btn{opacity:1}.st{width:20px;height:32px;display:grid;place-items:center;flex:none}.st.edit:before,.st.miss:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--brand)}.st.miss:before{background:none;box-shadow:inset 0 0 0 1.5px var(--amber)}.st.saved{color:var(--green);animation:fadeOut .6s 4s forwards}.st.err,.st.conflict{color:var(--red)}.em{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:16px;color:var(--fg3)}.em.on{margin-top:4px}.emm{flex:1;min-width:0;display:flex;align-items:flex-start;gap:4px}.emm>svg{flex:none;margin-top:1px}.emm>span{min-width:0}.emm.e{color:var(--red)}.emm.w{color:var(--amber)}.emm.n{color:var(--fg2)}.cnt{margin-left:auto;flex:none;font-variant-numeric:tabular-nums}.cnt.over{color:var(--red);font-weight:600}.cf{margin-top:6px;padding:8px 10px;border:1px solid var(--red-s);border-radius:4px;background:var(--red-bg);font-size:12px;line-height:16px;color:var(--fg2)}.cf q{display:block;margin:4px 0 8px;quotes:none;color:var(--fg1);font-size:14px;line-height:20px;overflow-wrap:anywhere}.cf .acts{display:flex;gap:8px;flex-wrap:wrap}.rv{display:flex;flex-direction:column;gap:16px;min-height:0;flex:1 1 auto}.rv .dlg-body{gap:16px}.wd{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;color:var(--fg1);overflow-wrap:anywhere}.wd .wd-a{color:var(--fg3)}.wd del{background:#fdeaea;color:#a4262c;border-radius:2px;text-decoration:line-through}.wd ins{background:#e9f7ec;color:var(--green);border-radius:2px;text-decoration:none}.wd .arr,.wd em{color:var(--fg4)}.iss{display:flex;align-items:flex-start;gap:6px;margin-top:4px;font-size:12px;line-height:16px}.iss svg{flex:none}.iss.error{color:var(--red)}.iss.warn{color:var(--amber)}.iss.note{color:var(--fg2)}.wait{display:flex;align-items:center;gap:8px}.sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:8px;flex:none}.tile{border:1px solid var(--s2);border-radius:8px;padding:10px 12px}.tile b{display:block;font-size:24px;line-height:32px;font-weight:600;color:var(--fg1)}.tile span{font-size:12px;color:var(--fg3)}.tile.ok b{color:var(--green)}.tile.bad b{color:var(--red)}.tile.amb b{color:var(--amber)}.pl{border:1px solid var(--s2);border-radius:6px;overflow:auto;min-height:0;flex:0 1 auto;max-height:min(420px,48vh)}.pr{display:flex;align-items:center;gap:8px;min-height:36px;padding:4px 12px;border-bottom:1px solid var(--s3)}.pr:last-child{border-bottom:0}.pr .pt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg1)}.pr .pt small{color:var(--fg3);font-size:12px}.pr .pm{flex:0 1 50%;min-width:0;font-size:12px;line-height:16px;color:var(--fg3);overflow-wrap:anywhere}.pr .pm.bad{color:var(--red)}.ps{width:16px;display:grid;place-items:center;flex:none;color:var(--fg4)}.ps.w:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--s1)}.ps.ok{color:var(--green)}.ps.bad{color:var(--red)}.ps.amb{color:var(--amber)}.hr{display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1px solid var(--s3)}.hr:last-child{border-bottom:0}.hr-m{flex:1;min-width:0}.hr-m b{color:var(--fg1)}.hr-m small{display:block;font-size:12px;line-height:16px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@media(prefers-reduced-motion:reduce){.app,.panel,.win.dock .panel,.dialog,.scrim,.pop,.toast,.toast.out,.sheet,.mini,.tip,.sk i,.fprog.ind i,.pbar.ind i{animation:none}.st.saved{animation:none;opacity:1}.fprog i,.pbar i{transition:none}}`;
+  var styles_default = `:host{all:initial}*{box-sizing:border-box}[hidden]{display:none!important}.app{--brand:#0f6cbd;--brand-h:#115ea3;--brand-p:#0f548c;--brand-bg:#ebf3fc;--brand-bg2:#dcebfb;--brand-s:#b4d6fa;--fg1:#242424;--fg2:#424242;--fg3:#616161;--fg4:#707070;--bg1:#fff;--bg2:#fafafa;--bg3:#f5f5f5;--bg4:#ebebeb;--s1:#d1d1d1;--s2:#e0e0e0;--s3:#f0f0f0;--red:#c50f1f;--red-h:#a80d1a;--red-bg:#fdf3f4;--red-s:#eeacb2;--green:#0e700e;--green-bg:#f1faf1;--green-s:#9fd89f;--amber:#8a3707;--amber-bg:#fff9f5;--amber-s:#fdcfb4;--sh8:0 0 2px rgba(0,0,0,.12),0 8px 16px rgba(0,0,0,.14);--sh64:0 0 2px rgba(0,0,0,.12),0 32px 64px rgba(0,0,0,.24);--mono:"Cascadia Mono",Consolas,monospace;--ease:cubic-bezier(.1,.9,.2,1);position:fixed;inset:0;pointer-events:none;font:14px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;color:var(--fg1);text-align:left;-webkit-font-smoothing:antialiased;animation:fade .15s ease-out}@keyframes fade{0%{opacity:0}}@keyframes rise{0%{opacity:0;transform:translateY(10px)}}@keyframes spin{to{transform:rotate(360deg)}}@keyframes shimmer{0%{background-position:100% 0}to{background-position:-100% 0}}@keyframes toastOut{to{opacity:0;transform:translateY(8px)}}@keyframes slideIn{0%{opacity:0;transform:translate(24px)}}@keyframes fadeOut{to{opacity:0}}@keyframes ind{0%{transform:translate(-100%)}to{transform:translate(340%)}}button{font:inherit;color:inherit}:focus-visible{outline:2px solid #000;outline-offset:1px}.spacer{flex:1}.quiet{color:var(--fg3)}.vh{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.win{position:absolute;z-index:1;pointer-events:auto;display:flex}.panel{flex:1;min-width:0;background:var(--bg1);border-radius:8px;box-shadow:var(--sh64);display:flex;flex-direction:column;overflow:hidden;position:relative;z-index:0;container-type:inline-size;outline:0;animation:rise .22s var(--ease)}.win.max .panel,.win.dock .panel{border-radius:0}.win.dock .panel{box-shadow:0 0 2px #0000001f,-12px 0 40px #00000029;animation:slideIn .22s var(--ease)}.rz{position:absolute;z-index:1}.win.max .rz,.win.dock .rz:not(.w){display:none}.rz.n,.rz.s{left:14px;right:14px;height:8px;cursor:ns-resize}.rz.n{top:-6px}.rz.s{bottom:-6px}.rz.e,.rz.w{top:14px;bottom:14px;width:8px;cursor:ew-resize}.rz.e{right:-6px}.rz.w{left:-6px}.win.dock .rz.w{top:0;bottom:0;left:-4px}.rz.ne,.rz.nw,.rz.se,.rz.sw{width:18px;height:18px}.rz.ne{top:-6px;right:-6px;cursor:nesw-resize}.rz.sw{bottom:-6px;left:-6px;cursor:nesw-resize}.rz.nw{top:-6px;left:-6px;cursor:nwse-resize}.rz.se{bottom:-6px;right:-6px;cursor:nwse-resize}.app.moving,.app.sizing{pointer-events:auto}.app.moving .panel,.app.sizing .panel{-webkit-user-select:none;user-select:none}.top{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;height:56px;min-width:0;padding:0 8px 0 16px;border-bottom:1px solid var(--s2);flex:none;overflow:hidden;cursor:move;-webkit-user-select:none;user-select:none}.top button{cursor:pointer}.top h1{font-size:16px;line-height:22px;font-weight:600;margin:0;white-space:nowrap;flex:none}.top .spacer{min-width:0}.tnav{display:flex;align-items:center;gap:8px;flex:0 1 auto;min-width:0;overflow:hidden}.tbtns{display:flex;align-items:center;gap:2px;flex:none}.logo{width:28px;height:28px;border-radius:6px;background:var(--brand);color:#fff;display:grid;place-items:center;flex:none}.top .orgb{flex:0 1 auto;min-width:40px;max-width:220px;gap:6px;overflow:hidden;cursor:default}.orgb .bt{min-width:0;overflow:hidden;text-overflow:ellipsis}.orgb .dot{display:none;width:8px;height:8px;border-radius:50%;background:currentColor;flex:none}.top .langbtn{gap:4px;padding:0 8px;min-width:0;flex:0 1 auto;font-weight:600}.top .btn.langbtn{color:var(--fg1)}.langbtn svg{color:var(--fg3);flex:none}.langbtn .ln{min-width:0;overflow:hidden;text-overflow:ellipsis}.langbtn .ls,.langbtn .lt{display:none;min-width:0;overflow:hidden;text-overflow:ellipsis}.btn.icon[aria-pressed=true]{background:var(--brand-bg);color:var(--brand)}@container (max-width:669px){.langbtn .ln{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.langbtn .ls{display:inline}.top .orgb{max-width:160px}}@container (max-width:599px){.top h1{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0)}}@container (max-width:519px){.top .orgb{flex:none;min-width:0;width:20px;padding:0;justify-content:center}.orgb .bt{position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.orgb .dot{display:block}}@container (max-width:399px){.top{gap:6px;padding:0 4px 0 12px}.langbtn>svg:first-child{display:none}}@container (max-width:359px){.langbtn .ls{display:none}.langbtn .lt{display:inline}}@container (max-width:319px){.top{padding:0 4px 0 10px}.top .logo{display:none}.tbtns .btn.icon{width:28px}}.stage{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}.stage>:not(.sheet){flex:1;min-height:0}.lban{display:flex;align-items:center;gap:8px;padding:8px 16px;background:var(--amber-bg);color:var(--amber);border-top:1px solid var(--amber-s);font-size:13px;line-height:18px;flex:none}.lban svg{flex:none}.bar{position:relative;display:flex;align-items:center;gap:8px;height:64px;padding:0 16px;border-top:1px solid var(--s2);background:var(--bg1);flex:none}.msg{flex:1;min-width:0;color:var(--fg3);display:flex;align-items:center;gap:8px;white-space:nowrap;overflow:hidden}.msg>span{overflow:hidden;text-overflow:ellipsis;min-width:0}.msg .spin{color:var(--brand)}.msg .link{flex:none}.fprog{position:absolute;left:0;right:0;top:-1px;height:2px;overflow:hidden}.fprog i{display:block;height:100%;width:0;background:var(--brand);transition:width .25s ease-out}.fprog.ind i{width:30%;animation:ind 1.2s ease-in-out infinite}.pend{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border-radius:14px;border:1px solid var(--brand-s);background:var(--brand-bg);color:var(--brand);font-weight:600;font-size:13px;white-space:nowrap;cursor:pointer;flex:none;transition:background .1s}.pend:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.pend:hover{background:var(--brand-bg2)}.bar .btn.primary .sh{display:none}@container (max-width:400px){.bar .btn.primary .lg{display:none}.bar .btn.primary .sh{display:inline}}.sheet{position:absolute;top:0;right:0;bottom:0;z-index:12;width:min(600px,100%);background:var(--bg1);border-left:1px solid var(--s2);box-shadow:-8px 0 24px #00000014;display:flex;flex-direction:column;animation:slideIn .18s var(--ease)}.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:32px;padding:0 12px;border-radius:4px;border:1px solid var(--s1);background:var(--bg1);color:var(--fg1);font-weight:600;font-size:14px;white-space:nowrap;cursor:pointer;transition:background .1s,border-color .1s,color .1s;flex:none}.btn:hover{background:var(--bg3);border-color:#c7c7c7}.btn:active{background:var(--bg4)}.btn.primary{background:var(--brand);border-color:transparent;color:#fff}.btn.primary:hover{background:var(--brand-h)}.btn.primary:active{background:var(--brand-p)}.btn.danger{background:var(--red);border-color:transparent;color:#fff}.btn.danger:hover{background:var(--red-h)}.btn.subtle{border-color:transparent;background:transparent;color:var(--fg2)}.btn.subtle:hover{background:var(--bg3);color:var(--fg1)}.btn:disabled,.btn:disabled:hover,.btn[aria-disabled=true],.btn[aria-disabled=true]:hover{cursor:default;background:#f0f0f0;border-color:#e0e0e0;color:#bdbdbd}.btn.primary:disabled,.btn.danger:disabled,.btn.primary[aria-disabled=true],.btn.primary[aria-disabled=true]:hover,.btn.primary[aria-disabled=true]:active{background:#f0f0f0;border-color:transparent;color:#bdbdbd}.btn.subtle:disabled,.btn.subtle:disabled:hover{background:transparent;border-color:transparent;color:#bdbdbd}.btn.icon{width:32px;padding:0}.btn.sm{height:28px;padding:0 10px;font-size:13px}.btn.icon.sm{width:28px;padding:0}.btn:focus-visible{outline:0;border-color:#000;box-shadow:inset 0 0 0 1px #000}.btn.primary:focus-visible,.btn.danger:focus-visible{box-shadow:inset 0 0 0 1px #000,inset 0 0 0 2px #fff}.link{border:0;background:none;padding:0;color:var(--brand-h);font-weight:400;font-size:inherit;line-height:inherit;cursor:pointer}.link:hover{color:var(--brand-p);text-decoration:underline}.link:disabled{color:#bdbdbd;cursor:default;text-decoration:none}.input{display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;background:var(--bg1);color:var(--fg3)}.input:focus-within{border-bottom-color:var(--brand);box-shadow:inset 0 -1px 0 var(--brand)}.input input{border:0;outline:0;background:transparent;font:inherit;color:var(--fg1);flex:1;min-width:0;height:100%;padding:0}.input input::placeholder{color:var(--fg4)}.input input::-webkit-search-cancel-button{-webkit-appearance:none;width:16px;height:16px;cursor:pointer;background:center/12px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 5l10 10M15 5 5 15' stroke='%23616161' stroke-width='1.6' stroke-linecap='round'/></svg>")}.sel{height:32px;max-width:280px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;font:inherit;color:var(--fg1);padding:0 32px 0 12px;cursor:pointer;appearance:none;-webkit-appearance:none;text-overflow:ellipsis;background:var(--bg1) no-repeat right 8px center/16px url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M6 8l4 4 4-4' fill='none' stroke='%23616161' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>")}input[type=checkbox],input[type=radio]{width:16px;height:16px;margin:0;accent-color:var(--brand);cursor:pointer;flex:none}.chk{display:inline-flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap;color:var(--fg2)}.sx-h{font-weight:600;color:var(--fg1);margin-bottom:-6px!important}.sx-g{display:flex;flex-wrap:wrap;gap:6px 20px}.seg{display:inline-flex;border:1px solid var(--s1);border-radius:4px;overflow:hidden;flex:none;background:var(--bg1)}.seg button{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;border:0;background:var(--bg1);cursor:pointer;color:var(--fg2);white-space:nowrap}.seg button:focus-visible{outline:2px solid #000;outline-offset:-2px}.seg button+button{border-left:1px solid var(--s1)}.seg button:hover{background:var(--bg3)}.seg button[aria-pressed=true]{background:var(--brand-bg);color:var(--brand);font-weight:600}.fp{display:inline-flex;align-items:center;gap:4px;height:28px;max-width:280px;min-width:0;padding:0 12px;border-radius:14px;border:1px solid var(--s1);background:var(--bg1);color:var(--fg1);font-size:14px;cursor:pointer;white-space:nowrap;flex:0 1 auto;transition:background .1s,border-color .1s}.fp:has(svg){padding-right:8px}.fp:hover{background:var(--bg3)}.fp .k{font-weight:600;flex:none}.fp .v{color:var(--fg3);overflow:hidden;text-overflow:ellipsis;min-width:0}.fp svg{flex:none;color:var(--fg3)}.fp.on{background:var(--brand-bg);border-color:var(--brand)}.fp.on .v,.fp.on svg{color:var(--brand)}.fp[aria-expanded=true]{border-color:var(--brand)}.fp:disabled{cursor:default;opacity:.5}.badge{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:10px;font-size:12px;line-height:16px;font-weight:600;background:var(--bg3);color:var(--fg2);border:1px solid var(--s2);white-space:nowrap;flex:none}.badge.prod,.badge.bad{background:var(--red-bg);color:var(--red);border-color:var(--red-s)}.badge.dev,.badge.amb{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-s)}.badge.ok{background:var(--green-bg);color:var(--green);border-color:var(--green-s)}.badge.brand{background:var(--brand-bg);color:var(--brand);border-color:var(--brand-s)}.count{font-size:12px;line-height:20px;font-weight:600;color:var(--brand);background:var(--brand-bg);border-radius:10px;padding:0 8px;flex:none}.tag{display:inline-block;padding:0 6px;border-radius:4px;background:var(--bg4);color:var(--fg2);font-size:12px;font-weight:600;line-height:16px}.card{border:1px solid var(--s2);border-radius:8px;display:flex;flex-direction:column;min-height:0;background:var(--bg1)}.card-h{display:flex;align-items:center;gap:12px;min-height:48px;padding:0 12px 0 16px;border-bottom:1px solid var(--s3);flex:none}.card-t{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;white-space:nowrap}.nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.un{font-size:12px;line-height:16px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spin{width:14px;height:14px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;animation:spin .7s linear infinite;flex:none;display:inline-block}.sk{display:flex;align-items:center;gap:12px;height:52px;padding:0 16px;border-bottom:1px solid var(--s3)}.sk i{display:block;border-radius:4px;background:linear-gradient(90deg,var(--bg3) 0,var(--bg4) 50%,var(--bg3) 100%);background-size:200% 100%;animation:shimmer 1.2s linear infinite}.sk .ln2{margin-top:8px}.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px;padding:48px 24px;color:var(--fg3)}.empty .ic{width:48px;height:48px;border-radius:24px;display:grid;place-items:center;background:var(--bg3);color:var(--fg3);margin-bottom:4px}.empty .ic.ok{background:var(--green-bg);color:var(--green)}.empty .ic.bad{background:var(--red-bg);color:var(--red)}.empty .ic.brand{background:var(--brand-bg);color:var(--brand)}.empty b{color:var(--fg1);font-size:16px;line-height:22px;font-weight:600}.empty .acts{display:flex;gap:8px;margin-top:8px}.note{display:flex;align-items:flex-start;gap:8px;padding:8px 12px;border-radius:4px;background:var(--bg3);color:var(--fg2);border:1px solid var(--s2)}.note>svg{flex:none;margin-top:2px}.note>div{flex:1;min-width:0}.note.bad{background:var(--red-bg);color:var(--red);border-color:var(--red-s)}.note.amb{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-s)}.note.ok{background:var(--green-bg);color:var(--green);border-color:var(--green-s)}.note.info{background:var(--brand-bg);color:var(--fg1);border-color:var(--brand-s)}.note.info>svg{color:var(--brand)}.pbar{height:4px;border-radius:2px;background:var(--s3);overflow:hidden;flex:none}.pbar i{display:block;height:100%;width:0;background:var(--brand);border-radius:2px;transition:width .25s ease-out}.pbar.ind i{width:30%;animation:ind 1.2s ease-in-out infinite}kbd{font:12px/18px var(--mono);padding:0 6px;border:1px solid var(--s1);border-bottom-width:2px;border-radius:4px;background:var(--bg2);color:var(--fg1);white-space:nowrap}.pop{position:absolute;z-index:40;pointer-events:auto;min-width:200px;max-width:min(420px,calc(100% - 16px));overflow:auto;background:var(--bg1);border-radius:6px;box-shadow:var(--sh8);animation:rise .12s ease-out}.menu{padding:4px;min-width:240px}.mi{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;border:0;background:none;padding:6px 8px;border-radius:4px;cursor:pointer;text-align:left;color:var(--fg1)}.mi:hover,.mi:focus-visible{background:var(--bg3);outline:0}.mi:disabled{color:#bdbdbd;cursor:default;background:none}.mi.danger{color:var(--red)}.mi>svg{color:var(--fg3);flex:none}.mi .ck{width:16px;display:grid;color:var(--brand);flex:none}.mi .tx{flex:1;min-width:0}.mi small{display:block;color:var(--fg3);font-size:12px;line-height:16px}.mh{padding:8px 8px 4px;font-size:12px;line-height:16px;font-weight:600;color:var(--fg3)}.msep{height:1px;background:var(--s2);margin:4px -4px}.tip{position:absolute;z-index:60;max-width:280px;padding:5px 8px;border-radius:4px;background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);font-size:12px;line-height:16px;pointer-events:none;white-space:pre-line;overflow-wrap:anywhere;animation:fade .1s ease-out}.scrim{position:absolute;inset:0;z-index:20;pointer-events:auto;background:#0006;display:flex;align-items:center;justify-content:center;padding:24px;animation:fade .12s ease-out}.dialog{width:min(560px,100%);max-height:min(880px,100%);display:flex;flex-direction:column;background:var(--bg1);border-radius:8px;box-shadow:var(--sh64);padding:24px;gap:16px;outline:0;animation:rise .18s var(--ease)}.dialog.wide{width:min(880px,100%)}.dlg-h{display:flex;align-items:flex-start;gap:8px;margin:-4px -8px 0 0;flex:none}.dlg-h h3{flex:1;margin:0;font-size:20px;line-height:28px;font-weight:600}.dlg-body{color:var(--fg2);overflow:auto;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;gap:12px}.dlg-body p{margin:0}.dlg-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex:none;flex-wrap:wrap}.dlg-actions .quiet{margin-right:auto;font-size:12px}.toasts{position:absolute;right:24px;bottom:80px;z-index:50;display:flex;flex-direction:column;gap:8px;align-items:flex-end;pointer-events:none;max-width:calc(100% - 16px)}.toast{pointer-events:auto;display:flex;align-items:flex-start;gap:8px;width:360px;max-width:100%;padding:12px;border-radius:4px;background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);animation:rise .18s ease-out}.toast.out{animation:toastOut .15s ease-in forwards}.toast .ic{flex:none;margin-top:2px;color:var(--brand);display:grid}.toast.ok .ic{color:var(--green)}.toast.warn .ic{color:var(--amber)}.toast.error .ic{color:var(--red)}.toast .txt{flex:1;min-width:0;overflow-wrap:anywhere}.toast .act{display:block;margin-top:4px;font-weight:600}.toast .x{width:24px;height:24px;border:0;border-radius:4px;background:none;display:grid;place-items:center;color:var(--fg3);cursor:pointer;flex:none}.toast .x:hover{background:var(--bg3);color:var(--fg1)}.kt{display:grid;grid-template-columns:max-content 1fr;gap:10px 16px;align-items:center;color:var(--fg2)}.mini{position:absolute;right:24px;bottom:24px;z-index:2;pointer-events:auto;display:flex;align-items:center;gap:10px;height:44px;padding:0 16px 0 8px;border-radius:22px;border:1px solid var(--s2);background:var(--bg1);color:var(--fg1);box-shadow:var(--sh8);font-weight:600;cursor:pointer;animation:rise .18s ease-out}.mini:hover{background:var(--bg3)}.mini .logo{width:28px;height:28px;border-radius:14px}.mini .spin{color:var(--brand);width:16px;height:16px}.mini small{font-weight:400;font-size:13px;color:var(--fg3)}.mini small.p{color:var(--brand);font-weight:600}.ed{display:flex;flex-direction:column;min-height:0;flex:1;container-type:inline-size}.ed-h{display:flex;align-items:flex-start;gap:12px;padding:16px 8px 12px 20px;border-bottom:1px solid var(--s3);flex:none}.ki{width:36px;height:36px;border-radius:8px;background:var(--brand-bg);color:var(--brand);display:grid;place-items:center;flex:none}.ed-t{flex:1;min-width:0}.ed-k{display:flex;align-items:center;gap:8px;font-size:12px;line-height:16px;color:var(--fg3)}.ed-t h2{margin:2px 0 0;font-size:18px;line-height:24px;font-weight:600;overflow-wrap:anywhere}.crumb{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;margin-top:4px;font-size:12px;line-height:16px;color:var(--fg3)}.crumb svg{color:var(--fg4);flex:none}.lnm{display:inline-block;margin-top:6px;padding:1px 6px;border-radius:4px;background:var(--bg3);color:var(--fg2);font:12px/16px var(--mono);overflow-wrap:anywhere}.ed-b{flex:1;min-height:0;overflow:auto;padding:12px 20px 24px;display:flex;flex-direction:column;gap:16px}.ed-n{display:flex;flex-direction:column;gap:8px}.ed-n .note{font-size:13px;line-height:18px}.eb-h{margin:0 0 4px;font-size:12px;line-height:16px;font-weight:600;color:var(--fg2)}.er{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:0 10px;align-items:start;padding:6px 8px;margin:0 -8px;border-radius:6px}.er.tgt{background:var(--brand-bg)}.lc{display:inline-flex;align-items:center;gap:8px;height:32px;min-width:0;font-size:12px;color:var(--fg2);white-space:nowrap}.lc b{display:inline-grid;place-items:center;min-width:34px;height:20px;padding:0 5px;border-radius:4px;background:var(--bg4);color:var(--fg2);font-size:11px;font-weight:600;letter-spacing:.02em}.lc.b b{background:var(--fg2);color:#fff}.lc.t b{background:var(--brand);color:#fff}.lc .nm{display:none;font-weight:400}.lc small{display:none;color:var(--fg3)}@container (min-width:540px){.er{grid-template-columns:150px minmax(0,1fr) auto}.lc .nm{display:block}.lc.b small{display:inline}}.ti{display:block;width:100%;min-height:32px;margin:0;padding:5px 10px;border:1px solid var(--s1);border-bottom-color:var(--fg3);border-radius:4px;background:var(--bg1);font:inherit;color:var(--fg1);outline:0;resize:none}textarea.ti{field-sizing:content;max-height:220px;overflow:auto}.ti:focus{border-bottom-color:var(--brand);box-shadow:inset 0 -1px 0 var(--brand)}.ti:disabled{background:var(--bg3);color:var(--fg3);border-color:var(--s2)}input.ti{text-overflow:ellipsis}.ti::placeholder{color:var(--fg4);font-style:italic}.ti.same{text-decoration:underline dashed var(--fg4);text-underline-offset:4px}.er[data-s=miss] .ti{border-color:var(--amber-s);border-bottom-color:var(--amber);background:var(--amber-bg)}.er[data-s=miss] .ti:focus{background:var(--bg1)}.er[data-s=edit] .ti{box-shadow:inset 3px 0 0 var(--brand)}.er[data-s=edit] .ti:focus{box-shadow:inset 3px 0 0 var(--brand),inset 0 -1px 0 var(--brand)}.er[data-s=err] .ti,.er[data-s=conflict] .ti{border-color:var(--red-s);border-bottom-color:var(--red)}.ef{min-width:0}.ea{display:flex;align-items:center;height:32px}.ea .btn{opacity:.6}.er:hover .ea .btn,.er:focus-within .ea .btn{opacity:1}.st{width:20px;height:32px;display:grid;place-items:center;flex:none}.st.edit:before,.st.miss:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--brand)}.st.miss:before{background:none;box-shadow:inset 0 0 0 1.5px var(--amber)}.st.saved{color:var(--green);animation:fadeOut .6s 4s forwards}.st.err,.st.conflict{color:var(--red)}.em{display:flex;align-items:flex-start;gap:8px;font-size:12px;line-height:16px;color:var(--fg3)}.em.on{margin-top:4px}.emm{flex:1;min-width:0;display:flex;align-items:flex-start;gap:4px}.emm>svg{flex:none;margin-top:1px}.emm>span{min-width:0}.emm.e{color:var(--red)}.emm.w{color:var(--amber)}.emm.n{color:var(--fg2)}.cnt{margin-left:auto;flex:none;font-variant-numeric:tabular-nums}.cnt.over{color:var(--red);font-weight:600}.cf{margin-top:6px;padding:8px 10px;border:1px solid var(--red-s);border-radius:4px;background:var(--red-bg);font-size:12px;line-height:16px;color:var(--fg2)}.cf q{display:block;margin:4px 0 8px;quotes:none;color:var(--fg1);font-size:14px;line-height:20px;overflow-wrap:anywhere}.cf .acts{display:flex;gap:8px;flex-wrap:wrap}.rv{display:flex;flex-direction:column;gap:16px;min-height:0;flex:1 1 auto}.rv .dlg-body{gap:16px}.wd{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;color:var(--fg1);overflow-wrap:anywhere}.wd .wd-a{color:var(--fg3)}.wd del{background:#fdeaea;color:#a4262c;border-radius:2px;text-decoration:line-through}.wd ins{background:#e9f7ec;color:var(--green);border-radius:2px;text-decoration:none}.wd .arr,.wd em{color:var(--fg4)}.iss{display:flex;align-items:flex-start;gap:6px;margin-top:4px;font-size:12px;line-height:16px}.iss svg{flex:none}.iss.error{color:var(--red)}.iss.warn{color:var(--amber)}.iss.note{color:var(--fg2)}.wait{display:flex;align-items:center;gap:8px}.sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:8px;flex:none}.tile{border:1px solid var(--s2);border-radius:8px;padding:10px 12px}.tile b{display:block;font-size:24px;line-height:32px;font-weight:600;color:var(--fg1)}.tile span{font-size:12px;color:var(--fg3)}.tile.ok b{color:var(--green)}.tile.bad b{color:var(--red)}.tile.amb b{color:var(--amber)}.pl{border:1px solid var(--s2);border-radius:6px;overflow:auto;min-height:0;flex:0 1 auto;max-height:min(420px,48vh)}.pr{display:flex;align-items:center;gap:8px;min-height:36px;padding:4px 12px;border-bottom:1px solid var(--s3)}.pr:last-child{border-bottom:0}.pr .pt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg1)}.pr .pt small{color:var(--fg3);font-size:12px}.pr .pm{flex:0 1 50%;min-width:0;font-size:12px;line-height:16px;color:var(--fg3);overflow-wrap:anywhere}.pr .pm.bad{color:var(--red)}.ps{width:16px;display:grid;place-items:center;flex:none;color:var(--fg4)}.ps.w:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--s1)}.ps.ok{color:var(--green)}.ps.bad{color:var(--red)}.ps.amb{color:var(--amber)}.hr{display:flex;align-items:center;gap:12px;padding:12px 4px;border-bottom:1px solid var(--s3)}.hr:last-child{border-bottom:0}.hr-m{flex:1;min-width:0}.hr-m b{color:var(--fg1)}.hr-m small{display:block;font-size:12px;line-height:16px;color:var(--fg3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}@media(prefers-reduced-motion:reduce){.app,.panel,.win.dock .panel,.dialog,.scrim,.pop,.toast,.toast.out,.sheet,.mini,.tip,.sk i,.fprog.ind i,.pbar.ind i{animation:none}.st.saved{animation:none;opacity:1}.fprog i,.pbar i{transition:none}}`;
 
   // src/ui/app.ts
   var KEYS2 = [
@@ -18419,8 +20102,8 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     return b;
   }
   function readPrefs(ctx, json2) {
-    const all2 = ctx.langs.map((l) => l.lcid);
-    const target = ctx.user !== ctx.base && all2.includes(ctx.user) ? ctx.user : all2.find((l) => l !== ctx.base) ?? ctx.base;
+    const all = ctx.langs.map((l) => l.lcid);
+    const target = ctx.user !== ctx.base && all.includes(ctx.user) ? ctx.user : all.find((l) => l !== ctx.base) ?? ctx.base;
     let s = {};
     try {
       s = JSON.parse(json2 || "{}") || {};
@@ -18428,12 +20111,12 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       s = {};
     }
     const p = {
-      target: all2.includes(Number(s.target)) ? Number(s.target) : target,
-      shown: all2,
+      target: all.includes(Number(s.target)) ? Number(s.target) : target,
+      shown: all,
       showNames: !!s.showNames,
       dock: s.dock === "float" || s.dock === "max" ? s.dock : "right"
     };
-    p.shown = Array.isArray(s.shown) ? all2.filter((l) => l === ctx.base || l === p.target || s.shown.includes(l)) : all2;
+    p.shown = Array.isArray(s.shown) ? all.filter((l) => l === ctx.base || l === p.target || s.shown.includes(l)) : all;
     if (s.bar && typeof s.bar === "object") p.bar = s.bar;
     if (s.list && typeof s.list === "object") p.list = s.list;
     return p;
@@ -18468,7 +20151,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     compSlots(store, "");
     const PK = `dxt:prefs:${ctx.orgId}`;
     const prefs = loadPrefs(ctx, PK);
-    const all2 = ctx.langs.map((l) => l.lcid);
+    const all = ctx.langs.map((l) => l.lcid);
     const pageType = pageInfo(ctx.xrm).type;
     const onPage = translatesOn(pageType);
     const started = Date.now();
@@ -18625,7 +20308,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     }
     function savePrefs(p) {
       Object.assign(prefs, p);
-      if (p.shown || p.target) prefs.shown = all2.filter((l) => l === ctx.base || l === prefs.target || prefs.shown.includes(l));
+      if (p.shown || p.target) prefs.shown = all.filter((l) => l === ctx.base || l === prefs.target || prefs.shown.includes(l));
       try {
         localStorage.setItem(PK, JSON.stringify(prefs));
       } catch {
@@ -18738,7 +20421,8 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       toast,
       // destroy() removes the beforeunload guard too, so the reload doesn't ask "Leave site?".
       teardown: () => destroy(),
-      restore: () => lang.restore()
+      restore: () => lang.restore(),
+      switching: () => lang.active && !lang.waiting
     });
     function refresh(items) {
       if (destroyed) return Promise.resolve(false);
@@ -18831,7 +20515,11 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         list: toggleList,
         workbench: () => show3("workbench"),
         publish: () => void review(),
-        history: () => recentPublishes()
+        history: () => recentPublishes(),
+        select: () => {
+          closeList();
+          m.select(true);
+        }
       });
       L2.append(bar2.el);
       barWatch = new MutationObserver(rafThrottle(placeToasts));
@@ -18918,6 +20606,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       adoptStyles,
       // Form tab and section labels in other languages are read and written with a brief, automatic language switch.
       askLangSwitch: () => Promise.resolve(true),
+      managedMenuItem,
       providers: deps.providers,
       saver: null,
       io: deps.io
@@ -18955,9 +20644,29 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         "-",
         { head: "Settings" },
         { label: "Show logical names", checked: prefs.showNames, keep: true, run: () => savePrefs({ showNames: !prefs.showNames }) },
+        managedMenuItem(),
         "-",
-        { head: `Dynamics Translator ${"1.0.0"}` }
+        { head: `Dynamics Translator ${"1.1.0"}` }
       ], { end: true });
+    }
+    function managedMenuItem() {
+      return {
+        label: "Allow changes to managed labels",
+        checked: !!ctx.managedEdits,
+        run: () => void (async () => {
+          const on = !ctx.managedEdits;
+          if (on) {
+            const ok = await confirm2({
+              title: "Allow changes to managed labels?",
+              body: "Labels from managed solutions become editable where their solution allows it. Publishing a change to one adds an unmanaged layer on top of it: it stays until removed in Power Apps, and the solution's later updates of that label won't show.",
+              ok: "Allow"
+            });
+            if (!ok || destroyed) return;
+          }
+          ctx.managedEdits = on;
+          store.setManagedEdits(on);
+        })()
+      };
     }
     function shortcuts() {
       void modal(
@@ -19105,6 +20814,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
   var standInTip = (s, l, base, before, after, text4) => {
     const x = standIn(s, l, base, before, after, text4);
     if (!x?.text) return "";
+    if (x.follow) return `Shows “${x.text.trim()}”`;
     if (x.same) return standInSays(s, l, base, x);
     return `Becomes “${x.text.trim()}” when you save: ${standInText(s, l, base, x.from)} Was “${before}”.`;
   };
@@ -19295,8 +21005,8 @@ ${byId.get(itemId(it))?.now ?? ""}`);
   var cut2 = (v, n = 60) => v.length > n ? v.slice(0, n - 1) + "…" : v;
   function createGrid(app, o) {
     app.adoptStyles(grid_default);
-    const { store } = app, base = app.ctx.base, all2 = app.ctx.langs.map((x) => x.lcid), undo = { label: "Undo", run: () => store.undo() };
-    let rows = [], cols = [], sheet = "", typeText = (s) => s.prop, target = base, pool = [], ar = 0, ac = 0, br = 0, bc = 0, drag = false, moved2 = false, x0 = 0, y0 = 0, down = null, edKey = "", edL = 0, edStart = "", edFrom = "", edBase = "", clip = 0, pinOn = true, narrow = false, lastW = 0, owed = false, flash = null, flT, cf = null, copied = "", unk = /* @__PURE__ */ new Set(), gen = 0;
+    const { store } = app, base = app.ctx.base, all = app.ctx.langs.map((x) => x.lcid), undo = { label: "Undo", run: () => store.undo() };
+    let rows = [], cols = [], sheet = "", typeText = (s) => s.prop, target = base, pool = [], ar = 0, ac = 0, br = 0, bc = 0, drag = false, moved2 = false, x0 = 0, y0 = 0, down = null, edKey = "", edL = 0, edStart = "", edFrom = "", edPending = false, edBase = "", clip = 0, pinOn = true, narrow = false, lastW = 0, owed = false, flash = null, flT, cf = null, copied = "", unk = /* @__PURE__ */ new Set(), gen = 0;
     const live = /* @__PURE__ */ new Map();
     noteSaved(store);
     const offStore = store.on((e) => {
@@ -19417,7 +21127,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const fill2 = (r, i) => {
       const s = rows[i], [r0, c0, r1, c1] = rng(), multi = r0 !== r1 || c0 !== c1;
       if (r.i !== i) r.i = i, r.style.transform = `translateY(${i * RH}px)`, r.setAttribute("aria-rowindex", String(i + 2));
-      const [g, gt] = rowState2(store, s, all2, base), gk = g + "\0" + gt + "\0" + i;
+      const [g, gt] = rowState2(store, s, all, base), gk = g + "\0" + gt + "\0" + i;
       if (r.g.k !== gk) {
         r.g.k = gk;
         r.g.className = "g-g" + (g && " is-" + g);
@@ -19608,7 +21318,8 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       edKey = s.key;
       edL = l;
       edFrom = store.value(s.key, l);
-      edBase = store.before(s.key, l);
+      edPending = store.isEdited(s.key, l);
+      edBase = store.base(s.key, l);
       ed.value = init ?? edFrom;
       edStart = init === void 0 ? ed.value : "\0";
       ed.dir = isRtl(l) ? "rtl" : "auto";
@@ -19632,7 +21343,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       if (!s || v === edFrom || v === store.value(key, l)) return;
       if (l === base && s.baseRequired && !v.trim()) app.toast(`The ${langName(app, base)} label can't be blank.`, "warn");
       else {
-        store.set(key, l, v, store.original(key, l) === edFrom ? void 0 : edBase);
+        store.set(key, l, v, edPending && store.original(key, l) === edFrom ? void 0 : edBase);
         if (clearing(store, s, l, base) === "blocked") app.toast(blockedWhy(s, l, base, store.original(key, l), v, textOf2(store)), "warn", undo);
       }
     };
@@ -19739,7 +21450,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       const [r0, c0, r1, c1] = rng(), src = rows[r0 === r1 ? r0 - 1 : r0];
       if (src) each((_, l) => unread(src, l) ? null : store.value(src.key, l), r0 === r1 ? r0 : r0 + 1, c0, r1, c1, "Filled");
     };
-    const langHead = (v) => all2.some((l) => v === String(l) || v === keyNorm(`${langName(app, l)} Label`));
+    const langHead = (v) => all.some((l) => v === String(l) || v === keyNorm(`${langName(app, l)} Label`));
     const misfit = (d, r0, c0) => {
       const hd = headerCell(d, c0, cols.length, (j, v) => keyNorm(v) === keyNorm(cols[j].name) || !!cols[j].l && langHead(keyNorm(v)));
       if (hd)
@@ -20054,7 +21765,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
   var ENT3 = "Entity Logical Name";
   var ent = (o) => N("entity", ENT3, (s) => s.entity, o);
   var formId = (n = "Form Id") => G("form", n, (s) => B2(s.ref?.formId));
-  var formName = (n = "Form Name") => N("formname", n, (s) => str3(s.path[1]));
+  var formName2 = (n = "Form Name") => N("formname", n, (s) => str3(s.path[1]));
   var cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
   var tabOf = (s) => s.ref?.area && s.ref.area !== "body" ? cap(String(s.ref.area)) : str3(s.ref?.tabName ?? s.path[2]);
   var sectionOf = (s) => str3(s.ref?.sectionName ?? s.path[3]);
@@ -20222,14 +21933,14 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       id: "formtabs",
       name: "Forms Tabs",
       kinds: ["tab"],
-      cols: [formId(), ent(), formName(), N("tab", "Tab Name", (s) => str3(s.ref?.tabName ?? s.ref?.elId), { keep: true })],
+      cols: [formId(), ent(), formName2(), N("tab", "Tab Name", (s) => str3(s.ref?.tabName ?? s.ref?.elId), { keep: true })],
       help: "Labels of form tabs."
     },
     {
       id: "formsections",
       name: "Forms Sections",
       kinds: ["section"],
-      cols: [formId(), ent(), formName(), N("tab", "Tab Name", (s) => str3(s.ref?.tabName)), N("section", "Section Name", (s) => str3(s.ref?.sectionName ?? s.ref?.elId), { keep: true })],
+      cols: [formId(), ent(), formName2(), N("tab", "Tab Name", (s) => str3(s.ref?.tabName)), N("section", "Section Name", (s) => str3(s.ref?.sectionName ?? s.ref?.elId), { keep: true })],
       help: "Labels of form sections."
     },
     {
@@ -20239,7 +21950,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       cols: [
         formId(),
         ent(),
-        formName(),
+        formName2(),
         N("tab", "Tab Name", tabOf),
         N("section", "Section Name", sectionOf),
         N("field", "Field Name", (s) => str3(s.ref?.datafield || s.ref?.controlId), { keep: true }),
@@ -20251,7 +21962,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       id: "formnav",
       name: "Form Navigation",
       kinds: ["navitem"],
-      cols: [formId(), ent(), formName(), N("item", "Item Id", (s) => str3(s.ref?.elId), { w: 200, keep: true })],
+      cols: [formId(), ent(), formName2(), N("item", "Item Id", (s) => str3(s.ref?.elId), { w: 200, keep: true })],
       help: "Labels of the related-records items in a form's navigation."
     },
     sm("Area", "area", 0),
@@ -20268,7 +21979,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       id: "dashboardtabs",
       name: "Dashboards Tabs",
       kinds: ["dtab"],
-      cols: [formId("Dashboard Id"), formName("Dashboard Name"), N("tab", "Tab Name", (s) => str3(s.ref?.tabName ?? s.ref?.elId), { keep: true })],
+      cols: [formId("Dashboard Id"), formName2("Dashboard Name"), N("tab", "Tab Name", (s) => str3(s.ref?.tabName ?? s.ref?.elId), { keep: true })],
       help: "Labels of dashboard tabs."
     },
     {
@@ -20277,7 +21988,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       kinds: ["dsection"],
       cols: [
         formId("Dashboard Id"),
-        formName("Dashboard Name"),
+        formName2("Dashboard Name"),
         N("tab", "Tab Name", (s) => str3(s.ref?.tabName)),
         N("section", "Section Name", (s) => str3(s.ref?.sectionName ?? s.ref?.elId), { keep: true })
       ],
@@ -20289,7 +22000,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       kinds: ["dfield"],
       cols: [
         formId("Dashboard Id"),
-        formName("Dashboard Name"),
+        formName2("Dashboard Name"),
         N("tab", "Tab Name", tabOf),
         N("section", "Section Name", sectionOf),
         N("component", "Component", (s) => str3(s.ref?.controlId), { keep: true })
@@ -20576,7 +22287,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
   var DN_DEF = 185;
   var DN_KEY = "setup:dn";
   var uid = 0;
-  function createSetup(app, st, save, onExtract) {
+  function createSetup(app, st, save2, onExtract) {
     app.adoptStyles(setup_default);
     const { ctx, providers: providers2 } = app;
     const id = `su${++uid}`;
@@ -20584,7 +22295,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const signal = ac.signal;
     const sel = new Set(st.tables);
     const names3 = /* @__PURE__ */ new Map();
-    let all2 = null;
+    let all = null;
     let sols = null;
     let solsErr = "";
     let rows = [];
@@ -20596,7 +22307,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     st.tablesFor ??= listKey(st);
     const changed = () => {
       st.tables = [...sel];
-      save();
+      save2();
     };
     const loadBtn = h("button", { type: "button", class: "btn sm", on: { click: () => void reload() } }, "Load Entities");
     const checkBtn = h(
@@ -20683,7 +22394,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     };
     const keepWidth = (w) => {
       st.widths[DN_KEY] = width(w);
-      save();
+      save2();
     };
     handle.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
@@ -20778,20 +22489,20 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       put(stNote, h("div", { class: "su-sk", "aria-label": "Loading entities" }, [1, 2, 3, 4, 5].map(() => h("div", { class: "sk" }, h("i", { style: { width: "16px", height: "16px" } }), h("i", { style: { flex: "1", height: "12px" } })))));
       listCount.textContent = "Loading entities…";
       try {
-        if (!all2 || o.fresh) {
+        if (!all || o.fresh) {
           const ts = await providers2.listTables(ctx, signal);
           for (const x of ts) names3.set(x.logicalName, pick(x.displayName, ctx.user, ctx.base) || x.logicalName);
-          all2 = ts;
+          all = ts;
         }
         if (t !== tok || destroyed) return;
         if (solution && !st.sol) {
           showState("Select a solution to list its tables.");
           return;
         }
-        let tables = all2;
+        let tables = all;
         if (solution) {
           const inSol = new Set(await providers2.solutionTables(ctx, st.sol, signal));
-          tables = all2.filter((x) => inSol.has(x.logicalName));
+          tables = all.filter((x) => inSol.has(x.logicalName));
         }
         if (t !== tok || destroyed) return;
         if (o.clear) sel.clear();
@@ -20802,7 +22513,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         fill2(tables, solution ? "solution" : "all");
       } catch (e) {
         if (t !== tok || destroyed || isAbort(e)) return;
-        if (!all2) showState(retry(`Couldn't load the entities: ${errText2(e)}`, () => void list2({ fresh: true })), true);
+        if (!all) showState(retry(`Couldn't load the entities: ${errText2(e)}`, () => void list2({ fresh: true })), true);
         else showState(retry(`Couldn't read the tables of ${st.solName || "the solution"}: ${errText2(e)}`, () => void list2(o)), true);
       } finally {
         if (t === tok && !destroyed) {
@@ -20823,7 +22534,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const setSource = (v) => {
       if (v === st.source) return;
       st.source = v;
-      save();
+      save2();
       sync();
       void list2();
       if (v === "solution" && !st.sol) solSel.focus();
@@ -20832,7 +22543,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       const s = sols?.find((x) => x.id === v);
       st.sol = s?.id || "";
       st.solName = s?.name || "";
-      save();
+      save2();
       void list2({ clear: true });
     };
     const drawSols = () => {
@@ -20856,7 +22567,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         if (st.sol && !sols.some((x) => x.id === st.sol)) {
           st.sol = "";
           st.solName = "";
-          save();
+          save2();
           if (st.source === "solution") void list2();
         }
       } catch (e) {
@@ -20873,7 +22584,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       opts2.map((o) => {
         const hint = HINTS[o.id];
         const hid = `${id}-h-${o.id}`;
-        const cb = h("input", { type: "checkbox", "aria-describedby": hint ? hid : null, on: { change: () => (st.opts[o.id] = cb.checked, save(), sync()) } });
+        const cb = h("input", { type: "checkbox", "aria-describedby": hint ? hid : null, on: { change: () => (st.opts[o.id] = cb.checked, save2(), sync()) } });
         boxes.set(o.id, cb);
         const lab = h("label", { class: "su-o" }, cb, h("span", null, o.label), hint ? h("span", { id: hid, hidden: true }, hint) : null);
         if (hint) {
@@ -20893,7 +22604,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
           click: () => {
             const on = !opts2.some((o) => st.opts[o.id] ?? o.def);
             for (const o of opts2) st.opts[o.id] = on;
-            save();
+            save2();
             sync();
           }
         }
@@ -20919,7 +22630,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const only = (l) => {
       if (l && l !== ctx.base) app.savePrefs({ target: l, shown: [l] });
     };
-    const rowsSel = h("select", { class: "sel", id: `${id}-rows`, on: { change: () => (st.rows = rowsSel.value, save()) } });
+    const rowsSel = h("select", { class: "sel", id: `${id}-rows`, on: { change: () => (st.rows = rowsSel.value, save2()) } });
     const langBox = h(
       "div",
       { class: "su-box", role: "group", "aria-labelledby": `${id}-lh` },
@@ -20934,11 +22645,11 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     );
     const modeR = /* @__PURE__ */ new Map();
     const modeRadio = (m, text4) => {
-      const r = h("input", { type: "radio", name: `${id}-mode`, value: m, on: { change: () => r.checked && (st.labelMode = m, save()) } });
+      const r = h("input", { type: "radio", name: `${id}-mode`, value: m, on: { change: () => r.checked && (st.labelMode = m, save2()) } });
       modeR.set(m, r);
       return h("label", { class: "su-o" }, r, h("span", null, text4));
     };
-    const roCb = h("input", { type: "checkbox", on: { change: () => (st.ro = roCb.checked, save(), all2 && void list2()) } });
+    const roCb = h("input", { type: "checkbox", on: { change: () => (st.ro = roCb.checked, save2(), all && void list2()) } });
     const labelBox = h(
       "div",
       { class: "su-box su-wide", role: "group", "aria-labelledby": `${id}-mh` },
@@ -21006,7 +22717,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const onPrefs = () => sync();
     app.root.host.addEventListener("dxt-prefs", onPrefs);
     const init = () => initP ??= Promise.all([loadSols(), list2()]).then(() => {
-      if (!all2) initP = null;
+      if (!all) initP = null;
     });
     const scope = () => scopeOf(st, [...sel], listing ? "loading" : rows.length ? "shown" : filled ? "empty" : "none", st.tablesFor);
     drawSols();
@@ -21258,11 +22969,11 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       while (p < src.length && src[p] !== "]") {
         const a = atom();
         if (src[p] === "-" && src[p + 1] !== "]" && p + 1 < src.length && a.length === 1 && a[0][0] === a[0][1]) {
-          const save = p++;
+          const save2 = p++;
           const b = atom();
           if (b.length === 1 && b[0][0] === b[0][1]) set.push([a[0][0], b[0][0]]);
           else {
-            p = save;
+            p = save2;
             set.push(...a);
           }
         } else set.push(...a);
@@ -21966,7 +23677,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     const excelB = headBtn("table", "Excel", () => excelMenu(), "", true);
     excelB.setAttribute("aria-haspopup", "menu");
     excelB.setAttribute("aria-expanded", "false");
-    const saveB = headBtn("save", SAVE, () => void save(), "primary");
+    const saveB = headBtn("save", SAVE, () => void save2(), "primary");
     saveB.setAttribute("aria-keyshortcuts", "Control+S");
     const head = h("div", { class: "wb-head" }, h("h2", null, "Translation workbook"), extractB, excelB, saveB);
     const filter = h("input", { type: "search", placeholder: "Filter rows", "aria-label": "Filter rows on every sheet" });
@@ -22104,8 +23815,8 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       } else put(empty);
     };
     const drawCount = () => {
-      const all2 = by.get(sheetId)?.length ?? 0;
-      cnt.textContent = all2 && (q2.length || rowsMode() !== "all") ? `${rows.length.toLocaleString()} of ${plural(all2, "row")}` : "";
+      const all = by.get(sheetId)?.length ?? 0;
+      cnt.textContent = all && (q2.length || rowsMode() !== "all") ? `${rows.length.toLocaleString()} of ${plural(all, "row")}` : "";
     };
     const selectSheet = (id, restore2 = true) => {
       if (!by.has(id)) return;
@@ -22357,7 +24068,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       filter.value = "";
       setRowsMode(m, true);
     };
-    const save = async () => {
+    const save2 = async () => {
       grid.commit();
       if (loading) return say("Wait for the labels to finish loading, then save.", "info");
       if (!store.pendingCount()) return say("No pending translation changes to save.", "info");
@@ -22372,7 +24083,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       keepFocus(() => setupShown ? toggleB : grid);
     };
     const allRows = () => ORDER.flatMap((id) => by.get(id) ?? []);
-    const withEdits = (list2) => list2.map((s) => {
+    const withEdits2 = (list2) => list2.map((s) => {
       const e = store.edits.get(s.key);
       return e ? { ...s, labels: { ...s.labels, ...Object.fromEntries(e) } } : s;
     });
@@ -22390,7 +24101,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       const name = `Translations ${ctx.org}${k === "sheet" ? ` ${DEF.get(sheetId)?.name ?? ""}` : ""} ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.${k === "csv" ? "csv" : "xlsx"}`;
       say("Preparing the file…", "info", [], true);
       try {
-        const slots = withEdits(list2);
+        const slots = withEdits2(list2);
         download(k === "csv" ? app.io.exportCsv(slots, langs) : await app.io.exportWorkbook(slots, langs, name), name);
         const n = store.pendingCount();
         say(`Downloaded ${name}: ${plural(list2.length, "row")} in ${plural(langs.length, "language")}.${n ? " Pending changes are in the file; they are not saved yet." : ""}`, "ok");
@@ -22548,7 +24259,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
     el.addEventListener("keydown", (e) => {
       if (e.isComposing || e.defaultPrevented || !(e.ctrlKey || e.metaKey) || e.altKey) return;
       const k = (e.key || "").toLowerCase();
-      if (k === "s") e.preventDefault(), void save();
+      if (k === "s") e.preventDefault(), void save2();
       else if (k === "f") e.preventDefault(), find3();
     });
     const find3 = () => {
@@ -22560,7 +24271,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
       filter.select();
     };
     el.addEventListener("dxt-search", find3);
-    el.addEventListener("dxt-save", () => void save());
+    el.addEventListener("dxt-save", () => void save2());
     const onPrefs = (e) => {
       const p = e.detail || {};
       if ("shown" in p || "target" in p) sticky.clear();
@@ -22738,6 +24449,7 @@ Switch it back to ${lcidName(m.lcid)}? Cancel keeps ${lcidName(now)}.`
       self.destroy = app.destroy;
       self.starting = false;
       if (restored) app.api.toast("Your Dynamics language was restored after an interrupted save.", "info");
+      if (ctx.customizer === false) app.api.toast(`${NOT_CUSTOMIZER} You can look at them and export them.`, "warn");
       if (devWin) devWin.__dxtDev = devInfo = { ctx, store, lang, providers, app: app.api };
     } catch (e) {
       if (!current2()) return;

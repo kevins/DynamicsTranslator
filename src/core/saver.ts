@@ -1,17 +1,18 @@
 // Save orchestration: stand-ins for emptied translations Dataverse can't remove (model.ts standIn) → validate →
 // write each group through its provider, scheduled by lane (a stand-in made of a text another group writes: once that
 // is saved) → check the UI language is back → commit to the store → undo journal → one targeted publish, once every
-// write has finished (LIVE-FINDINGS 48: a write during PublishXml slows it down 5× and gets published half-way)
-// → an update of each business process flow whose name was written (LIVE-FINDINGS 83).
+// write has finished (LIVE-FINDINGS 48: a write during PublishXml slows it down 5× and gets published half-way), while no
+// UI-language switch window is open (LangSession.quiet) → an update of each business process flow whose name was
+// written (LIVE-FINDINGS 83).
 
-import { changeId, check as compare, type Lane, type SaveOptions, type ServerTexts, type Writer } from '../providers/types';
+import { changeId, check as compare, type FormWrite, type Lane, type SaveOptions, type ServerTexts, type Writer } from '../providers/types';
 import type { HistoryEntry, HistoryItem, Issue, PendingWork, Prepared, PrepareOptions, SaveReport, SaveRunOptions, SaverApi } from '../ui/types';
-import type { Ctx } from './context';
+import { NOT_CUSTOMIZER, type Ctx } from './context';
 import { addHistory, markPublished, markUndone, readHistory } from './history';
 import { DvError, guid, isAbort, q } from './http';
 import { WAITING, type LangSession } from './langsession';
 import { lcidName } from './lcid';
-import { baseNameFirst, canClear, isManaged, keepsEmpty, MANAGED, namesFirst, noStandIn, perLanguage, PublishSet, refusedBlank, savesEmpty, sourceMoved, sourceUnread, sourceUnsaved, standIn, standInSources, storedEmpty, type Change, type ChangeResult, type Kind, type Lcid, type Outcome, type Prop, type Slot, type TextOf } from './model';
+import { baseNameFirst, canClear, columnKey, columnNames, filledIn, isManaged, keepsEmpty, managedHeld, managedReadOnly, namesFirst, noStandIn, perLanguage, PublishSet, refusedBlank, savesEmpty, sourceMoved, sourceUnread, sourceUnsaved, standIn, standInSources, storedEmpty, type Change, type ChangeResult, type Kind, type Lcid, type Outcome, type Prop, type Slot, type TextOf } from './model';
 import { isLockError, PartialPublishError, publishTargets, publishXml, rebuildProcess } from './publish';
 import type { Store } from './store';
 
@@ -19,6 +20,8 @@ import type { Store } from './store';
 type Purpose = 'save' | 'undo';
 
 const CANCELLED = 'Cancelled before saving';
+/** Why a second save or undo is refused while one runs: they share the language session and the customization lock. */
+const BUSY = 'A save is already running. Wait for it to finish.';
 /** Metadata kinds written with UpdateOptionValue / UpdateStateValue (only the changed languages are sent). */
 const OPTIONS = /^(option|status|state|boolean|globaloption)$/;
 const placeholders = (t: string) => (t.match(/\{\d+\}/g) || []).length;
@@ -71,13 +74,14 @@ export const saveText = (store: Pick<Store, 'text'>, sent: readonly Change[], no
  * is saved empty (model.ts savesEmpty). An Undo back to no translation of such a description (Change.untranslated)
  * whose stand-in is its base text, empty as the run leaves it, is saved empty after all: that language's users saw no
  * text there before the publish, which '' gives them again (passed on without the mark). Every other change, and one
- * whose stand-in isn't known (check() refuses it, saying why), is passed on as the same object.
+ * whose stand-in isn't known (check() refuses it, saying why), is passed on as the same object. `managed`: changes to
+ * labels from managed solutions are allowed (Ctx.managedEdits), so one of those that isn't read-only gets its stand-in too.
  */
-export function withStandIns(changes: readonly Change[], base: Lcid, text: TextOf): Change[] {
+export function withStandIns(changes: readonly Change[], base: Lcid, text: TextOf, managed?: boolean): Change[] {
   return changes.map((c) => {
-    if (c.standIn || c.slot.readOnly || isManaged(c.slot)) return c;
+    if (c.standIn || c.slot.readOnly || managedHeld(c.slot, managed)) return c;
     const x = standIn(c.slot, c.lcid, base, c.before, c.after, text, c.untranslated);
-    if (x?.text) return { ...c, after: x.text, standIn: { from: x.from, typed: c.after } };
+    if (x?.text) return { ...c, after: x.text, standIn: { from: x.from, typed: c.after, ...(x.follow ? { follow: true as const } : {}) } };
     if (x && c.untranslated && !x.unloaded && keepsEmpty(c.slot)) {
       const { untranslated: _, ...none } = c;
       return none;
@@ -171,6 +175,22 @@ export function schedule(lanes: Record<Lane, Job[]>, run: Run, lang: Pick<LangSe
 export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor: (k: Kind) => Writer | undefined): SaverApi {
   let running = false;
   const base = ctx.base;
+  const langs = ctx.langs.map((l) => l.lcid);
+  /** The store's texts as loaded (or read since), never a pending edit (model.ts TextOf). */
+  const loaded: TextOf = (k, l) => store.text(k, l, true);
+  /**
+   * The form writer's view of the columns its labels show (SaveOptions.column), for a run that leaves their names as
+   * `text` reads them: their names as loaded and as the run leaves them, and the languages where the name a form read
+   * fills in changes with the run (a language without a name of its own shows the base language's, LIVE-FINDINGS 42).
+   */
+  const columnsOf =
+    (text: TextOf): NonNullable<SaveOptions['column']> =>
+    (entity, attr) => {
+      const k = `attribute|${entity}.${attr}|DisplayName`;
+      if (!store.get(k)) return undefined;
+      const [was, now] = [columnNames(k, langs, base, loaded), columnNames(k, langs, base, text)];
+      return { names: columnNames(k, langs, base, loaded, text), renamed: langs.filter((l) => was[l][0] !== now[l][0]) };
+    };
   /**
    * The text the server holds once a change is saved: a blank value removes that translation (ARCHITECTURE
    * §4 "Clearing a translation"; a blank base-language description and a metadata description saved empty, model.ts
@@ -203,7 +223,7 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
       const { slot: s, lcid, after: v } = c;
       // A component from a managed solution is read-only even where its slot slipped through as editable: saving it
       // would put an unmanaged layer on it.
-      const ro = s.readOnly || (isManaged(s) ? MANAGED : '');
+      const ro = s.readOnly || (isManaged(s) ? managedReadOnly(s, ctx.managedEdits) : '');
       if (ro) {
         out.push({ change: c, level: 'error', message: `Read-only: ${ro}` });
         continue;
@@ -289,7 +309,7 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     let sent = staged.filter(writes);
     for (let round = 0; ; round++) {
       const text = saveText(store, sent, o.now);
-      const changes = withStandIns(staged, base, text);
+      const changes = withStandIns(staged, base, text, ctx.managedEdits);
       const issues = check(changes, purpose, text);
       const at = new Map(changes.map((c, i) => [c, i] as const));
       const bad = new Set(issues.filter((i) => i.level === 'error').map((i) => at.get(i.change)));
@@ -395,11 +415,45 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     // (never a silent "unchanged" over someone else's newer text). One that couldn't be read goes to its writer, which
     // reads it again.
     const was = new Map(sent.map((c) => [changeId(c), c.before] as const));
-    const stood = changes.filter((c) => c.standIn && !blocked.has(c) && !c.slot.readOnly && !isManaged(c.slot));
-    const same = new Set(stood.filter((c) => bare(c.after) === bare(c.before)));
+    const stood = changes.filter((c) => c.standIn && !blocked.has(c) && !c.slot.readOnly && !managedHeld(c.slot, ctx.managedEdits));
+    // A label freed of its own text (model.ts StandIn follow) is written even where it reads the same: it then follows.
+    const same = new Set(stood.filter((c) => !c.standIn!.follow && bare(c.after) === bare(c.before)));
+    const ids = new Set(changes.map(changeId));
     const { stale, now } = stood.length
       ? await sources(stood, [...same], (k, l) => was.get(`${k}#${l}`) ?? store.original(k, l), signal)
       : { stale: new Map<Change, string>(), now: new Map<Change, string | Error>() };
+    /**
+     * The changes written once the metadata lane is done (the `after` round), so that a rename of their column this run
+     * makes has landed when their form is read: what they write is right only then.
+     */
+    const renamedFirst = new Set<Change>();
+    const sentIds = new Set(sent.map(changeId));
+    /**
+     * The renames an edit of `renamedFirst` waits for, by change (its column's name in its language, or in the base one
+     * where it has none there): never written to be found as asked while the label shows that name filled in, it is right
+     * only once they are saved, so it is held back should one not be (gate()).
+     */
+    const firstOf = new Map<Change, Array<{ key: string; lcid: Lcid; id: string }>>();
+    // An edit of a form label that showed its column's name while this run renames that column: once the rename has
+    // landed, a fresh read shows the new name there, filled in (LIVE-FINDINGS 103), this run's own change, never a
+    // conflict, whichever write goes first (the lanes run side by side, LIVE-FINDINGS 44). One that writes the name the
+    // column goes by now (typed so, or an undo putting it back) is written once the rename has landed; where the label
+    // shows that name, filled in (`before`), only if it has: written before, it would be found as asked, then show the new
+    // name. Over a text of the label's own it is stored on the label's key whichever write lands first (LIVE-FINDINGS 104),
+    // so it is written whatever the rename's outcome.
+    for (const [i, c] of changes.entries()) {
+      if (c.slot.kind !== 'field' || c.slot.prop !== 'Label' || c.standIn || blocked.has(c) || !columnKey(c.slot)) continue;
+      const k = columnKey(c.slot);
+      const old = filledIn(c.slot, c.lcid, base, loaded);
+      const next = filledIn(c.slot, c.lcid, base, text);
+      if (next === undefined || old === undefined || next === old) continue;
+      if (bare(c.before) === bare(old)) changes[i] = { ...c, alsoBefore: next };
+      if (bare(c.after) !== bare(old)) continue;
+      renamedFirst.add(changes[i]);
+      if (bare(c.before) !== bare(old)) continue;
+      const from = loaded(k, c.lcid)?.trim() || text(k, c.lcid)?.trim() ? 'column' : 'columnBase';
+      firstOf.set(changes[i], standInSources(c.slot, c.lcid, base, from).map((src) => ({ ...src, id: `${src.key}#${src.lcid}` })).filter((src) => sentIds.has(src.id) && ids.has(src.id)));
+    }
     // A stand-in made of a text this run writes (`deps`: the column's new name, its English text) is that text only once
     // it is saved. Written in the same write of the same job, it fails with it (one request; a text someone changed
     // since was found by sources()). Written by another job (`apart`: a form label of its column's name), its job is set
@@ -408,7 +462,6 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     // Written by another pass of its own job (Writer.pass: a tab's or a timeline's French made of its English text, each
     // language written in its own), it goes in a job of its own (`later`), written in a third round once its job has
     // ended, held back the same way. One that needs no write is decided once those are known too (`wait`).
-    const sentIds = new Set(sent.map(changeId));
     const byId = new Map(changes.map((c) => [changeId(c), c] as const));
     const deps = new Map<Change, Array<{ key: string; lcid: Lcid; id: string }>>();
     for (const c of stood) {
@@ -429,15 +482,21 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
         const x = byId.get(src.id)!;
         return writerFor(x.slot.kind) === writerFor(c.slot.kind) && x.slot.group === c.slot.group;
       }) && apart(c).length > 0;
+    /** Why `c` can't be written now because one of the texts of this run it waits for (`list`) wasn't saved (undefined: they all were). */
+    const unsaved = (c: Change, list: ReadonlyArray<{ key: string; lcid: Lcid; id: string }>): string | undefined => {
+      const src = list.find((x) => {
+        const r = outcomes.get(x.id);
+        return r?.outcome !== 'saved' && r?.outcome !== 'unchanged';
+      });
+      return src && sourceUnsaved(c.slot, src);
+    };
     /**
      * Why a stand-in made of texts this run writes can't be written now (undefined: it can): one of them (`list`) wasn't
      * saved, or the texts saved don't give the text it was measured as (measured again by them, as model.ts standIn does).
      */
     const ready = (c: Change, list: ReadonlyArray<{ key: string; lcid: Lcid; id: string }>): string | undefined => {
-      for (const src of list) {
-        const r = outcomes.get(src.id);
-        if (r?.outcome !== 'saved' && r?.outcome !== 'unchanged') return sourceUnsaved(c.slot, src);
-      }
+      const no = unsaved(c, list);
+      if (no) return no;
       const confirmed = (k: string, l: Lcid): string | undefined => {
         const r = list.some((src) => src.id === `${k}#${l}`) ? outcomes.get(`${k}#${l}`) : undefined;
         return r ? stored(r.change.after) : text(k, l);
@@ -471,7 +530,7 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
       const read = same.has(c) ? now.get(c) : undefined;
       const r = typeof read === 'string' ? compare(c, read, o.force ?? new Set()) : null;
       // Read-only (a managed solution's component included): skipped with the reason, never sent to a writer.
-      if (c.slot.readOnly || isManaged(c.slot) || held.has(c)) finish({ change: c, outcome: 'skipped', message: msg });
+      if (c.slot.readOnly || managedHeld(c.slot, ctx.managedEdits) || held.has(c)) finish({ change: c, outcome: 'skipped', message: msg });
       else if (msg) finish({ change: c, outcome: 'error', message: msg });
       else if (stale.has(c)) finish({ change: c, outcome: 'error', message: stale.get(c) });
       else if (r?.outcome === 'unchanged' && deps.has(c)) wait.push(c);
@@ -495,20 +554,52 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     const after: Record<Lane, Job[]> = { metadata: [], records: [], xml: [], doc: [], ribbon: [] };
     /** The stand-ins made of a text another pass of their own group writes (inPass): written once that group's job has ended. */
     const later: Record<Lane, Job[]> = { metadata: [], records: [], xml: [], doc: [], ribbon: [] };
-    for (const j of jobs) (split.has(j[1]) ? later : j[1].some((c) => apart(c).length) ? after : lanes)[j[0].lane].push(j);
+    // A form whose save posts some cells as read (a type or zone outside providers/formxml.ts SPARSE, a quick view control)
+    // and shows a column this run renames: its read could show the old name filled in (LIVE-FINDINGS 103), which posted
+    // as read Dataverse would store (104, 108), right as the rename lands. Written in the second round, once the metadata
+    // lane is done, so its read shows the new name. A form that shows none of those columns, or shows them only in cells
+    // it posts where they change, goes on beside the metadata lane (LIVE-FINDINGS 44).
+    const renames = new Set(changes.filter((c) => c.slot.kind === 'attribute' && c.slot.prop === 'DisplayName' && sentIds.has(changeId(c)) && !blocked.has(c)).map((c) => c.slot.key));
+    /** Per form, the columns its cells posted as read show (null: none of its fields is loaded, so unknown). */
+    const asRead = new Map<string, Set<string> | null>();
+    const waitsForRename = ([, cs]: Job): boolean => {
+      if (!renames.size) return false;
+      const form = guid(cs[0].slot.ref?.formId);
+      if (!asRead.has(form)) {
+        const fields = [...store.slots.values()].filter((s) => s.kind === 'field' && guid(s.ref?.formId) === form);
+        const shown = fields.filter((s) => s.ref?.sparse !== true && s.ref?.datafield).map((s) => `attribute|${s.entity}.${String(s.ref.datafield).toLowerCase()}|DisplayName`);
+        asRead.set(form, fields.length ? new Set(shown) : null);
+      }
+      const cols = asRead.get(form);
+      return [...renames].some((k) => (cols ? cols.has(k) : k.startsWith(`attribute|${cs[0].slot.entity}.`)));
+    };
+    for (const j of jobs) (split.has(j[1]) ? later : j[1].some((c) => apart(c).length || renamedFirst.has(c)) || (j[0].lane === 'xml' && waitsForRename(j)) ? after : lanes)[j[0].lane].push(j);
 
     // 2. Write. A failing group never stops the others.
     const pset = new PublishSet();
     /** The changes a write of this run may have saved (SaveOptions.ran), as the writers say. */
     const ran = new Set<string>();
-    const so: SaveOptions = { signal, publish: pset, progress: tell, force: o.force ?? new Set(), ran, lang, allowPublish: o.publish };
+    const warnings: string[] = [];
+    /** What the user is told after a save that needs nothing tried again or undone (SaveReport.notice). */
+    const notices: string[] = [];
+    /** What the form writer knew of each form it wrote (SaveOptions.forms, SaveReport.forms). */
+    const forms = new Map<string, FormWrite>();
+    const so: SaveOptions = { signal, publish: pset, progress: tell, force: o.force ?? new Set(), ran, lang, allowPublish: o.publish, column: columnsOf(text), forms };
     const runJob = async ([w, cs]: Job): Promise<void> => {
       const got = new Map<string, ChangeResult>();
       let err: unknown = null;
       const sending = !signal.aborted;
+      // What the writer tells the user (SaveOptions.warn), once per job: the form writer's job is one form, so two forms
+      // of the same name each keep their own message, though both read alike.
+      const said = new Set<string>();
+      const warn = (m: string, level: 'warning' | 'notice') => {
+        if (said.has(level + m)) return;
+        said.add(level + m);
+        (level === 'warning' ? warnings : notices).push(m);
+      };
       if (sending)
         try {
-          for (const r of await w.save(ctx, cs, so)) got.set(changeId(r.change), r);
+          for (const r of await w.save(ctx, cs, { ...so, warn })) got.set(changeId(r.change), r);
         } catch (e) {
           err = e;
         }
@@ -540,7 +631,6 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     // A language switch whose answer was lost may still run on the server: every write waits for it, and says so
     // (LangSession doubtful); Stop ends the wait for this save.
     const offWait = lang.onWait?.((w) => tell(w ? WAITING : idle));
-    const warnings: string[] = [];
     /** The UI language could not be switched back (said in `warnings`): nothing switches it again in this run. */
     let stuck = false;
     // Every switch of the UI language is checked and put back by LangSession itself; this waits for that and
@@ -567,12 +657,13 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
       await settled(schedule(lanes, runJob, stoppable));
       decide(false);
       // Then the jobs with a stand-in made of a text another job wrote, the same way: a stand-in whose text wasn't saved
-      // is held back (skipped, saying so: Try again writes both), the rest of its job written.
+      // is held back (skipped, saying so: Try again writes both), the rest of its job written; so is an edit that waits
+      // for its column's rename (firstOf), should that not be saved.
       const gate: Run = ([w, cs]) => {
         if (!signal.aborted)
           for (const c of [...cs]) {
             const list = apart(c);
-            const why = list.length ? ready(c, list) : undefined;
+            const why = list.length ? ready(c, list) : unsaved(c, firstOf.get(c) ?? []);
             if (!why) continue;
             cs.splice(cs.indexOf(c), 1);
             finish({ change: c, outcome: 'skipped', message: why });
@@ -624,17 +715,20 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
       );
 
     // 4. One targeted publish. A label already as asked ('unchanged') counts too: it may be an earlier write whose
-    // answer was lost (reported as not checked), never published; its writer then put it in the publish set.
+    // answer was lost (reported as not checked), never published; its writer then put it in the publish set. Under
+    // LangSession.quiet: no UI-language switch window starts while it runs (the page's loads, the check behind them, another
+    // tab's), and one open is waited for; Stop ends that wait.
     const done = saved.length + results.filter((r) => r.outcome === 'unchanged').length;
     let published = done > 0 && live;
     let publishError: string | undefined;
     // The processes to update (step 5) are part of this phase: the Publish dialog shows them on its Publishing step. Only
-    // processes whose name a writer saved, so never one from a managed solution (rebuildProcess checks that again).
+    // processes whose name a writer saved, so one from a managed solution only where this session allows changes to
+    // managed labels (rebuildProcess checks that again).
     const procs = o.publish && done ? [...pset.processes] : [];
     if (o.publish && done && (!live || procs.length)) tell('Publishing…');
     if (o.publish && done && !live) {
       try {
-        await publishXml(ctx, pset, signal, tell);
+        await lang.quiet(() => publishXml(ctx, pset, signal, tell), signal);
         published = true;
         if (historyId) await markPublished(ctx, [historyId]);
       } catch (e) {
@@ -650,7 +744,8 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
 
     // 5. A process whose name was written shows it on the page only once the process itself is updated (LIVE-FINDINGS
     // 83): once each, after every write and the publish, so outside every quiet() window (rebuildProcess's switch to
-    // the base language needs the exclusive window, which a save lane's quiet() job would hold it from for good).
+    // the base language needs the exclusive window, which a save lane's quiet() job, or the publish's, would hold it from
+    // for good).
     // Never retried, and a failure never undoes the save: the page may only show the old name for now.
     let notice: string | undefined;
     if (procs.length) {
@@ -691,15 +786,19 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
       ms: Math.round(performance.now() - t0),
       historyId,
     };
+    if (forms.size) report.forms = forms;
     if (warnings.length) report.warning = warnings.join(' ');
-    if (notice) report.notice = notice;
+    if (notice) notices.push(notice);
+    if (notices.length) report.notice = notices.join(' ');
     if (__DEV__) console.log('[translator] save', report, ctx.http.stats);
     return report;
   }
 
   /** One save or undo at a time: they share the language session and the customization lock. */
   async function start(changes: Change[], o: SaveRunOptions, purpose: Purpose): Promise<SaveReport> {
-    if (running) throw new Error('A save is already running. Wait for it to finish.');
+    // Without either role nothing is sent (Ctx.customizer), whichever button asked.
+    if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
+    if (running) throw new Error(BUSY);
     running = true;
     store.setBusy(true, purpose === 'undo' ? 'Undoing a save' : 'Saving');
     try {
@@ -718,7 +817,7 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
    * reads as "nothing pending".
    */
   async function pendingWork(changes: Change[], signal?: AbortSignal): Promise<PendingWork[]> {
-    const ents = [...publishTargets(changes).entities];
+    const ents = [...publishTargets(changes, ctx.managedEdits).entities];
     const mine = new Set<string>();
     for (const { slot: s } of changes) {
       const id = s.ref?.formId || (/^(form|view|chart)$/.test(s.kind) && s.ref?.id);
@@ -846,6 +945,32 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
     return out;
   }
 
+  /**
+   * Publish again's repair (SaverApi.writeAgain, LIVE-FINDINGS 117, 118): each writer writes its labels again
+   * (Writer.again) with the options a save's writes get, the columns' names as loaded, and calls `publish`. One writer
+   * after the other, so that no write of a form runs while a column it shows is renamed with MARK. One at a time with
+   * saves and undos, which share the language session and the customization lock.
+   */
+  async function writeAgain(changes: Change[], publish: (signal?: AbortSignal) => Promise<void>, signal: AbortSignal, warn?: SaveOptions['warn']): Promise<ChangeResult[]> {
+    if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
+    if (running) throw new Error(BUSY);
+    const by = new Map<Writer, Change[]>();
+    for (const c of changes) {
+      const w = writerFor(c.slot.kind);
+      if (!w?.again) throw new Error("These labels can't be written again here.");
+      (by.get(w) ?? by.set(w, []).get(w)!).push(c);
+    }
+    running = true;
+    try {
+      const so: SaveOptions = { signal, publish: new PublishSet(), progress: () => {}, force: new Set(), lang, allowPublish: true, column: columnsOf(loaded), ...(warn ? { warn } : {}) };
+      const out: ChangeResult[] = [];
+      for (const [w, cs] of by) out.push(...(await w.again!(ctx, cs, so, publish)));
+      return out;
+    } finally {
+      running = false;
+    }
+  }
+
   /** The changes as a run of them writes them, measured as it measures them (measure); each issue names the change it was given. */
   function prepare(changes: Change[], o: PrepareOptions = {}): Prepared {
     const m = measure(changes, o.undo ? 'undo' : 'save', o);
@@ -856,11 +981,12 @@ export function createSaver(ctx: Ctx, store: Store, lang: LangSession, writerFor
   return {
     validate: (changes, o) => prepare(changes, o).issues,
     prepare,
-    publishTargets,
+    publishTargets: (changes) => publishTargets(changes, ctx.managedEdits),
     pendingWork,
     save: (changes, o) => start(changes, o, 'save'),
     history: () => readHistory(ctx),
     current,
+    writeAgain,
     undo,
   };
 }

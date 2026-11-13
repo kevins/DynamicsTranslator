@@ -1149,6 +1149,44 @@ export function register(t: Kit): void {
   const lpOf = (table: string) => `Microsoft.PowerApps.PowerAppsOneGrid|entity_control|${table}|${VW}|${table}`;
   const column = (entity: string, attr: string, en: string, fr: string): Slot =>
     ({ ...t.slot('attribute', `attribute|${entity}.${attr}|DisplayName`, { 1033: en, 1036: fr }), prop: 'DisplayName', comp: `attribute|${entity}.${attr}`, entity, ref: { entity, attribute: attr, odataType: 'Microsoft.Dynamics.CRM.StringAttributeMetadata' } }) as Slot;
+  /**
+   * The scanner's page on the overlay tests' document (install() first): fakedom elements that know whether they are in
+   * it, as update() asks. `show` sets what its body holds; `done` takes the elements' page properties away again.
+   */
+  const fakePage = () => {
+    let body: El = new El('body');
+    const inPage = (e: El | null): boolean => {
+      while (e?.parentElement) e = e.parentElement;
+      return e === body;
+    };
+    const props: Array<[string, PropertyDescriptor]> = [
+      ['nodeType', { get: () => 1, configurable: true }],
+      ['isConnected', { get(this: El) { return inPage(this); }, configurable: true }],
+      ['firstElementChild', { get(this: El) { return this.children[0] ?? null; }, configurable: true }],
+    ];
+    for (const [k, d] of props) Object.defineProperty(El.prototype, k, d);
+    const doc = document as unknown as Record<string, unknown>;
+    const fake = { querySelectorAll: doc.querySelectorAll as (s: string) => unknown[], createTreeWalker: doc.createTreeWalker as (r: unknown) => unknown };
+    doc.querySelectorAll = (s: string) => (s.includes('__fluentPortalMountNode') ? fake.querySelectorAll(s) : body.querySelectorAll(s));
+    doc.querySelector = (s: string) => body.querySelector(s);
+    doc.createTreeWalker = (root: unknown) => {
+      if (!(root instanceof El)) return fake.createTreeWalker(root);
+      const nodes: unknown[] = [];
+      const walk = (e: El) => {
+        if (e.text) nodes.push(e.node);
+        e.children.forEach(walk);
+      };
+      walk(root);
+      let i = 0;
+      return { nextNode: () => nodes[i++] ?? null };
+    };
+    return {
+      show: (...els: El[]) => (body = new El('body').add(...els)).children,
+      done: () => {
+        for (const [k] of props) delete (El.prototype as unknown as Record<string, unknown>)[k];
+      },
+    };
+  };
 
   t.test('mode: a clicked label is taken again from a new scan by its element, role and part; none when the new scan does not mark it', async () => {
     const { sameLabel } = await mode();
@@ -1188,33 +1226,7 @@ export function register(t: Kit): void {
     const { Overlay } = await import('../../../src/inspector/overlay');
     const { createPageMode } = await mode();
     const undo = install();
-    /** The scanner's page: fakedom elements that know whether they are in it, as update() asks. */
-    let body: El = new El('body');
-    const inPage = (e: El | null): boolean => {
-      while (e?.parentElement) e = e.parentElement;
-      return e === body;
-    };
-    const props: Array<[string, PropertyDescriptor]> = [
-      ['nodeType', { get: () => 1, configurable: true }],
-      ['isConnected', { get(this: El) { return inPage(this); }, configurable: true }],
-      ['firstElementChild', { get(this: El) { return this.children[0] ?? null; }, configurable: true }],
-    ];
-    for (const [k, d] of props) Object.defineProperty(El.prototype, k, d);
-    const doc = document as unknown as Record<string, unknown>;
-    const fake = { querySelectorAll: doc.querySelectorAll as (s: string) => unknown[], createTreeWalker: doc.createTreeWalker as (r: unknown) => unknown };
-    doc.querySelectorAll = (s: string) => (s.includes('__fluentPortalMountNode') ? fake.querySelectorAll(s) : body.querySelectorAll(s));
-    doc.querySelector = (s: string) => body.querySelector(s);
-    doc.createTreeWalker = (root: unknown) => {
-      if (!(root instanceof El)) return fake.createTreeWalker(root);
-      const nodes: unknown[] = [];
-      const walk = (e: El) => {
-        if (e.text) nodes.push(e.node);
-        e.children.forEach(walk);
-      };
-      walk(root);
-      let i = 0;
-      return { nextNode: () => nodes[i++] ?? null };
-    };
+    const page = fakePage();
     // The overlay as the controller drives it, and what the scan hands it.
     const proto = Overlay.prototype as unknown as { start(): void; sync(list: Anchor[]): void };
     const real = { start: proto.start, sync: proto.sync };
@@ -1257,10 +1269,7 @@ export function register(t: Kit): void {
         // The popup can't be built on this fake page: the app's editor opens for the component instead (mode.ts fallback).
         edit: (c: string) => void popups.push(c),
       } as unknown as AppApi;
-      const show = (...grids: Array<[string, string, string]>) => {
-        body = new El('body').add(...grids.map(([lp, col, text]) => listGrid(lp, col, text)));
-        return body.children;
-      };
+      const show = (...grids: Array<[string, string, string]>) => page.show(...grids.map(([lp, col, text]) => listGrid(lp, col, text)));
       const header = (el: unknown) => marked.find((a) => a.role === 'header' && (el as El).contains(a.el as unknown as El)) ?? null;
       let grid = show([lpOf('new_alpha'), 'description', 'Description']);
       m = createPageMode(app);
@@ -1306,7 +1315,56 @@ export function register(t: Kit): void {
       await new Promise((r) => setTimeout(r, 20));
       proto.start = real.start;
       proto.sync = real.sync;
-      for (const [k] of props) delete (El.prototype as unknown as Record<string, unknown>)[k];
+      page.done();
+      if (hadLoc) Object.defineProperty(globalThis, 'location', hadLoc);
+      else delete g.location;
+      undo();
+    }
+  });
+
+  t.test("mode: a column's name typed shows at once in the page's form field labels that follow that column (Preview.showing), never in one with a label of its own; undone, the page is as before", async () => {
+    const { install } = await import('./overlay-dom');
+    const { createPageMode } = await mode();
+    const undo = install();
+    const page = fakePage();
+    const g = globalThis as Record<string, unknown>;
+    const hadLoc = Object.getOwnPropertyDescriptor(globalThis, 'location');
+    const F = '0f1e2d3c-4b5a-4968-8776-655443322110';
+    const url = `https://org.crm.dynamics.com/main.aspx?pagetype=entityrecord&etn=account&id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee&formid=${F}`;
+    Object.defineProperty(globalThis, 'location', { value: { href: url, search: url.slice(url.indexOf('?')) }, configurable: true, writable: true });
+    let m: PageMode | null = null;
+    try {
+      const store = new Store();
+      const col = column('account', 'name', 'Account Name', 'Nom du compte');
+      /** The name field of the main form, control `ctl`: GetClientMetadata listed labels of its own (`own`), or none. */
+      const cell = (n: number, ctl: string, en: string, own: boolean) =>
+        ({ ...t.slot('field', `field|${F}|c${n}|Label`, { 1033: en }), comp: `field|${F}|c${n}`, entity: 'account', order: n, ref: { formId: F, elId: `c${n}`, controlId: ctl, datafield: 'name', sparse: true, own: { 1033: own } } }) as Slot;
+      // Placed twice: following its column, and with a label of its own.
+      store.add([col, cell(1, 'name', 'Account Name', false), cell(2, 'name1', 'Full name', true)]);
+      const label = (ctl: string, text: string) => new El('label', { id: `id-1a2b-${ctl}-field-label` }, text);
+      const labels = [label('name', 'Account Name'), label('name1', 'Full name')];
+      page.show(...labels.map((l, i) => new El('div', { 'data-id': `${['name', 'name1'][i]}-FieldSectionItemContainer` }).add(new El('div').add(l))));
+      const app = {
+        store,
+        ctx: { ...ctx, xrm: {} },
+        prefs: { target: 1036, shown: [] },
+        root: { host: { addEventListener() {}, removeEventListener() {} }, activeElement: null },
+        lang: {},
+        providers: new Proxy({}, { get: () => async () => [] }),
+        adoptStyles() {},
+        edit() {},
+      } as unknown as AppApi;
+      m = createPageMode(app);
+      m.start();
+      const shown = () => labels.map((l) => l.node.nodeValue);
+      store.set(col.key, 1033, 'Account');
+      t.eq(shown(), ['Account', 'Full name'], 'as typed in the column');
+      store.revert(col.key);
+      t.eq(shown(), ['Account Name', 'Full name'], 'undone');
+    } finally {
+      m?.destroy();
+      await new Promise((r) => setTimeout(r, 20));
+      page.done();
       if (hadLoc) Object.defineProperty(globalThis, 'location', hadLoc);
       else delete g.location;
       undo();

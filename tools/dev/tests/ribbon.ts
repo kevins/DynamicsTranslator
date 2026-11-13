@@ -3,12 +3,13 @@
 // ribboncustomization row, a row with an empty base cell skipped whole, a cell equal to the published title
 // skipped, an empty cell kept, unknown LocLabels ignored, nothing visible in ribbondiffs before a publish.
 import { DvError, Http } from '../../../src/core/http';
-import { MANAGED, PublishSet, type Change, type ChangeResult, type Kind, type Labels, type Slot } from '../../../src/core/model';
+import { MANAGED, MANAGED_RIBBON, PublishSet, type Change, type ChangeResult, type Kind, type Labels, type Slot } from '../../../src/core/model';
 import { RIBBON_DRY_RUN, RIBBON_OWED, loadRibbonLabels, loadRibbonScope, ribbonWriter, translationXml } from '../../../src/providers/ribbon';
 import { changeId, type SaveOptions } from '../../../src/providers/types';
 import { b64ToBytes, fromUtf8, unzip } from '../../../src/core/zip';
 import { Store } from '../../../src/core/store';
 import { describe, useRibbonControls } from '../../../src/inspector/describe';
+import { readOnlyLook } from '../../../src/inspector/status';
 import type { Anchor } from '../../../src/inspector/types';
 import type { AppApi } from '../../../src/ui/types';
 import type { Kit } from './kit';
@@ -109,7 +110,7 @@ function rig(S: Server) {
     if (url.startsWith('ribboncustomizations')) return { value: [{ ribboncustomizationid: layer }] };
     if (url.startsWith('publishers')) return { value: [{ publisherid: 'p1', uniquename: 'DefaultPublisherorg', customizationprefix: 'new' }] };
     if (url.startsWith('EntityDefinitions(')) return { MetadataId: `meta-${S.scope}` };
-    if (url.startsWith('EntityDefinitions?')) return { value: [{ LogicalName: S.scope, DisplayName: { UserLocalizedLabel: { Label: 'Test table' } } }] };
+    if (url.startsWith('EntityDefinitions?')) return { value: [{ LogicalName: S.scope, DisplayName: { LocalizedLabels: [{ Label: 'Test table', LanguageCode: 1033 }], UserLocalizedLabel: { Label: 'Test table', LanguageCode: 1033 } } }] };
     if (url.startsWith('importjobs(')) {
       const j = S.jobs.get(/importjobs\(([^)]+)\)/.exec(url)![1]);
       if (!j) throw new DvError('importjob does not exist', 404);
@@ -226,6 +227,21 @@ export function register(t: Kit): void {
     t.ok(/no English text/.test(threw), 'a row without base text is refused, never written with an empty base cell');
   });
 
+  t.test("ribbon writer: a temporary solution it can't delete is told once after the save (SaveOptions.warn, a notice), never on a saved row, whose message the Publish dialog doesn't show", async () => {
+    const S = server();
+    const r = rig(S);
+    const sl = await r.slots();
+    (r.ctx as { http: { del(url: string): Promise<unknown> } }).http.del = async (url: string) => {
+      S.calls.push(`DELETE ${url}`);
+      throw new DvError('Principal user is missing prvDeleteSolution privilege.', 403);
+    };
+    const told: string[][] = [];
+    const res = await r.save([r.change(sl.get(LT)!, FR, 'Lancer le test')], { warn: (m, level) => void told.push([level, m]) });
+    t.eq([r.outcomes(res), res[0].message, S.pub.get(LT), S.solutions.size, S.calls.filter((c) => c.startsWith('DELETE')).length], [[[LT, FR, 'saved']], undefined, { [EN]: 'Run', [FR]: 'Lancer le test' }, 1, 1]);
+    t.eq(told.map(([level]) => level), ['notice']);
+    t.ok(/^The temporary solution "dxt_ribbon_t_\w+" could not be deleted\. Deleting it removes only the solution, not the table or its command bar: delete it from Solutions in Power Apps/.test(told[0][1]), told[0][1]);
+  });
+
   t.test('ribbon writer: a French title is imported with the English title in its row, published, checked; nothing else moves', async () => {
     const S = server();
     const r = rig(S);
@@ -334,6 +350,41 @@ export function register(t: Kit): void {
       t.eq((await scope(false)).map((s) => s.ref.locLabelId), [TT]);
       t.eq((await scope(true)).map((s) => [s.ref.locLabelId, s.readOnly]), [[LT, MANAGED], [TT, '']]);
     }
+  });
+
+  t.test("ribbon: a label a managed solution defines stays read-only where this session allows changes to managed labels (Ctx.managedEdits), with a reason that says the setting doesn't cover the classic command bar: as loaded, in the store as the setting changes both ways, never staged, left out of the Workbench without read-only labels, refused by the writer as loaded and as read right before the import; its look stays read-only, never built-in", async () => {
+    const S = server();
+    S.managed.set('Mscrm.T.Lbl', { [EN]: 'Microsoft', [FR]: 'Microsoft FR', [DE]: 'Microsoft DE' });
+    const r = rig(S);
+    const off = (await r.slots()).get('Mscrm.T.Lbl')!;
+    t.eq([off.readOnly, off.ref.held, off.ref.lock], [MANAGED, MANAGED, MANAGED_RIBBON], 'loaded while the setting is off');
+    (r.ctx as unknown as { managedEdits?: boolean }).managedEdits = true;
+    const sl = await r.slots();
+    const on = sl.get('Mscrm.T.Lbl')!;
+    t.eq([on.readOnly, sl.get(LT)!.readOnly, sl.get(TT)!.readOnly], [MANAGED_RIBBON, '', ''], "loaded while it is on: still read-only, saying so; this environment's labels editable");
+    const scope = (includeReadOnly: boolean) => loadRibbonScope(r.ctx, { entities: ['t'], kinds: new Set<Kind>(['ribbon']), includeReadOnly }, { signal: new AbortController().signal, progress() {} });
+    t.eq((await scope(false)).map((s) => s.ref.locLabelId), [LT, TT], 'the Workbench without read-only labels');
+    t.eq((await scope(true)).map((s) => [s.ref.locLabelId, s.readOnly]), [[LT, ''], [TT, ''], ['Mscrm.T.Lbl', MANAGED_RIBBON]]);
+    // The store: one loaded before the setting was turned on, as the setting changes both ways; never staged.
+    const st = new Store();
+    st.setManagedEdits(true);
+    st.add([off]);
+    t.eq(st.get(off.key)!.readOnly, MANAGED_RIBBON);
+    st.set(off.key, FR, 'X');
+    t.eq(st.isEdited(off.key), false, 'never staged');
+    st.setManagedEdits(false);
+    t.eq(st.get(off.key)!.readOnly, MANAGED);
+    st.setManagedEdits(true);
+    t.eq([st.get(off.key)!.readOnly, st.isEdited(off.key)], [MANAGED_RIBBON, false]);
+    t.eq(readOnlyLook({ store: st, ctx: r.ctx } as never, st.get(off.key)!), 'ro', 'every language has its text: read-only all the same, never built-in');
+    // The writer: as loaded, and as read right before the import (loaded as this environment's).
+    const res = await r.save([r.change(on, FR, 'X')]);
+    t.eq(res.map((x) => [x.outcome, x.message]), [['error', MANAGED_RIBBON]]);
+    S.managed.set(LT, S.pub.get(LT)!);
+    S.pub.delete(LT);
+    const late = await r.save([r.change(sl.get(LT)!, FR, 'Lancer 2')]);
+    t.eq(late.map((x) => [x.outcome, x.message]), [['error', MANAGED_RIBBON]]);
+    t.eq([S.files.length, S.solutions.size], [0, 0], 'nothing imported');
   });
 
   t.test('ribbon writer: a label without base text is refused per change (its row would be skipped silently)', async () => {

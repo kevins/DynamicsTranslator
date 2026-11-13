@@ -20,9 +20,9 @@
 import { pageInfo, type PageInfo } from '../core/context';
 import { guid, isAbort } from '../core/http';
 import { lcidName } from '../core/lcid';
-import type { Kind, Slot } from '../core/model';
+import { fillsIn, type Kind, type Lcid, type Slot } from '../core/model';
 import { mergeStored } from '../providers/bpf';
-import type { FormRef, LoadOptions, RibbonControl } from '../providers/types';
+import type { FormRef, LoadOptions, OwnCopy, RibbonControl } from '../providers/types';
 import type { AppApi } from '../ui/types';
 import { navKnown } from './fallback';
 import { queryLinks, queryTable, type Link } from './parts';
@@ -72,6 +72,8 @@ export const WANT_RELATED = '#related|';
  */
 export const WANT_NAMES = '#names|';
 const GUID = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/;
+/** What the page keeps of a quick view's form: its cells (shown()). */
+const QUICK_KINDS: ReadonlySet<Kind> = new Set<Kind>(['field']);
 
 /** Form API control types that show a grid of another table (getControlType). */
 export const isGridType = (t: string): boolean => /^(subgrid|editablegrid|customsubgrid)(:|$)/i.test(t);
@@ -104,6 +106,15 @@ class Incomplete extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The page's own copies of a form's GetClientMetadata answer (providers/formxml.ts pageOwnLabels), looked for while the
+ * form is read: `found` once the search is over.
+ */
+interface Scan {
+  done: Promise<OwnCopy[]>;
+  found?: OwnCopy[];
 }
 
 const tryGet = <T>(fn: () => T, fallback: T): T => {
@@ -162,14 +173,30 @@ export class PageLoader {
   private want = new Set<string>();
   /** Requests whose load failed; asked again only on retry() (never in a loop). */
   private failed = new Set<string>();
+  /**
+   * Side panes' and quick views' forms read in some languages only (shown()), by job key: read again on retry() alone.
+   * Nothing else asks for them again: their labels are in the store, so the scanner has what it needs.
+   */
+  private again = new Map<string, () => void>();
+  /**
+   * Requests that came while a load that answers them already ran, by its key (join()): a quick view's form its host
+   * form's read asked for first, a table a sub-grid's load is reading, the page's own view name. A failed load gives
+   * them up with its own (asked again after retry()); one that succeeds has answered them.
+   */
+  private joined = new Map<string, Set<string>>();
   private timer = 0;
   private ac = new AbortController();
   /**
+   * Stops the read behind the page's loads (ownLabels) as a load, a save or a publish starts, short of a language window
+   * already sent: it holds the language lock, which they may need. It runs again once none runs.
+   */
+  private behind = new AbortController();
+  /**
    * Settles when the page's form and table loads have finished (they never reject). Every GET shares one
    * first-in-first-out gate (core/http), so sub-grid tables and command bar labels queued first would hold
-   * the form labels back: those loads wait for this (see later()). Waiting for the whole form read also keeps
-   * them out of its language switch window, where a read that names things in the caller's language (table
-   * names of the command bar and of the form name load) would get the other language.
+   * the form labels back: those loads wait for this (see later()). They may still run in a language switch
+   * window (ownLabels', a process's): the table names they read are picked from every language, not from
+   * UserLocalizedLabel, which follows the caller's.
    */
   private head: Promise<unknown> = Promise.resolve();
 
@@ -250,7 +277,8 @@ export class PageLoader {
    * Requests what the page shows but the store lacks (Scanner.want): command bar buttons ('<table>|<control id>'),
    * tables of grids (WANT_TABLE + '<table>'), forms of side panes and quick views, grid views' queries and names, the
    * names of the forms in the form selector's list, a table's relationships and the names of tables the navigation shows
-   * (WANT_NAMES). Each is asked for once; failed ones again after retry().
+   * (WANT_NAMES). Each is asked for once; failed ones again after retry(). One a load already running answers joins it
+   * (join()), so it fails with that load too.
    */
   request(items: Iterable<string>): void {
     const tables: string[] = [];
@@ -285,17 +313,30 @@ export class PageLoader {
     return this.failed;
   }
 
-  /** "Try again": failed loads run again, failed command bar labels and grid tables are requested again. */
+  /**
+   * "Try again": failed loads run again, failed command bar labels and grid tables are requested again, and side panes'
+   * and quick views' forms read in some languages only are read again.
+   */
   retry(): void {
     for (const w of this.failed) this.asked.delete(w);
     this.failed.clear();
     this.errors.clear();
+    const again = [...this.again.values()];
+    this.again.clear();
     this.start();
+    for (const fn of again) fn();
   }
 
   abort(): void {
     this.ac.abort();
+    this.behind.abort();
     clearTimeout(this.timer);
+  }
+
+  /** Stops the read behind the page's loads (`behind`), short of a language window already sent: it runs again later. */
+  private stop(): void {
+    this.behind.abort();
+    this.behind = new AbortController();
   }
 
   private o(lang = false): LoadOptions {
@@ -315,25 +356,40 @@ export class PageLoader {
 
   /**
    * True when nothing with this key prefix is in the store yet. With `complete`, labels loaded for the user's
-   * language only (ref.partial) count as not loaded.
+   * language only (ref.partial) count as not loaded, except those no read can complete (ref.unreadable).
    */
   private fresh(prefix: string, complete = false): boolean {
     let hit = false;
     for (const s of this.app.store.slots.values())
       if (s.key.startsWith(prefix)) {
-        if (!complete || s.ref?.partial) return complete;
+        if (!complete || (s.ref?.partial && !s.ref.unreadable)) return complete;
         hit = true;
       }
     return !hit;
   }
 
   /**
+   * Requests (`items`) that a load already running answers: they fail with it (joined). Nothing once it is done: it
+   * succeeded (a failed one leaves `jobs`), and its labels are in.
+   */
+  private join(key: string, items?: Iterable<string>): void {
+    if (!items || !this.running.has(key)) return;
+    const set = this.joined.get(key) ?? new Set<string>();
+    for (const w of items) set.add(w);
+    this.joined.set(key, set);
+  }
+
+  /**
    * `quiet`: a load the page can do without (a side pane's form, a view's linked columns): when it fails its labels
-   * just stay unmarked, and the bar says nothing. `fn` gets the store's tick as the load started (Store.tick), for slots it
-   * adds itself before it ends.
+   * just stay unmarked, and the bar says nothing; one that got only part of them (an Incomplete that isn't quiet itself)
+   * says so as any load does, since those show, not loaded in some language. `fn` gets the store's tick as the load
+   * started (Store.tick), for slots it adds itself before it ends. `items`: the requests it answers, given up if it fails
+   * (gaveUp: asked again after retry()). While a load of `key` runs, another run() of it only adds its `items` to those
+   * (join()); once one has succeeded, nothing.
    */
   private run(key: string, groups: PageGroup[], what: string, fn: (since: number) => Promise<Slot[] | null>, items?: string[], quiet = false): void {
-    if (this.jobs.has(key)) return;
+    if (this.jobs.has(key)) return this.join(key, items);
+    this.stop();
     const bump = (d: number) => {
       for (const g of groups) {
         const n = (this.busy.get(g) || 0) + d;
@@ -360,10 +416,11 @@ export class PageLoader {
           keep(await fn(since));
         } catch (e) {
           this.jobs.delete(key);
-          items?.forEach((w) => this.failed.add(w));
+          for (const w of [...(items ?? []), ...(this.joined.get(key) ?? [])]) this.failed.add(w);
           if (e instanceof Incomplete) keep(e.slots);
-          if (!quiet && !(e instanceof Incomplete && e.quiet) && !isAbort(e) && !this.ac.signal.aborted) this.errors.set(key, e instanceof Incomplete ? e.message : `Could not load ${what}. ${(e as Error)?.message || e}`);
+          if (!(e instanceof Incomplete ? e.quiet : quiet) && !isAbort(e) && !this.ac.signal.aborted) this.errors.set(key, e instanceof Incomplete ? e.message : `Could not load ${what}. ${(e as Error)?.message || e}`);
         } finally {
+          this.joined.delete(key);
           this.running.delete(key);
           bump(-1);
           this.changed();
@@ -421,9 +478,11 @@ export class PageLoader {
    * The names of views shown in view selectors other than the list page's own (an associated grid's, a sub-grid's, a side
    * pane list's, the items of a list of views), and of the forms the form selector's list shows besides the page's own,
    * as the scanner asks for them (`prefix` + id): one read for those asked together. A personal view is no savedquery
-   * and gets no slot: its name is the user's own, not a label. What the read doesn't find is never asked for again.
+   * and gets no slot: its name is the user's own, not a label. What the read doesn't find is never asked for again. One
+   * whose name a load already reads (the page's own, records()) joins that load.
    */
   private recordNames(kind: 'view' | 'form', prefix: string, items: string[]): void {
+    for (const w of items) this.join(`r:${kind}:${guid(w.slice(prefix.length))}`, [w]);
     const ids = [...new Set(items.map((w) => guid(w.slice(prefix.length))))].filter((id) => GUID.test(id) && this.fresh(`${kind}|${id}|`) && !this.jobs.has(`r:${kind}:${id}`));
     if (!ids.length) return;
     const { ctx, providers: pv } = this.app;
@@ -435,7 +494,7 @@ export class PageLoader {
   /**
    * Loads the columns and choices of tables whose grids the page shows (the list, sub-grids), once each,
    * after the page's form and table (see head). `asked`: they came from request() (a failure lets retry()
-   * ask again).
+   * ask again), also when a load of the table already runs (they join it).
    */
   private tables(names: Iterable<string>, asked = false): void {
     const { ctx, providers: pv } = this.app;
@@ -443,7 +502,10 @@ export class PageLoader {
       const t = String(raw || '').toLowerCase();
       if (!/^[a-z0-9_]+$/.test(t)) continue;
       const k = `g:${t}`;
-      if (this.jobs.has(k) || this.jobs.has(`t:${t}`)) continue;
+      if (this.jobs.has(k) || this.jobs.has(`t:${t}`)) {
+        if (asked) this.join(this.jobs.has(k) ? k : `t:${t}`, [WANT_TABLE + t]);
+        continue;
+      }
       // Another view may have loaded it already (columns and choices). A table the scanner asked for lacks
       // something the page shows (e.g. the Workbench loaded its columns without choices): read once anyway.
       if (!asked && !this.fresh(`attribute|${t}.`) && !this.fresh(`state|${t}.`)) continue;
@@ -481,8 +543,12 @@ export class PageLoader {
       // No lookup first: the read itself says the form's table, type and name. The page's table is
       // passed, so its display name (breadcrumbs) loads alongside the read.
       const ref = this.forms.get(id) ?? { formId: id, entity: kind === 'form' ? this.page?.entity || '' : '', type: NaN, name: '' };
+      // A form's field labels of its own: the page's copies of what says so are looked for while its labels are read,
+      // which they never hold up (a dashboard has none).
+      const scan = kind === 'form' ? this.scan(id, ref.entity) : undefined;
       const read = await pv.loadFormXml(ctx, [ref], ctx.langs.map((l) => l.lcid), this.o(all));
       if (!read.length) throw new Error(`The ${kind} was not found, or you have no access to it.`);
+      this.ownLabels(read, scan, this.jobs.get(`x:${id}`));
       if (!this.forms.has(id)) this.forms.set(id, { formId: id, entity: read[0].entity || 'none', name: '', type: Number(read[0].ref?.formType) });
       // The form API knows its sub-grids by now (or again, after a cold boot).
       this.subgrids();
@@ -500,6 +566,72 @@ export class PageLoader {
       if (all && slots.some((s) => s.ref?.partial && !s.ref.unreadable)) throw new Incomplete(slots, `Could not load the ${kind} labels in every language.`);
       return slots;
     });
+  }
+
+  /**
+   * The page's copies of form `id`'s GetClientMetadata answer (providers/formxml.ts pageOwnLabels), looked for from now on.
+   * `entity`: the form's table, where known.
+   */
+  private scan(id: string, entity: string): Scan {
+    const s: Scan = { done: this.app.providers.pageOwnLabels(this.app.ctx, id, entity) };
+    void s.done.then((c) => (s.found = c));
+    return s;
+  }
+
+  /**
+   * Which field labels of a main form just read have a text of their own in each language, not their column's name filled
+   * in (`ref.own`, core/model.ts follows). What is known without a request (providers/formxml.ts knownOwnLabels: the
+   * answers kept for that version of the form, and the page's copies of it, `scan`, if found by now) is on the labels
+   * before they are stored, so a popup shows it from the start. A copy is checked against the labels as read: a cell it
+   * lists no label of its own for has the text a read fills in there (`fills`, by the column's names in the store), so
+   * copies found later, and those the column's names weren't in yet to check, are set once the labels are stored
+   * (`stored`, the load's job) and the page's table is in (`head`); until then no label shows as following its column
+   * anyway. The rest is read once none of the page's loads runs any more, and no save or publish runs (Store.busy), in the
+   * user's language, then in each other language in a switch window of its own (loadOwnLabels), only where a label's text
+   * is its column's name (Store.fillsIn), and set on the labels as each comes in. A load that starts stops it (`behind`),
+   * and so does a save or a publish that starts, short of a window already sent, which they wait for (one hold at a time;
+   * a publish runs while no window is open, LangSession.quiet); it is read again once none runs. Until a language is in, a
+   * label worded as its column's name there shows as the user's language does (core/model.ts follows), and one nothing is
+   * known of as before; a label loaded again since from another version of its form keeps what it has.
+   */
+  private ownLabels(read: Slot[], scan?: Scan, stored?: Promise<unknown>): void {
+    const cells = read.filter((s) => s.ref?.sparse);
+    if (!cells.length) return;
+    const { ctx, providers: pv, store } = this.app;
+    const set = (own: Map<string, Record<number, boolean>>) => {
+      for (const s of cells) if (store.get(s.key)?.ref?.formVersion !== s.ref.formVersion) own.delete(s.key);
+      store.setOwn(own);
+    };
+    const fills = (s: Slot, l: Lcid) => fillsIn(s, l, ctx.base, s.labels[l] ?? '', (k, y) => store.text(k, y, true));
+    const now = pv.knownOwnLabels(ctx, cells, scan?.found, fills);
+    for (const s of cells) if (now.has(s.key)) s.ref.own = { ...s.ref.own, ...now.get(s.key) };
+    const undecided = (s: Slot, l: Lcid) => store.fillsIn(s.key, l, ctx.base);
+    // A save or a publish that starts (Store.busy) stops the read as a load does.
+    const off = store.on((e) => void (e.type === 'busy' && e.busy && this.stop()));
+    void (async () => {
+      const copies = await scan?.done;
+      await stored;
+      await this.head;
+      if (copies?.length) set(pv.knownOwnLabels(ctx, cells, copies, fills));
+      for (;;) {
+        for (let k = this.running.values().next().value; k; k = this.running.values().next().value) await this.jobs.get(k);
+        if (store.busy) {
+          await new Promise<void>((go) => {
+            const done = store.on((e) => void (e.type === 'busy' && !e.busy && (done(), go())));
+          });
+          continue;
+        }
+        const { signal } = this.behind;
+        try {
+          set(await pv.loadOwnLabels(ctx, cells, signal, set, undecided));
+          return;
+        } catch (e) {
+          if (!signal.aborted || this.ac.signal.aborted) throw e;
+        }
+      }
+    })()
+      .catch(() => {})
+      .finally(off);
   }
 
   /**
@@ -525,37 +657,69 @@ export class PageLoader {
   /**
    * A form the page shows besides its own (LIVE-FINDINGS 56, 58), behind the page's form and table (see head), and
    * its table (columns, tooltips, choices). `full`: a side pane's form, which shows tabs and sections too, in every
-   * language like the page's; else a quick view's, whose cells come in every language with one read (its tabs and
-   * sections never show). A form that can't be read leaves its labels unmarked, without a message.
+   * language like the page's; else a quick view's, of which only cells show: they come in every language with one read,
+   * and its tabs and sections are left out, never kept in the user's language alone (they would only ever show as
+   * not loaded, in the Workbench and All labels). A cell kept per language (a web resource's, an iframe's) is read in
+   * every language as the page's own form's tabs are; a quick view without one costs no language switch. A form that
+   * can't be read leaves its labels unmarked, without a message; one read in some languages only keeps what was read
+   * and counts as failed, as the page's own form does (the bar says so, Try again reads it again). A request (`item`)
+   * for a form whose read already runs joins it (the scanner asks for a quick view its host form's read asked for
+   * first): if that read fails, the request is given up with it, and asked again after Try again.
    */
   private shown(id: string, full: boolean, item?: string): void {
     const fid = guid(id);
     const key = `${full ? 'o' : 'q'}:${fid}`;
-    if (!GUID.test(fid) || this.jobs.has(key) || this.jobs.has(`o:${fid}`)) return;
+    if (!GUID.test(fid)) return;
+    const on = this.jobs.has(key) ? key : `o:${fid}`;
+    if (this.jobs.has(on)) return this.join(on, item ? [item] : undefined);
     const { ctx, providers: pv, store } = this.app;
-    const all = full && ctx.langs.length > 1;
+    const all = ctx.langs.length > 1;
+    const kinds = full ? undefined : QUICK_KINDS;
     const tableOf = (): string => {
       for (const s of store.slots.values()) if (s.ref?.formId === fid && s.entity) return s.entity;
       return '';
+    };
+    /** Labels of this form that this load keeps are in the store in some languages only, and a read can complete them. */
+    const partial = (): boolean => all && [...store.slots.values()].some((s) => s.ref?.formId === fid && (!kinds || kinds.has(s.kind)) && s.ref.partial && !s.ref.unreadable);
+    const failed = (slots: Slot[]): Incomplete => {
+      this.again.set(key, () => this.shown(fid, full, item));
+      return new Incomplete(slots, 'Could not load the form labels in every language.');
     };
     this.run(
       key,
       ['Form'],
       'the labels of a form on this page',
       this.later(async () => {
-        // Already read (the page's own form in a side pane, a quick view shown twice): only its table may be missing.
-        if (!this.fresh(`field|${fid}|`) && (!full || !this.fresh(`tab|${fid}|`, all))) {
+        this.again.delete(key);
+        // Already read (the page's own form in a side pane, a quick view shown twice): only its table may be missing. A
+        // cell or tab known in the user's language alone (ref.partial: a read that missed a language) is read again.
+        if (!this.fresh(`field|${fid}|`, all) && (!full || !this.fresh(`tab|${fid}|`, all))) {
           this.tables([tableOf()]);
           return null;
         }
-        const read = await pv.loadFormXml(ctx, [{ formId: fid, entity: '', type: NaN, name: '' }], ctx.langs.map((l) => l.lcid), this.o(all));
+        let read: Slot[];
+        try {
+          read = await pv.loadFormXml(ctx, [{ formId: fid, entity: '', type: NaN, name: '' }], ctx.langs.map((l) => l.lcid), this.o(all), kinds);
+        } catch (e) {
+          // Read again for labels known in some languages only, and failed: they still show so, so this says so too (a
+          // form none of whose labels were read stays quiet, as above).
+          if (!isAbort(e) && partial()) throw failed([]);
+          throw e;
+        }
         if (read[0]?.entity) this.tables([read[0].entity]);
         this.quickViews(read);
+        const kept = kinds ? read.filter((s) => kinds.has(s.kind)) : read;
+        this.ownLabels(kept);
         // Labels known in every language are never replaced by partial ones (a quick view's read after a pane's).
-        return read.filter((s) => {
+        const slots = kept.filter((s) => {
           const o = store.get(s.key);
           return !s.ref?.partial || !o || o.ref?.partial;
         });
+        // A language that couldn't be read leaves labels known in some languages only: as for the page's own form (form()),
+        // what was read is kept and the load counts as failed, so the bar says so and Try again reads it again (retry()),
+        // nothing else. Not for labels no read can complete (ref.unreadable).
+        if (all && slots.some((s) => s.ref?.partial && !s.ref.unreadable)) throw failed(slots);
+        return slots;
       }),
       item ? [item] : undefined,
       true,

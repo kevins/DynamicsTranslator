@@ -11,14 +11,18 @@
 // exactly the target language, then restores the same way. app.dev.noRefresh keeps the page from reloading after
 // a successful publish (the dialog shows "Done" instead). Some steps make one request fail on purpose (a publish
 // answered 503, a write whose answer is lost) to check the dialog's Publish again and Try again, and some put labels
-// back through Recent publishes' Undo, as a user would.
-// Results: window.__dxtPage = { running, log: [{ name, pass, info }] }.
-window.__dxtPage = { running: true, log: [] };
+// back through Recent publishes' Undo, as a user would. A main form's field label is put back by giving its cell its own
+// label key back (onTestKey), never by writing a text back. The record steps need the form "Information" on the page.
+// window.__dxtPageOnly = ['<step>', …] runs only the steps named.
+// Results: window.__dxtPage = { running, log: [{ name, pass, info }], keys } (keys: the test label keys made).
+window.__dxtPage = { running: true, log: [], keys: [] };
 (async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const log = window.__dxtPage.log;
   const ok = (name, cond, info) => log.push({ name, pass: !!cond, info: cond ? undefined : String(JSON.stringify(info)).slice(0, 900) });
+  const only = window.__dxtPageOnly;
   const step = async (name, fn) => {
+    if (only && !only.includes(name)) return;
     try {
       await fn();
     } catch (e) {
@@ -306,19 +310,98 @@ window.__dxtPage = { running: true, log: [] };
   const loc = async (set, id, col) =>
     labelsOf((await get(`RetrieveLocLabels(EntityMoniker=@e,AttributeName=@a,IncludeUnpublished=@u)?@e=${encodeURIComponent(JSON.stringify({ '@odata.id': `${set}(${id})` }))}&@a='${col}'&@u=true`)).Label);
 
-  if (where === 'record') {
+  // ---- Main-form field labels: as tools/e2e-suite.js (onTestKey). A form read fills in its column's name where a cell
+  // has no label of its own (LIVE-FINDINGS 103), and Dataverse keeps a cell's labels whatever a save leaves out (104): a
+  // text written back would store a copy of the column's name where the label followed it. So a step that writes a main
+  // form's field label puts its cell on a label key of its own first and gives it its own key back after (105). ----
+  const JH = { Accept: 'application/json', 'Content-Type': 'application/json' };
+  const cellIn = (doc, id) => [...doc.getElementsByTagName('cell')].find((c) => norm(c.getAttribute('id')) === norm(id));
+  const keyIn = (doc, id) => norm(cellIn(doc, id)?.getAttribute('labelid')) || null;
+  /** Publishes a table outside any language switch (LIVE-FINDINGS 62), again while Dataverse is busy with another publish. */
+  const publishE = (entity = E) =>
+    d.lang.quiet(async () => {
+      for (let i = 0; ; i++) {
+        const r = await fetch(api + 'PublishXml', { method: 'POST', headers: JH, body: JSON.stringify({ ParameterXml: `<importexportxml><entities><entity>${entity}</entity></entities></importexportxml>` }) });
+        if (r.ok) return;
+        if (i === 3) throw new Error(`PublishXml ${entity}: ${r.status} ${(await r.text()).slice(0, 200)}`);
+        await sleep(5000 * (i + 1));
+      }
+    });
+  /** A column's own cell in the body or header (src/core/column.ts columnCell; the zones a main form's save posts sparse). */
+  const columnCell = (c) => {
+    const ctl = c.querySelector(':scope > control');
+    const df = (ctl?.getAttribute('datafieldname') || '').toLowerCase();
+    const id = (ctl?.getAttribute('id') || '').toLowerCase().replace(/^header_/, '');
+    return !!df && !c.closest('footer') && (!id || id === df || (id.startsWith(df) && /^\d+$/.test(id.slice(df.length))));
+  };
+  /** A raw read-modify-write of a main form under the translator's lock, every other column cell posted without labels (LIVE-FINDINGS 104). */
+  const rawPatch = (formId, edit, keep) =>
+    d.lang.hold(async () => {
+      for (let i = 0; i < 3; i++) {
+        const [u, p] = await Promise.all([get(`systemforms(${formId})/Microsoft.Dynamics.CRM.RetrieveUnpublished()?$select=formxml`), get(`systemforms(${formId})?$select=formid`)]);
+        const doc = xml(u.formxml);
+        for (const c of [...doc.getElementsByTagName('cell')]) if (columnCell(c) && norm(c.getAttribute('id')) !== norm(keep)) c.querySelector(':scope > labels')?.remove();
+        edit(doc);
+        const r = await fetch(api + `systemforms(${formId})`, { method: 'PATCH', headers: { ...JH, 'If-Match': p['@odata.etag'] }, body: JSON.stringify({ formxml: new XMLSerializer().serializeToString(doc) }) });
+        if (r.ok) return;
+        if (r.status !== 412) throw new Error(`PATCH systemforms(${formId}): ${r.status} ${(await r.text()).slice(0, 200)}`);
+      }
+      throw new Error(`PATCH systemforms(${formId}): 412 three times`);
+    });
+  /** The page's store after a raw write: the form read again, every language, so an edit is measured against the server's text. */
+  const refresh = async (formId) => store.add(await d.providers.loadFormXml(ctx, [await d.providers.getForm(ctx, formId)], ctx.langs.map((l) => l.lcid), { signal: new AbortController().signal, progress() {}, lang: d.lang }));
+  /**
+   * Runs `fn(k)` with a cell on a label key of its own (`k.key`: its labels posted as read to a fresh labelid, which
+   * stores its own labels and none of its column's names, LIVE-FINDINGS 104), published and read again; then gives the
+   * cell its own key back (or none), posting no labels for it, so it shows its labels from before exactly (105), and
+   * publishes. A test key stays behind as label rows of no cell (107).
+   */
+  async function keyed(name, formId, cellId, entity, fn) {
+    const read = async () => {
+      const doc = await formXml(formId);
+      return { labels: cellLabels(doc, cellId), key: keyIn(doc, cellId) };
+    };
+    const at0 = await read();
+    const k = { key: crypto.randomUUID() };
+    await rawPatch(formId, (doc) => cellIn(doc, cellId)?.setAttribute('labelid', `{${k.key}}`), cellId);
+    window.__dxtPage.keys.push(k.key);
+    try {
+      await publishE(entity);
+      await refresh(formId);
+      await fn(k);
+    } finally {
+      await closeAll();
+      if (callout()) callout().querySelector('.co-f .btn.primary')?.click(); // Done
+      await rawPatch(formId, (doc) => {
+        const c = cellIn(doc, cellId);
+        if (at0.key) c?.setAttribute('labelid', `{${at0.key}}`);
+        else c?.removeAttribute('labelid');
+      });
+      await publishE(entity);
+      const now = await read();
+      ok(`${name}: restored (the cell's own label key back, its labels as before)`, JSON.stringify(now) === JSON.stringify(at0), { at0, now });
+      await refresh(formId);
+    }
+  }
+
+  // The record steps write on the form "Information": the app opens the form a user opened last.
+  const shown = where === 'record' && FORM ? await get(`systemforms(${FORM})?$select=name,type`).catch(() => null) : null;
+  const onInfo = shown?.name === 'Information' && shown.type === 2;
+  if (where === 'record') ok('the record page shows the form Information (open the record with &formid= its id)', onInfo, shown);
+
+  if (where === 'record' && onInfo) {
     await step('field label', async () => {
       ok('field cell found', !!cell, slots.filter((s) => s.kind === 'field').map((s) => s.ref?.controlId));
-      const b = cellLabels(await unpub(), cell.ref.elId);
-      const t = tgt(b[T], 'Nom page E2E');
-      const r = await viaPopup(cell.comp, cell.key, T, t);
-      const a = cellLabels(await unpub(), cell.ref.elId);
-      ok('field label published through the popup', r.ok && a[T] === t && a[B] === b[B] && r.rep?.published, { r, b, a });
-      ok('the Publish dialog lists it as a form label', /Form label/.test(r.listText || ''), r.listText);
-      // Published XML has the user's language only.
-      if ((await uiLang()) === T) ok('the published form has it', cellLabels(await pub(), cell.ref.elId)[T] === t, cellLabels(await pub(), cell.ref.elId));
-      const r2 = await viaPopup(cell.comp, cell.key, T, orig(b[T], 'Nom'));
-      ok('field label restored', r2.ok && cellLabels(await unpub(), cell.ref.elId)[T] === orig(b[T], 'Nom'), r2);
+      await keyed('field label', FORM, cell.ref.elId, E, async () => {
+        const b = cellLabels(await unpub(), cell.ref.elId);
+        const t = tgt(b[T], 'Nom page E2E');
+        const r = await viaPopup(cell.comp, cell.key, T, t);
+        const a = cellLabels(await unpub(), cell.ref.elId);
+        ok('field label published through the popup', r.ok && a[T] === t && a[B] === b[B] && r.rep?.published && !r.rep.warning && !r.rep.notice, { r, b, a });
+        ok('the Publish dialog lists it as a form label', /Form label/.test(r.listText || ''), r.listText);
+        // Published XML has the user's language only.
+        if ((await uiLang()) === T) ok('the published form has it', cellLabels(await pub(), cell.ref.elId)[T] === t, cellLabels(await pub(), cell.ref.elId));
+      });
     });
 
     await step('field tooltip', async () => {
@@ -358,16 +441,16 @@ window.__dxtPage = { running: true, log: [] };
     });
 
     await step('text typed after Publish stays staged', async () => {
-      const b = cellLabels(await unpub(), cell.ref.elId);
-      const A = tgt(b[T], 'Nom A E2E');
-      const s = await stage(cell.comp, cell.key, T, A);
-      if (s.err) return ok('typed after publish', false, s);
-      const r = await publish(() => store.set(cell.key, T, A + ' then more')); // typed right after Publish
-      const a = cellLabels(await unpub(), cell.ref.elId);
-      ok('only the text shown in the dialog was written', a[T] === A && store.value(cell.key, T) === A + ' then more' && store.isEdited(cell.key, T), { r, a: a[T], v: store.value(cell.key, T) });
-      store.revert(cell.key, T);
-      const r2 = await viaPopup(cell.comp, cell.key, T, orig(b[T], 'Nom'));
-      ok('restored after the typed-after-publish check', r2.ok, r2);
+      await keyed('typed after publish', FORM, cell.ref.elId, E, async () => {
+        const b = cellLabels(await unpub(), cell.ref.elId);
+        const A = tgt(b[T], 'Nom A E2E');
+        const s = await stage(cell.comp, cell.key, T, A);
+        if (s.err) return ok('typed after publish', false, s);
+        const r = await publish(() => store.set(cell.key, T, A + ' then more')); // typed right after Publish
+        const a = cellLabels(await unpub(), cell.ref.elId);
+        ok('only the text shown in the dialog was written', a[T] === A && store.value(cell.key, T) === A + ' then more' && store.isEdited(cell.key, T), { r, a: a[T], v: store.value(cell.key, T) });
+        store.revert(cell.key, T);
+      });
     });
 
     // Published once the published form's version is the unpublished one (the Publish dialog's own check).
@@ -377,68 +460,103 @@ window.__dxtPage = { running: true, log: [] };
       // The publish after the save fails (one PublishXml answered 503): the dialog says the label is saved but not
       // published, and why, and offers Publish again; the form holds unpublished changes; Recent publishes lists the save
       // as not published. Publish again publishes it. Then Recent publishes' Undo puts the earlier text back, published.
-      const b = cellLabels(await unpub(), cell.ref.elId);
-      const t = tgt(b[T], 'Nom publication E2E');
-      const last = app.saver.history()[0]?.id;
-      try {
-        const s = await stage(cell.comp, cell.key, T, t);
-        if (s.err) return ok('publish fails: staged', false, s);
-        const r = await publishFailing((u, i) => i.method === 'POST' && /\/PublishXml$/.test(u), '503');
-        if (r.err) return ok('publish fails: the Publish dialog', false, r);
-        const e = app.saver.history()[0];
-        const [p1, u1] = await versions();
-        ok('publish fails: the dialog says saved but not published, and why, and offers Publish again', r.hit === 1 && r.title === 'Saved, but not published' && /Saved, but publishing failed: Dataverse returned HTTP 503\./.test(r.text) && !!button(dialog(), 'Publish again'), r);
-        ok('publish fails: the label is saved, the form not published, the save listed as not published', cellLabels(await unpub(), cell.ref.elId)[T] === t && p1 !== u1 && e && e.id !== last && e.published === false && e.items.some((it) => it.key === cell.key && it.after === t), { p1, u1, e });
-        const r2 = await clickAndWait('Publish again');
-        const [p2, u2] = await versions();
-        ok('Publish again publishes it, and says so', r2.title === 'Published' && /Done\. Published 1 change\./.test(r2.text) && p2 === u2 && app.saver.history().find((x) => x.id === e?.id)?.published === true, { r2, p2, u2 });
-        await closeAll();
-        const rep = await closed(r.pending);
-        ok('the Publish dialog reports it published', rep?.published === true && !rep.publishError, rep && { published: rep.published, publishError: rep.publishError });
-        const un = await undoPublish(e && e.id !== last && e.items.some((it) => it.key === cell.key) ? e.id : null);
-        const [p3, u3] = await versions();
-        ok('Recent publishes › Undo of a form label: the earlier text back, published', un.ok && cellLabels(await unpub(), cell.ref.elId)[T] === b[T] && p3 === u3, { un, now: cellLabels(await unpub(), cell.ref.elId)[T], b: b[T], p3, u3 });
-      } finally {
-        await closeAll();
-        if (store.isEdited(cell.key, T)) store.revert(cell.key, T);
-        // Published first: a publish that failed leaves the form unpublished, and the Publish dialog would then ask first.
-        const [p, u] = await versions();
-        if (p !== u) await fetch(api + 'PublishXml', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ ParameterXml: `<importexportxml><entities><entity>${E}</entity></entities></importexportxml>` }) });
-        if (cellLabels(await unpub(), cell.ref.elId)[T] !== b[T]) await viaPopup(cell.comp, cell.key, T, orig(b[T], 'Nom'));
-      }
+      await keyed('publish fails', FORM, cell.ref.elId, E, async () => {
+        const b = cellLabels(await unpub(), cell.ref.elId);
+        const t = tgt(b[T], 'Nom publication E2E');
+        const last = app.saver.history()[0]?.id;
+        try {
+          const s = await stage(cell.comp, cell.key, T, t);
+          if (s.err) return ok('publish fails: staged', false, s);
+          const r = await publishFailing((u, i) => i.method === 'POST' && /\/PublishXml$/.test(u), '503');
+          if (r.err) return ok('publish fails: the Publish dialog', false, r);
+          const e = app.saver.history()[0];
+          const [p1, u1] = await versions();
+          ok('publish fails: the dialog says saved but not published, and why, and offers Publish again', r.hit === 1 && r.title === 'Saved, but not published' && /Saved, but publishing failed: Dataverse returned HTTP 503\./.test(r.text) && !!button(dialog(), 'Publish again'), r);
+          ok('publish fails: the label is saved, the form not published, the save listed as not published', cellLabels(await unpub(), cell.ref.elId)[T] === t && p1 !== u1 && e && e.id !== last && e.published === false && e.items.some((it) => it.key === cell.key && it.after === t), { p1, u1, e });
+          const r2 = await clickAndWait('Publish again');
+          const [p2, u2] = await versions();
+          ok('Publish again publishes it, and says so', r2.title === 'Published' && /Done\. Published 1 change\./.test(r2.text) && p2 === u2 && app.saver.history().find((x) => x.id === e?.id)?.published === true, { r2, p2, u2 });
+          await closeAll();
+          const rep = await closed(r.pending);
+          ok('the Publish dialog reports it published', rep?.published === true && !rep.publishError, rep && { published: rep.published, publishError: rep.publishError });
+          const un = await undoPublish(e && e.id !== last && e.items.some((it) => it.key === cell.key) ? e.id : null);
+          const [p3, u3] = await versions();
+          ok('Recent publishes › Undo of a form label: the earlier text back, published', un.ok && cellLabels(await unpub(), cell.ref.elId)[T] === b[T] && p3 === u3, { un, now: cellLabels(await unpub(), cell.ref.elId)[T], b: b[T], p3, u3 });
+        } finally {
+          // The cell's own key goes back, published, after this (keyed).
+          await closeAll();
+          if (store.isEdited(cell.key, T)) store.revert(cell.key, T);
+        }
+      });
     });
 
     await step('write answer lost, then Try again', async () => {
       // The form label's write reaches Dataverse but its answer is lost (the connection drops): the dialog can't tell
       // whether it was written and offers Try again. Try again finds it written, publishes it and journals it as this
       // publish's own (reaudit 06, SW01: a write that may have run), so Recent publishes' Undo puts the earlier text back.
-      const b = cellLabels(await unpub(), cell.ref.elId);
-      const t = tgt(b[T], 'Nom réponse E2E');
-      const last = app.saver.history()[0]?.id;
-      try {
-        const s = await stage(cell.comp, cell.key, T, t);
-        if (s.err) return ok('write answer lost: staged', false, s);
-        const r = await publishFailing((u, i) => i.method === 'POST' && /\/\$batch$/.test(u) && typeof i.body === 'string' && /PATCH [^\r\n]*systemforms\(/.test(i.body), 'lost');
-        if (r.err) return ok('write answer lost: the Publish dialog', false, r);
-        ok("write answer lost: the dialog says it couldn't be checked and offers Try again; nothing journaled yet", r.hit === 1 && r.title === "Some changes weren't published" && /Sent to Dataverse, but the result could not be checked/.test(r.text) && !!button(dialog(), 'Try again') && app.saver.history()[0]?.id === last, r);
-        ok('write answer lost: the write reached Dataverse', cellLabels(await unpub(), cell.ref.elId)[T] === t, cellLabels(await unpub(), cell.ref.elId));
-        const r2 = await clickAndWait('Try again');
-        const e = app.saver.history()[0];
-        const [p2, u2] = await versions();
-        ok("Try again: published, and journaled as this publish's own", r2.title === 'Published' && /Done\. Published 1 change\./.test(r2.text) && p2 === u2 && e && e.id !== last && e.published && e.items.length === 1 && e.items[0].key === cell.key && e.items[0].before === (b[T] || '') && e.items[0].after === t, { r2, e, p2, u2 });
-        await closeAll();
-        await closed(r.pending);
-        const un = await undoPublish(e && e.id !== last && e.items.some((it) => it.key === cell.key) ? e.id : null);
-        const [p3, u3] = await versions();
-        ok('Recent publishes › Undo after Try again: the earlier text back, published', un.ok && cellLabels(await unpub(), cell.ref.elId)[T] === b[T] && p3 === u3, { un, now: cellLabels(await unpub(), cell.ref.elId)[T], b: b[T] });
-      } finally {
-        await closeAll();
-        if (store.isEdited(cell.key, T)) store.revert(cell.key, T);
-        // Published first: a publish that failed leaves the form unpublished, and the Publish dialog would then ask first.
-        const [p, u] = await versions();
-        if (p !== u) await fetch(api + 'PublishXml', { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify({ ParameterXml: `<importexportxml><entities><entity>${E}</entity></entities></importexportxml>` }) });
-        if (cellLabels(await unpub(), cell.ref.elId)[T] !== b[T]) await viaPopup(cell.comp, cell.key, T, orig(b[T], 'Nom'));
-      }
+      await keyed('write answer lost', FORM, cell.ref.elId, E, async () => {
+        const b = cellLabels(await unpub(), cell.ref.elId);
+        const t = tgt(b[T], 'Nom réponse E2E');
+        const last = app.saver.history()[0]?.id;
+        try {
+          const s = await stage(cell.comp, cell.key, T, t);
+          if (s.err) return ok('write answer lost: staged', false, s);
+          const r = await publishFailing((u, i) => i.method === 'POST' && /\/\$batch$/.test(u) && typeof i.body === 'string' && /PATCH [^\r\n]*systemforms\(/.test(i.body), 'lost');
+          if (r.err) return ok('write answer lost: the Publish dialog', false, r);
+          ok("write answer lost: the dialog says it couldn't be checked and offers Try again; nothing journaled yet", r.hit === 1 && r.title === "Some changes weren't published" && /Sent to Dataverse, but the result could not be checked/.test(r.text) && !!button(dialog(), 'Try again') && app.saver.history()[0]?.id === last, r);
+          ok('write answer lost: the write reached Dataverse', cellLabels(await unpub(), cell.ref.elId)[T] === t, cellLabels(await unpub(), cell.ref.elId));
+          const r2 = await clickAndWait('Try again');
+          const e = app.saver.history()[0];
+          const [p2, u2] = await versions();
+          ok("Try again: published, and journaled as this publish's own", r2.title === 'Published' && /Done\. Published 1 change\./.test(r2.text) && p2 === u2 && e && e.id !== last && e.published && e.items.length === 1 && e.items[0].key === cell.key && e.items[0].before === (b[T] || '') && e.items[0].after === t, { r2, e, p2, u2 });
+          await closeAll();
+          await closed(r.pending);
+          const un = await undoPublish(e && e.id !== last && e.items.some((it) => it.key === cell.key) ? e.id : null);
+          const [p3, u3] = await versions();
+          ok('Recent publishes › Undo after Try again: the earlier text back, published', un.ok && cellLabels(await unpub(), cell.ref.elId)[T] === b[T] && p3 === u3, { un, now: cellLabels(await unpub(), cell.ref.elId)[T], b: b[T] });
+        } finally {
+          // The cell's own key goes back, published, after this (keyed).
+          await closeAll();
+          if (store.isEdited(cell.key, T)) store.revert(cell.key, T);
+        }
+      });
+    });
+
+    await step('form label emptied through the popup', async () => {
+      // Emptied in the popup, a main form's French field label is written as its stand-in, as in 1.0.0: Dataverse keeps a
+      // label a save leaves out or posts empty (LIVE-FINDINGS 104), so it gets the column's French name as a text of its
+      // own. The line under it says so, and the Publish dialog's row reads "<old> → <that name>" with its quiet note.
+      // Published, the cell is on the same label key, French that name, English as it was. On a test key whose English
+      // and French are texts of its own.
+      if (B !== 1033 || T !== 1036) return ok('form label emptied: the texts checked are worded for English and French', false, { B, T });
+      const colFr = (await colLabels(E, 'new_name'))[T];
+      const BECOMES = `Becomes “${colFr}”: Dataverse can't remove a translation here, so French gets the column's French name.`;
+      const TAG = "The column's French name: Dataverse can't remove a translation";
+      const OWN = 'Full name E2E';
+      const OWN_FR = 'Nom complet E2E';
+      await keyed('form label emptied', FORM, cell.ref.elId, E, async (k) => {
+        store.set(cell.key, B, OWN);
+        store.set(cell.key, T, OWN_FR);
+        const r0 = await app.saver.save(store.changes((s) => s.key === cell.key), { signal: new AbortController().signal, publish: true, onProgress() {} });
+        const was = cellLabels(await unpub(), cell.ref.elId);
+        if (!(r0.saved === 2 && was[B] === OWN && was[T] === OWN_FR)) return ok('form label emptied: English and French labels of its own on the test key', false, { r0: r0.results?.map((x) => [x.outcome, x.message]), was });
+        const r = await input(cell.comp, cell.key, T);
+        if (r.err) return ok('form label emptied: the popup', false, r);
+        setValue(r.inp, '');
+        await sleep(300);
+        const lines = [...r.inp.parentElement.querySelectorAll('.co-m')].filter((x) => !x.hidden).map((x) => x.textContent.trim());
+        ok('popup: the emptied French form label says it becomes the column’s French name', lines.includes(BECOMES), { lines, BECOMES });
+        r.co.querySelector('.co-f .btn.primary')?.click(); // Done
+        await sleep(200);
+        const p = await publish();
+        const list = p.listText || '';
+        const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        ok('Publish dialog: the row reads "<old> → <the column’s French name>" with its note', new RegExp(`${esc(OWN_FR)}\\s*→\\s*${esc(colFr)}`).test(list) && list.includes(TAG), list.slice(0, 900));
+        const d1 = await unpub();
+        const a = cellLabels(d1, cell.ref.elId);
+        const key = keyIn(d1, cell.ref.elId);
+        ok('published: the cell on the same label key, French the column’s French name as a text of its own, English kept; nothing else to say', p.ok && p.rep?.published && !p.rep.warning && !p.rep.notice && key === k.key && a[T] === colFr && a[B] === OWN, { p: p.outcomes, w: p.rep?.warning, n: p.rep?.notice, key, k: k.key, a });
+      });
     });
 
     await step('tab label', async () => {
@@ -538,15 +656,16 @@ window.__dxtPage = { running: true, log: [] };
         const tabA = anchors().find((a) => inPane(a) && a.role === 'tab');
         ok('the side pane\'s tab maps to its own form\'s tab', tabA && store.get(tabA.key)?.ref?.formId === PF, show(tabA));
         if (!PF) return;
-        const host = cellLabels(await unpub(), cell.ref.elId);
-        const b = cellLabels(await formXml(PF), s.ref.elId);
-        const t = tgt(b[T], 'Nom lié volet E2E');
-        const r = await viaPopup(ap.comp, ap.key, T, t, undefined, ap.zone ?? ap.el);
-        const a = cellLabels(await formXml(PF), s.ref.elId);
-        ok('the side pane field label published to the side pane\'s form', r.ok && a[T] === t && a[B] === b[B] && r.rep?.published, { r, b, a });
-        ok('the page form\'s field of the same name is untouched', JSON.stringify(cellLabels(await unpub(), cell.ref.elId)) === JSON.stringify(host));
-        const r2 = await viaPopup(ap.comp, ap.key, T, orig(b[T], 'Nom lié'));
-        ok('side pane field label restored', r2.ok && cellLabels(await formXml(PF), s.ref.elId)[T] === orig(b[T], 'Nom lié'), r2);
+        // The side pane shows a main form of new_dxtlinked: its field on a label key of its own, given back after.
+        await keyed('side pane field label', PF, s.ref.elId, 'new_dxtlinked', async () => {
+          const host = cellLabels(await unpub(), cell.ref.elId);
+          const b = cellLabels(await formXml(PF), s.ref.elId);
+          const t = tgt(b[T], 'Nom lié volet E2E');
+          const r = await viaPopup(ap.comp, ap.key, T, t, undefined, ap.zone ?? ap.el);
+          const a = cellLabels(await formXml(PF), s.ref.elId);
+          ok('the side pane field label published to the side pane\'s form', r.ok && a[T] === t && a[B] === b[B] && r.rep?.published && !r.rep.warning && !r.rep.notice, { r, b, a });
+          ok('the page form\'s field of the same name is untouched', JSON.stringify(cellLabels(await unpub(), cell.ref.elId)) === JSON.stringify(host));
+        });
       } finally {
         pane.close();
       }
@@ -592,40 +711,18 @@ window.__dxtPage = { running: true, log: [] };
       // The timeline's heading is its Name from the form designer, one text for every language, else Dynamics' own
       // ("Timeline", "Chronologie" in French), whatever its form cell's label says (LIVE-FINDINGS 101): the cell's mark,
       // grey, under a key of Microsoft's text, so the list finds the cell on the page there; its popup says which heading
-      // it is and offers that label, saved on the form but never shown. The test form's last tab (dxt_tl_tab) holds a
-      // timeline named "TimelineDXT" and labelled "Timeline DXT", French "Chronologie DXT" (the table has notes: a
-      // timeline shows nothing without). That label is kept per UI language, as a tab's (LIVE-FINDINGS 102): read here in another
-      // language while Dynamics is switched to it. Saved through the heading's popup, it is written on the form.
+      // it is, with no input: that label, saved on the form but never shown, is translated in the Workbench. The test
+      // form's last tab (dxt_tl_tab) holds a timeline named "TimelineDXT" and labelled "Timeline DXT", French
+      // "Chronologie DXT" (the table has notes: a timeline shows nothing without). That label is kept per UI language, as
+      // a tab's (LIVE-FINDINGS 102): read here in another language while Dynamics is switched to it.
       const tab = window.Xrm?.Page?.ui?.tabs?.get('dxt_tl_tab');
       const tl = slots.find((s) => s.kind === 'field' && s.ref?.formId === FORM && /06375649-c143-495e-a496-c962e5b4488e/i.test(s.ref?.classid || ''));
       ok('the test form has a timeline on its tab "Timeline test"', tab && tl, { tab: !!tab, cells: slots.filter((s) => s.kind === 'field' && s.ref?.formId === FORM).map((s) => [s.ref?.controlId, s.ref?.classid]) });
       if (!tab || !tl) return;
-      const FALLBACK = 'Chronologie DXT';
       /** The timeline cell's label in `l` as Dynamics keeps it: read while switched to `l` when it isn't the user's language. */
       const keptIn = async (l) => cellLabels(l === ctx.user ? await unpub() : await d.lang.run(l, unpub).finally(() => d.lang.restore()), tl.ref.elId)[l] || '';
-      /** The heading's popup, opened as a click on it opens it (the overlay's open: the mode presents its anchor). */
-      const openAt = async (a) => {
-        if (callout()) callout().querySelector('.co-f .btn.primary')?.click(); // Done
-        await sleep(150);
-        mode.dev.overlay.o.open(a);
-        await sleep(500);
-        return callout();
-      };
-      /** Types `text` as the timeline's label in the target language in the heading's popup, presses Done, publishes. */
-      const viaHeading = async (a, text) => {
-        const co = await openAt(a);
-        const inp = co?.querySelector(`[data-k="${CSS.escape(tl.key + '#' + T)}"]`);
-        if (!inp) return { err: 'no input for the timeline label', text: co?.innerText.slice(0, 400) };
-        setValue(inp, text);
-        await sleep(100);
-        co.querySelector('.co-f .btn.primary')?.click(); // Done
-        await sleep(200);
-        if (store.value(tl.key, T) !== text) return { err: 'not staged', v: store.value(tl.key, T) };
-        return publish();
-      };
       const first = window.Xrm.Page.ui.tabs.get()[0];
       tab.setFocus();
-      let b = null;
       try {
         const a = await anchorOf((x) => x.key.startsWith('builtin|timeline|'), 40000);
         const heading = document.getElementById(`action_bar_header_title${tl.ref.controlId || 'notescontrol'}`);
@@ -634,39 +731,18 @@ window.__dxtPage = { running: true, log: [] };
         ok('the timeline heading is its cell’s mark, under a key of Microsoft’s text (grey), showing its Name where it has one', a && a.comp === tl.comp && a.key === `builtin|timeline|${tl.comp}|Label` && !!a.text?.nodeValue && a.text.nodeValue === heading?.textContent && (!name || a.text.nodeValue === name), { a: show(a) || anchors().map(show).slice(0, 40), name });
         if (!a) return;
         ok('the list finds the timeline label on the page, at its heading', mode.items().find((i) => i.comp === tl.comp)?.visible === true, mode.items().filter((i) => i.comp === tl.comp));
-        b = { [T]: await keptIn(T), [ctx.user]: await keptIn(ctx.user) };
+        const b = { [T]: await keptIn(T), [ctx.user]: await keptIn(ctx.user) };
         ok('the timeline label is loaded in each language as Dynamics keeps it', (store.get(tl.key).labels[T] || '') === b[T] && (store.get(tl.key).labels[ctx.user] || '') === b[ctx.user], { store: store.get(tl.key).labels, kept: b });
         // Found from the list (mode.open, as a row click or Publish › Fix does): its popup opens at the heading.
         mode.open(tl.comp, {});
         await sleep(800);
         const co = callout();
-        const inp = co?.querySelector(`[data-k="${CSS.escape(tl.key + '#' + T)}"]`);
         const text = co?.innerText || '';
         const said = name ? /The timeline's Name, set in the form designer\. Dynamics shows it as it is in every language/.test(text) : /Dynamics' own heading, already translated/.test(text);
-        ok('opened from the list, its popup is at the heading: which heading it is, and the timeline’s form label, not shown', said && /Form label/.test(text) && /not shown on the page/.test(text) && !!inp && inp.value === b[T], { text: text.slice(0, 500), value: inp?.value, kept: b[T], name });
-        co?.querySelector('.co-f .btn.primary')?.click(); // Done
-        await sleep(200);
-        const t = tgt(b[T], 'Chronologie E2E');
-        const r = await viaHeading(a, t);
-        const c = { [T]: await keptIn(T), [ctx.user]: await keptIn(ctx.user) };
-        ok('the timeline’s form label saved through the heading’s popup, in its own language; the user’s language kept', r.ok && c[T] === t && (T === ctx.user || c[ctx.user] === b[ctx.user]), { r, b, c });
+        ok('opened from the list, its popup is at the heading: the heading, which heading it is, and no input', said && co?.querySelector('.co-t')?.textContent === heading?.textContent && !co.querySelector('[data-k]') && !/Form label/.test(text), { text: text.slice(0, 500), name });
       } finally {
         await closeAll();
         if (callout()) callout().querySelector('.co-f .btn.primary')?.click();
-        if (store.isEdited(tl.key, T)) store.revert(tl.key, T);
-        // Put back as it was (a leftover of an earlier run: the fixture's text), from a fresh read: a save whose answer was
-        // lost committed nothing, and the store would take the text for unchanged.
-        if (b) {
-          const want = orig(b[T], FALLBACK);
-          const now = await keptIn(T).catch(() => null);
-          if (now !== want) {
-            const fresh = await d.providers.loadFormXml(ctx, [{ formId: FORM, entity: '', name: '', type: NaN }], ctx.langs.map((l) => l.lcid), { signal: new AbortController().signal, progress() {}, lang: d.lang }).catch(() => []);
-            store.add(fresh);
-            store.set(tl.key, T, want);
-            const rep = await app.saver.save(store.changes((s) => s.key === tl.key), { signal: new AbortController().signal, publish: true, onProgress() {} }).catch((e) => ({ saved: 0, e: String(e) }));
-            ok('timeline form label restored', rep.saved === 1 && (await keptIn(T)) === want, rep.e || rep.results?.map((x) => [x.outcome, x.message]));
-          } else ok('timeline form label restored', true);
-        }
         first?.setFocus();
         await sleep(1500);
       }

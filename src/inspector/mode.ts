@@ -13,7 +13,7 @@ import { debounce } from '../ui/dom';
 import { notLoaded } from '../ui/editor';
 import type { AppApi } from '../ui/types';
 import { modalOpen } from '../ui/widgets';
-import { describe, inTransient, navIdOf, useRibbonControls } from './describe';
+import { BUILTIN_NOTE, describe, inTransient, navIdOf, useRibbonControls } from './describe';
 import { focusOpener, openList, switchTo, type ListFx } from './lists';
 import { Overlay } from './overlay';
 import { formOf, PageLoader } from './pageload';
@@ -50,6 +50,7 @@ import {
   type Trip,
 } from './reveal';
 import { buildIndex, isBuiltin, isHeading, ofProcess, paneOf, Scanner, type PageIndex } from './scan';
+import { Chosen, openDownload } from './selection';
 import { awayTitle, groupOf, isPending, look, pageTitle, readOnlyLook, WORKBENCH } from './status';
 import type { Action, Anchor, Callout, CalloutHost, CalloutModel, CreatePageMode, Look, OverlayHooks, PageGroup, PageItem, PageMode, PageNote, Switch } from './types';
 
@@ -569,6 +570,7 @@ export const createPageMode: CreatePageMode = (app) => {
     mutated,
     ours: () => [app.root.host],
     alt: () => emit('alt'),
+    boxed: (as) => addSelected(as),
   };
   // The class, not only its OverlayApi: active() also takes the label the popup points at (marked alone).
   const overlay = new Overlay(hooks);
@@ -611,9 +613,10 @@ export const createPageMode: CreatePageMode = (app) => {
     if (!on || e.type === 'busy') return;
     if (e.type === 'slots') return refreshSoon();
     if (e.type === 'edit') {
-      // The user's own language shows the staged text in place while typing (the original again after Undo).
+      // The user's own language shows the staged text in place while typing (the original again after Undo), a column's
+      // name also in the form field labels that show it (Preview.showing).
       const c = store.get(e.key)?.comp;
-      if (c) preview.apply(scanner.of(c));
+      if (c) preview.apply([...scanner.of(c), ...preview.showing(e.key, scanner.list)]);
     } else preview.apply(scanner.list);
     repaint();
   });
@@ -1415,11 +1418,50 @@ export const createPageMode: CreatePageMode = (app) => {
     if (!on || paused) return;
     const a = navigate() ? sameLabel(clicked, scanner.list) : clicked;
     if (!a) return;
+    if (selecting) return toggleSelected(a);
     const st = cur && !cur.closed ? cur : null;
     clickLabel(a, st, {
       move: (b) => st && moveTo(st, b),
       open: (b) => present(b.comp, b, {}),
     });
+  }
+
+  // ---- selecting labels for an export ----
+
+  /**
+   * "Select labels to export": the labels selected, by component (a label shown twice is selected once), kept across
+   * pages until Cancel; a download keeps them. `selecting`: a click (or a box dragged over labels) selects.
+   */
+  const chosen = new Chosen();
+  let selecting = false;
+  /** Microsoft's built-in text (and the timeline's heading) has nothing of ours to export: it can't be selected. */
+  const canSelect = (a: Anchor): boolean => anchorLook(a) !== 'builtin';
+
+  function selectionLook(): void {
+    overlay.selection(selecting ? { has: (a) => chosen.has(a.comp), can: canSelect } : null);
+  }
+
+  /** A click while selecting: selects the label, or unselects it; built-in text says why it can't be. */
+  function toggleSelected(a: Anchor): void {
+    if (!canSelect(a)) {
+      let why = '';
+      try {
+        why = describe(app, a.comp, a).note || '';
+      } catch (e) {
+        if (__DEV__) console.error('[translator]', e);
+      }
+      return app.toast(why || BUILTIN_NOTE, 'info');
+    }
+    chosen.toggle(a, title());
+    overlay.invalidate(1);
+    emit('items');
+  }
+
+  /** Labels a box covered, or Select all: each one not selected yet is (never unselects). */
+  function addSelected(as: Iterable<Anchor>): void {
+    if (!selecting || !chosen.add([...as].filter(canSelect), title())) return;
+    overlay.invalidate(1);
+    emit('items');
   }
 
   // ---- counts, notes ----
@@ -1478,6 +1520,8 @@ export const createPageMode: CreatePageMode = (app) => {
     if (!on) return;
     cancelWait();
     closeCallout();
+    selecting = false;
+    selectionLook();
     on = false;
     clearInterval(tick);
     refreshSoon.cancel();
@@ -1529,6 +1573,22 @@ export const createPageMode: CreatePageMode = (app) => {
     notes,
     title,
     flash: (comp) => overlay.flash(comp),
+    select(v, clear = false) {
+      if (clear) chosen.clear();
+      if (v && (!on || paused)) return;
+      if (v && !selecting) {
+        cancelWait();
+        closeCallout();
+        overlay.flash('');
+      }
+      selecting = v;
+      selectionLook();
+      emit('items');
+    },
+    selecting: () => selecting,
+    selectAll: () => addSelected(scanner.list),
+    selection: () => chosen.list(),
+    download: () => openDownload(app, chosen.list(), () => mode.select(false)),
     on(fn) {
       subs.add(fn);
       return () => subs.delete(fn);

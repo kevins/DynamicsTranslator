@@ -3,11 +3,14 @@
 // (double-click the logo to put it back); the place is kept in prefs.bar as fractions of the free room, so it
 // follows the viewport as it changes. Left to right: the logo, "Translator", the languages, one status text
 // (loading, a load problem, the hint, or the number of staged changes), "Review and publish", "All labels",
-// "Workbench", ⋯ (Recent publishes, Refresh page, Show Dynamics in <language>, the version) and ✕.
+// "Workbench", ⋯ (Select labels to export, Recent publishes, Refresh page, Show Dynamics in <language>, the version)
+// and ✕. While labels are selected for an export (PageMode.select) the status says how many, and Select all,
+// Download… and Cancel take the place of the buttons after it.
 
 import { lcidShort } from '../core/lcid';
 import type { Lcid } from '../core/model';
 import { shownLanguage } from '../core/uilang';
+import { selectingText } from '../inspector/selection';
 import type { CreateBar, PageNote } from '../inspector/types';
 import css from './bar.css';
 import { h, icon, plural, put, rafThrottle } from './dom';
@@ -149,11 +152,15 @@ export const createBar: CreateBar = (app, mode, o) => {
   tooltip(allB, 'All labels on this page');
   const wbB = h('button', { class: 'btn subtle', type: 'button', on: { click: () => o.workbench() } }, icon('table'), h('span', { class: 'tb-c1' }, 'Workbench'));
   tooltip(wbB, 'Every label of a table or solution in a spreadsheet');
+  // Selecting labels to export (PageMode.select): these take the place of the buttons above.
+  const selAllB = h('button', { class: 'btn subtle', type: 'button', hidden: true, on: { click: () => mode.selectAll() } }, 'Select all');
+  const dlB = h('button', { class: 'btn primary', type: 'button', hidden: true, on: { click: () => mode.download() } }, 'Download…');
+  const cancelB = h('button', { class: 'btn subtle', type: 'button', hidden: true, on: { click: () => mode.select(false, true) } }, 'Cancel');
   const moreB = ibtn('more', 'More options', () => moreMenu(), 'subtle');
   moreB.setAttribute('aria-haspopup', 'menu');
   const exitB = ibtn('close', 'Close the translator', () => o.exit(), 'subtle');
   const bar = h('div', { class: 'tb', role: 'toolbar', 'aria-label': 'Dynamics Translator' },
-    grip, h('span', { class: 'tb-title' }, 'Translator'), many && langEl, h('span', { class: 'tb-div', 'aria-hidden': 'true' }), stw, pubB, allB, wbB, moreB, exitB);
+    grip, h('span', { class: 'tb-title' }, 'Translator'), many && langEl, h('span', { class: 'tb-div', 'aria-hidden': 'true' }), stw, pubB, allB, wbB, selAllB, dlB, cancelB, moreB, exitB);
   const el = h('div', { class: 'tbx' }, bar);
 
   function syncLang(): void {
@@ -173,7 +180,8 @@ export const createBar: CreateBar = (app, mode, o) => {
   const count = (): number => safe(() => mode.counts().pending, store.pendingCount());
 
   // ---- what to say ----
-  function status(loading: boolean, notes: PageNote[], n: number): Status {
+  function status(loading: boolean, notes: PageNote[], n: number, selected: number | null): Status {
+    if (selected !== null) return { tone: '', text: selectingText(selected) };
     if (loading) return { tone: 'busy', text: 'Loading translations…' };
     const retry = notes.find((nt) => nt.action && nt.run);
     if (notes.length) return { tone: 'error', text: "Couldn't load some labels.", act: retry ? [retry.action!, () => retry.run!()] : undefined, tip: notes.map((nt) => nt.text).join('\n') };
@@ -188,7 +196,10 @@ export const createBar: CreateBar = (app, mode, o) => {
     const loading = safe(() => mode.loading(), false);
     const notes = safe(() => mode.notes(), [] as PageNote[]);
     const pending = count();
-    const s = status(loading, notes, pending);
+    const selecting = safe(() => mode.selecting(), false);
+    const s = status(loading, notes, pending, selecting ? safe(() => mode.selection().length, 0) : null);
+    for (const b of [pubB, allB, wbB, moreB]) b.hidden = selecting;
+    for (const b of [selAllB, dlB, cancelB]) b.hidden = !selecting;
     statusTip = s.tip || '';
     const sk = [s.tone, s.text, s.act?.[0] || ''].join('\u0001');
     if (sk !== stKey) {
@@ -331,7 +342,20 @@ export const createBar: CreateBar = (app, mode, o) => {
 
   // ---- menu ----
   function moreMenu(): void {
-    menu(moreB, [{ label: 'Recent publishes', icon: 'history', run: () => o.history() }, ...dynamicsItems(app), '-', { head: `Dynamics Translator ${__VERSION__}` }], { end: true });
+    menu(
+      moreB,
+      [
+        { label: 'Select labels to export', icon: 'download', run: () => o.select() },
+        { label: 'Recent publishes', icon: 'history', run: () => o.history() },
+        ...dynamicsItems(app),
+        '-',
+        { head: 'Settings' },
+        app.managedMenuItem(),
+        '-',
+        { head: `Dynamics Translator ${__VERSION__}` },
+      ],
+      { end: true },
+    );
   }
 
   // ---- events ----

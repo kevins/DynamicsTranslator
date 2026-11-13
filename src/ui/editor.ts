@@ -5,7 +5,7 @@
 
 import { isAbort } from '../core/http';
 import { isRtl, lcidShort, lcidTag } from '../core/lcid';
-import { keepsEmpty, KIND_NAMES, noneText, noStandIn, notLoaded, PROP_NAMES, savedEmptyText, standInSays, type Lcid, type Prop, type Slot, type StandIn } from '../core/model';
+import { filledIn, keepsEmpty, KIND_NAMES, noneText, noStandIn, notLoaded, PROP_NAMES, savedEmptyText, standInSays, type Lcid, type Prop, type Slot, type StandIn } from '../core/model';
 import type { Store } from '../core/store';
 import { shownLanguage } from '../core/uilang';
 import { fallbackOf } from '../inspector/fallback';
@@ -48,6 +48,14 @@ export const becomesText = (s: Slot, l: Lcid, base: Lcid, x: Pick<StandIn, 'text
  * check() in core/saver.ts, so the editor, grid, inspector and review all agree with what the save does.
  */
 export const isRemoval = (base: Lcid, lcid: Lcid, before: string, after: string): boolean => lcid !== base && !after.trim() && before !== '';
+
+/**
+ * What an input of the popup or the editor card stages for the text `v` typed in it: a blank one where the label follows
+ * its column as loaded (Store.follows), whose input shows empty, is its loaded text, so emptying it again changes
+ * nothing (its column's name is never written there as its stand-in); anything else as typed. With `user`, the user's
+ * language, as the input shows it: in a language GetClientMetadata hasn't answered for yet, the user's answer decides.
+ */
+export const typedText = (store: Store, key: string, l: Lcid, base: Lcid, v: string, user?: Lcid): string => (!v.trim() && store.follows(key, l, base, user) ? store.original(key, l) : v);
 
 /** Message tone under an input: class and icon, so the tone never relies on color alone. */
 const LOOK: Record<'error' | 'warn' | 'note', [string, IconName]> = { error: ['e', 'error'], warn: ['w', 'warn'], note: ['n', 'info'] };
@@ -175,7 +183,7 @@ export function createEditor(app: AppApi, comp: string, o: { focusLcid?: Lcid; o
     // A staged text with nothing typed in it yet: Ctrl+Z goes back to the server text, Ctrl+Y brings the edit back.
     whenEmpty(inp, (u) => (u === 'undo' && store.isEdited(s.key, l) ? store.original(s.key, l) : undefined));
     inp.addEventListener('input', () => {
-      store.set(s.key, l, inp.value);
+      store.set(s.key, l, typedText(store, s.key, l, base, inp.value, app.ctx.user));
       grow(inp);
     });
 
@@ -210,7 +218,9 @@ export function createEditor(app: AppApi, comp: string, o: { focusLcid?: Lcid; o
     // saving writes a stand-in, the line under the input says what it becomes instead (and where it saves a description
     // empty, that it does).
     const fallback = () => (isBase ? undefined : fallbackOf((k) => store.get(k), s));
-    const colKey = fallback()?.key || '';
+    // Followed in every language: a form label that follows its column (Store.follows) shows the column's name in its
+    // place, in the base language too.
+    const colKey = fallbackOf((k) => store.get(k), s)?.key || '';
     const showsNow = (bv: string): string => {
       // A metadata description (model.ts keepsEmpty): "No French tooltip" only where its users see none (stored or saved
       // empty, Store.emptyOnPurpose, or no base text either); a missing one shows them the base text, as the popup says.
@@ -229,8 +239,13 @@ export function createEditor(app: AppApi, comp: string, o: { focusLcid?: Lcid; o
       const bv = store.value(s.key, base);
       const edited = store.isEdited(s.key, l);
       const cs = store.cellStatus(s.key, l);
-      if (inp.value !== v) {
-        inp.value = v;
+      // A form label that follows its column (Store.follows) shows empty while nothing is typed in it, as in the popup
+      // (in a language not known yet, as the user's language does), with what shows in its place as its placeholder; its
+      // loaded text typed there stays, as in the popup.
+      const fol = !edited && store.follows(s.key, l, base, app.ctx.user);
+      const shown = fol && inp.value !== v ? '' : v;
+      if (inp.value !== shown) {
+        inp.value = shown;
         grow(inp);
       }
       inp.disabled = ro || nl;
@@ -240,20 +255,25 @@ export function createEditor(app: AppApi, comp: string, o: { focusLcid?: Lcid; o
       const empty = edited && !ro && !nl && !isBase && store.emptyOnPurpose(s.key, l, base) ? savedEmptyText(s, langName(app, l)) : '';
       const removing = edited && !ro && !nl && isRemoval(base, l, store.original(s.key, l), v);
       const x = removing && !empty ? store.standIn(s.key, l, base) : undefined;
+      // Emptied, the field's last label of its own (model.ts freesAll), the base language's too: it follows its column, so
+      // it shows as one that does.
+      const freed = edited && !ro && !nl && !v.trim() && !!store.standIn(s.key, l, base)?.follow;
       const stuck = !!x && !x.text;
-      const stand = empty || (x?.text ? becomesText(s, l, base, x) : '');
+      const stand = empty || (x?.text && !x.follow ? becomesText(s, l, base, x) : '');
       inp.placeholder = nl
         ? 'Not loaded'
         : ro
           ? ''
-          : isBase
-            ? s.baseRequired ? 'Required' : ''
-            : stuck
-              ? "Can't be removed — type the text instead"
-              : stand && !empty
-                ? ''
-                : showsNow(bv);
-      inp.classList.toggle('same', !isBase && !!v && v === bv);
+          : fol || freed
+            ? `Shows “${(filledIn(s, l, base, (k, y) => store.text(k, y)) ?? v).trim()}”`
+            : isBase
+              ? s.baseRequired ? 'Required' : ''
+              : stuck
+                ? "Can't be removed — type the text instead"
+                : stand && !empty
+                  ? ''
+                  : showsNow(bv);
+      inp.classList.toggle('same', !isBase && !!shown && shown === bv);
       // "Missing" means it needs translating: empty here while the base language has text, but for a description
       // stored empty on purpose (model.ts storedEmpty), which is translated.
       const miss = !ro && !nl && !v.trim() && (isBase ? s.baseRequired : !!bv.trim() && !store.emptyOnPurpose(s.key, l, base));
@@ -264,7 +284,7 @@ export function createEditor(app: AppApi, comp: string, o: { focusLcid?: Lcid; o
         cs?.outcome === 'error' && cs.message ? { level: 'error', text: cs.message }
         : stuck ? { level: 'error', text: noStandIn(s, l, x) }
         : stand ? { level: 'note', text: stand }
-        : removing ? { level: 'note', text: WILL_REMOVE }
+        : removing && !freed ? { level: 'note', text: WILL_REMOVE }
         : issue ? { level: issue.level, text: issue.message }
         : null;
       // A validation error blocks saving: show it in red like a failed save, not only as text.

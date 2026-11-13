@@ -217,6 +217,20 @@ export function register(t: Kit): void {
     return k;
   };
 
+  /** The name column, and body cells of it on a main form as the loader makes them (sparse), French as given. */
+  const nameCells = (r: Rig, frs: Record<string, string>) => {
+    r.add('attribute', 'attribute|acc.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom' }, { title: 'Name', prop: 'DisplayName', path: ['Account', 'Columns'] });
+    return Object.entries(frs).map(([id, fr]) =>
+      r.add('field', `field|f1|${id}|Label`, { [EN]: 'Name', [FR]: fr }, { title: id, group: 'formxml|f1', baseRequired: false, path: ['Account', 'Account (Main form)', 'General'], ref: { formId: 'f1', elId: id, formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name', sparse: true } }).key,
+    );
+  };
+
+  /**
+   * A journaled French change of a form label (saver.ts run: its key, comp and title as the publish names them); `o` may
+   * carry the fields a 1.1.0 development build journaled, which this version doesn't know.
+   */
+  const frItem = (key: string, before: string, after: string, o: object = {}): HistoryItem => ({ key, comp: key.slice(0, key.lastIndexOf('|')), kind: 'field', lcid: FR, title: key.split('|')[2], before, after, ...o });
+
   dialog('the Undo question reads each label first and says what will happen to it: back to its old text, to its stand-in (a translation Dataverse can\'t remove), changed since (not undone unless chosen), stays (Dataverse can\'t remove it and nothing stands in for it), already as before, not loaded here; nothing is written until Undo, and Cancel writes nothing', async (d) => {
     const { r } = d;
     const k = await sixLabels(r);
@@ -344,6 +358,21 @@ export function register(t: Kit): void {
     t.eq([!!x.undoneAt, x.kept], [true, undefined]);
   });
 
+  dialog("Undo of a publish a 1.1.0 development build journaled, its items with fields this version doesn't know (`removed`, `follows`, `own`): the question and the result rows read each label as any other, back to its text from before, and the undo writes that text", async (d) => {
+    const { r } = d;
+    const [ca, cb] = nameCells(r, { ca: 'Nom', cb: 'Nom complet' });
+    // A Remove of a text of the label's own (ca, which shows its column's name since), an edit over the column's name (cb).
+    await addHistory(r.app.ctx, { id: 'p1', at: Date.now() - 60_000, published: true, items: [frItem(ca, 'Client', 'Nom', { removed: 'column', own: true }), frItem(cb, 'Nom', 'Nom complet', { follows: true })] });
+    openHistory(r.app);
+    d.click('Undo');
+    await d.asked();
+    t.eq(groups(d.dlg()).map((g) => g[1]), ['French: Nom→Client', 'French: Nom complet→Nom']);
+    await d.ready();
+    fire(d.go()!, 'click', { detail: 1 });
+    await d.until('undone', () => d.title() === 'Publish undone');
+    t.eq([groups(d.dlg()).map((g) => g[1]), r.server.get(`${ca}#${FR}`), r.server.get(`${cb}#${FR}`)], [['French: Nom→Client | Undone', 'French: Nom complet→Nom | Undone'], 'Client', 'Nom']);
+  });
+
   dialog('Undo anyway on a label changed since writes the old text over the text read; one changed again after that read is still a conflict, never overwritten', async (d) => {
     const { r } = d;
     const b = col(r, 'b', 'B fr');
@@ -419,6 +448,36 @@ export function register(t: Kit): void {
     fire(d.go()!, 'click', { detail: 1 });
     await d.until('done', () => d.title() === 'Publish undone');
     t.eq(r.server.get(`${a}#${FR}`), 'A fr');
+  });
+
+  dialog("Undo says the text from before is live only once the check after its publish finds it served (LIVE-FINDINGS 118), as Publish does: one still not served after the check's repair is said, never live, and the undo's entry stays not published, for its Publish; one served is live", async (d) => {
+    const { r } = d;
+    const a = col(r, 'a', 'A fr', { ref: { entity: 'acc', attribute: 'a' } as Slot['ref'] });
+    const b = col(r, 'b', 'B fr', { ref: { entity: 'acc', attribute: 'b' } as Slot['ref'] });
+    const serve = (x: string, fr: string) => r.columns.set(`acc|${x}`, { DisplayName: { [EN]: x.toUpperCase(), [FR]: fr }, Description: {} });
+    const undo = async (k: string) => {
+      openHistory(r.app);
+      d.click('Undo');
+      await d.asked();
+      await d.ready();
+      fire(d.go()!, 'click', { detail: 1 });
+      await d.until('done', () => d.title() === 'Publish undone');
+      t.eq(r.server.get(`${k}#${FR}`), k === a ? 'A fr' : 'B fr', 'written');
+      const text = d.dlg().textContent;
+      d.click('Close');
+      return text;
+    };
+    r.store.set(a, FR, 'A 2');
+    serve('a', 'A 2'); // still served after the undo
+    await publish(r);
+    const one = await undo(a);
+    t.ok(one.includes('unpublished changes') && !one.includes('is live again'), one);
+    t.eq([r.again.length, readHistory(r.app.ctx).map((e) => !!e.published)], [1, [false, true]], 'repaired once, in vain; the undo not published');
+    r.store.set(b, FR, 'B 2');
+    serve('b', 'B fr');
+    await publish(r);
+    const two = await undo(b);
+    t.ok(two.includes('The previous text is live again.'), two);
   });
 
   dialog('every label already as before: Mark as undone writes nothing and marks the publish undone', async (d) => {
@@ -582,7 +641,7 @@ export function register(t: Kit): void {
       },
     };
     const noRead: Writer = { kinds: ['view'], lane: 'records', save: reader.save };
-    const saver = createSaver({ base: EN, user: EN } as never, store, {} as never, (k) => (k === 'attribute' ? reader : k === 'view' ? noRead : undefined));
+    const saver = createSaver({ base: EN, user: EN, langs: [] } as never, store, {} as never, (k) => (k === 'attribute' ? reader : k === 'view' ? noRead : undefined));
     const s = (kind: string, key: string, group: string) => ({ ...t.slot(kind, key), group }) as Slot;
     const ch = (slot: Slot, lcid: Lcid): Change => ({ slot, lcid, before: '', after: '' });
     const a = s('attribute', 'attribute|acc.a|DisplayName', 'attribute|acc.a');
@@ -720,6 +779,22 @@ export function register(t: Kit): void {
       t.eq(r.writes.map((w) => w.ids), [[[`${u.key}#${FR}`, 'Code']]], 'only the other label written');
       t.eq([r.server.get(`${m.key}#${FR}`), r.server.get(`${u.key}#${FR}`)], ['Nom 2', 'Code']);
       t.eq(readHistory(r.app.ctx).find((x) => x.id === e.id)?.undoneAt, undefined, 'still undoable: not every label is back');
+    } finally {
+      r.done();
+    }
+  });
+
+  t.test("Recent publishes › Undo of a publish that changed a label of a managed solution's component, where this session allows changes to managed labels (Ctx.managedEdits) and its loader said it may be changed: undone like any other", async () => {
+    const r = rig(t);
+    try {
+      const m = r.add('attribute', 'attribute|acc.m|DisplayName', { [EN]: 'Name', [FR]: 'Nom 2' }, { ref: { managed: true, lock: '', held: MANAGED } });
+      r.app.ctx.managedEdits = true;
+      r.store.setManagedEdits(true);
+      const e: HistoryEntry = { id: 'managed-undo-on', at: Date.now(), published: true, items: [{ key: m.key, comp: m.comp, kind: m.kind, lcid: FR, title: m.title, before: 'Nom', after: 'Nom 2' }] };
+      addHistory(r.app.ctx, e);
+      const rep = await r.app.saver.undo(e, { signal: new AbortController().signal, publish: true, onProgress() {} });
+      t.eq(rep.results.map((x) => [x.change.slot.key, x.outcome]), [[m.key, 'saved']]);
+      t.eq(r.server.get(`${m.key}#${FR}`), 'Nom');
     } finally {
       r.done();
     }

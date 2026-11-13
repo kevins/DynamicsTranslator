@@ -19,6 +19,9 @@
 // an error and never written, while the rest of its group saves normally; a description's (model.ts keepsEmpty) is
 // written as '' instead, with every other language as it is, and stored empty (finding 32). Loaders treat a stored ''
 // label as missing, but for a description, where it is kept as stored empty.
+//
+// A column's name or tooltip saved but still not served as saved after its publish (LIVE-FINDINGS 118): Publish again
+// writes it with MARK after it, publishes, writes it as it is and publishes again (againAttribute).
 
 import { batchGet } from '../core/batch';
 import type { Ctx } from '../core/context';
@@ -26,9 +29,10 @@ import { DvError, abortError, guid, isAbort, isLogicalName, mayHaveRun, partErro
 import { fromChanges, mergeInto, pick, stripAnnotations, toLabels } from '../core/labels';
 import type { Label } from '../core/labels';
 import { lcidName } from '../core/lcid';
-import { CANT_CLEAR_TEXT, KIND_NAMES, MANAGED, PROP_NAMES, isManaged, keepsEmpty, savesEmpty } from '../core/model';
+import { CANT_CLEAR_TEXT, KIND_NAMES, MANAGED, PROP_NAMES, behindText, keepsEmpty, managedHeld, managedReadOnly, managedSlot, savesEmpty } from '../core/model';
 import { friendly } from '../core/saver';
-import type { Change, ChangeResult, Kind, Labels, Prop, Slot } from '../core/model';
+import type { Change, ChangeResult, Kind, Labels, Lcid, Prop, Slot } from '../core/model';
+import { MARK, rewrite } from './formxml';
 import { layersPath, parseLayers, readLayers } from './layers';
 import type { LayerKind, Layers } from './layers';
 import { check } from './types';
@@ -250,6 +254,11 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
   const rels = new Map<string, any>();
   /** Loaded tables: logical name -> [display name, plural name]. */
   const tables = new Map<string, [string, string]>();
+  /**
+   * A label of a managed component, `why(managed)` its reason either way: read-only by why(true) unless this session
+   * allows changes to managed labels, then by why(false), as an unmanaged one (core/model.ts managedSlot).
+   */
+  const ms = (s: Slot, why: (managed: boolean) => string): Slot => (s.ref?.managed ? managedSlot(s, ctx.managedEdits, why(false), why(true)) : s);
 
   const table = async (e: string): Promise<Slot[]> => {
     const tp = entityPath(e);
@@ -278,8 +287,13 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
     if (kinds.has('entity')) {
       const ref = { entity: e, metadataId: guid(ent.MetadataId), managed: !!ent.IsManaged, custom: !!ent.IsCustomEntity };
       const b = mk('entity', `entity|${e}`, e, tt, [tt], e, notCustomizable(ent, 'table'), 0, ref);
-      const names = notRenameable(ent, 'table', ref.custom);
-      out.push(slot(b, 'DisplayName', ent.DisplayName, names), slot(b, 'DisplayCollectionName', ent.DisplayCollectionName, names), slot(b, 'Description', ent.Description));
+      const names = (m: boolean) => notRenameable(ent, 'table', ref.custom, m);
+      const own = (m: boolean) => notCustomizable(ent, 'table', m);
+      out.push(
+        ms(slot(b, 'DisplayName', ent.DisplayName, names(ref.managed)), names),
+        ms(slot(b, 'DisplayCollectionName', ent.DisplayCollectionName, names(ref.managed)), names),
+        ms(slot(b, 'Description', ent.Description), own),
+      );
     }
 
     if (ent.Attributes) {
@@ -291,7 +305,8 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
           const n: string = a.LogicalName;
           const ref = { entity: e, attribute: n, metadataId: guid(a.MetadataId), odataType: String(a['@odata.type'] || '').replace('#', ''), managed: !!a.IsManaged, custom: !!a.IsCustomAttribute };
           const b = mk('attribute', `attribute|${e}.${n}`, e, t, [tt, 'Columns'], n, notCustomizable(a, 'column'), i, ref);
-          out.push(slot(b, 'DisplayName', a.DisplayName, notRenameable(a, 'column', ref.custom)), slot(b, 'Description', a.Description));
+          const names = (m: boolean) => notRenameable(a, 'column', ref.custom, m);
+          out.push(ms(slot(b, 'DisplayName', a.DisplayName, names(ref.managed)), names), ms(slot(b, 'Description', a.Description), (m) => notCustomizable(a, 'column', m)));
         });
     }
 
@@ -312,13 +327,15 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
         }
         if (!kinds.has(kind)) continue;
         const path = [tt, `${name(a.DisplayName, n)} (${n})`, 'Choices'];
-        // Its options belong to the column and its own choice: either one from a managed solution makes them read-only.
+        // Its options belong to the column and its own choice: either one from a managed solution makes them read-only, and
+        // where changes to those are allowed, either one not customizable.
         const managed = !!a.IsManaged || !!os.IsManaged;
+        const lock = (m: boolean) => notCustomizable(a, 'choice column', m) || (m ? '' : notCustomizable(os, 'choice column', false));
         opts(os).forEach((op, j) => {
           const v = Number(op.Value);
           const ref = { entity: e, attribute: n, value: v, attributeMetadataId: guid(a.MetadataId), optionMetadataId: guid(op.MetadataId), cast, managed };
           const b = mk(kind, `${kind}|${e}.${n}|${v}`, e, name(op.Label, String(v)), path, String(v), notCustomizable(a, 'choice column', managed), j, ref);
-          out.push(slot(b, 'Label', op.Label), slot(b, 'Description', op.Description));
+          out.push(ms(slot(b, 'Label', op.Label), lock), ms(slot(b, 'Description', op.Description), lock));
         });
       }
     });
@@ -365,8 +382,9 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
     .sort((x, y) => x.t.localeCompare(y.t))
     .forEach(({ r, side, owner, other, m, t }, i) => {
       const beh = String(m?.Behavior);
-      const ro =
-        notCustomizable(r, 'relationship') || (/^(UseLabel|1)$/.test(beh) ? '' : /^(DoNotDisplay|2)$/.test(beh) ? 'Not shown in the related menu' : "Uses the related table's plural name");
+      const lock = (managed: boolean) =>
+        notCustomizable(r, 'relationship', managed) || (/^(UseLabel|1)$/.test(beh) ? '' : /^(DoNotDisplay|2)$/.test(beh) ? 'Not shown in the related menu' : "Uses the related table's plural name");
+      const ro = lock(!!r.IsManaged);
       const group = `relationship|${r.SchemaName}`;
       const ref = {
         schemaName: r.SchemaName,
@@ -383,7 +401,7 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
         managed: !!r.IsManaged,
       };
       const sub = side ? `${r.SchemaName} (${owner} → ${other})` : r.SchemaName;
-      out.push(slot(mk('relationship', side ? `${group}|${side}` : group, owner, t, [tables.get(owner)?.[0] || owner, 'Relationships'], sub, ro, i, ref, group), 'Label', m?.Label));
+      out.push(ms(slot(mk('relationship', side ? `${group}|${side}` : group, owner, t, [tables.get(owner)?.[0] || owner, 'Relationships'], sub, ro, i, ref, group), 'Label', m?.Label), lock));
     });
 
   // Global choices that belong to the solution are listed even when no loaded table uses them.
@@ -415,17 +433,18 @@ async function load(ctx: Ctx, entities: string[], kinds: Set<Kind>, o: LoadOptio
     .forEach(({ n, g, t }, i) => {
       const s = g.set;
       const ro = notCustomizable(s, 'global choice');
+      const lock = (m: boolean) => notCustomizable(s, 'global choice', m);
       const boolean = !!s.TrueOption;
       if (kinds.has('globaloptionset')) {
         const b = mk('globaloptionset', `globaloptionset|${n}`, '', t, [GLOBAL], n, ro, i, { name: n, metadataId: guid(s.MetadataId), boolean, usedBy: g.usedBy, managed: !!s.IsManaged });
-        out.push(slot(b, 'DisplayName', s.DisplayName), slot(b, 'Description', s.Description));
+        out.push(ms(slot(b, 'DisplayName', s.DisplayName), lock), ms(slot(b, 'Description', s.Description), lock));
       }
       if (kinds.has('globaloption'))
         opts(s).forEach((op, j) => {
           const v = Number(op.Value);
           const ref = { name: n, value: v, optionMetadataId: guid(op.MetadataId), setId: guid(s.MetadataId), usedBy: g.usedBy, boolean, managed: !!s.IsManaged };
           const b = mk('globaloption', `globaloption|${n}|${v}`, '', name(op.Label, String(v)), [GLOBAL, t], String(v), ro, j, ref);
-          out.push(slot(b, 'Label', op.Label), slot(b, 'Description', op.Description));
+          out.push(ms(slot(b, 'Label', op.Label), lock), ms(slot(b, 'Description', op.Description), lock));
         });
     });
 
@@ -455,8 +474,9 @@ const CANCELLED = 'Cancelled before saving';
 
 /** Why a change can't be written at all, decided before any server call ('' = it can be written). */
 function refusal(ctx: Ctx, c: Change): string {
-  // Loaded from a managed solution: never an unmanaged layer on it (the read before the write checks again, guard()).
-  if (isManaged(c.slot)) return MANAGED;
+  // Loaded from a managed solution: never an unmanaged layer on it, unless this session allows changes to managed labels
+  // and its load said it may be (the read before the write checks again, guard()).
+  if (managedHeld(c.slot, ctx.managedEdits)) return managedReadOnly(c.slot, ctx.managedEdits);
   if (c.after.trim()) return '';
   // A description's translation emptied is saved empty, '' with every other language as it is (model.ts savesEmpty);
   // any other is the saver's to write as its stand-in, so one blank here is refused.
@@ -611,16 +631,22 @@ async function sent(ctx: Ctx, method: string, url: string, send: () => Promise<a
 /**
  * The managed properties as read right before a write: the load's reasons (a property changed since). A component the
  * load or that read shows from a managed solution (a local choice's column or its own choice) is refused with MANAGED,
- * so nothing slipped through ever writes an unmanaged layer on it. The writers' reads leave out IsCustomEntity /
+ * so nothing slipped through ever writes an unmanaged layer on it, unless this session allows changes to managed labels
+ * (Ctx.managedEdits): then the layer is what was asked for. The writers' reads leave out IsCustomEntity /
  * IsCustomAttribute, which the slot remembers from its load.
  */
 const guard =
-  (noun: LockNoun) =>
+  (ctx: Ctx, noun: LockNoun) =>
   (cur: any, c: Change): string => {
     const managed = cur?.IsManaged === true || cur?.OptionSet?.IsManaged === true || !!c.slot.ref?.managed;
-    return (noun === 'table' || noun === 'column') && c.slot.prop !== 'Description'
-      ? notRenameable(cur, noun, !!c.slot.ref?.custom, managed)
-      : notCustomizable(cur, noun, managed);
+    // Where this session allows changes to managed labels (Ctx.managedEdits), a managed one is checked as an unmanaged one
+    // is, by its managed properties as read now, a local choice's own ones too (as its load did).
+    const held = managed && !ctx.managedEdits;
+    const why =
+      (noun === 'table' || noun === 'column') && c.slot.prop !== 'Description'
+        ? notRenameable(cur, noun, !!c.slot.ref?.custom, held)
+        : notCustomizable(cur, noun, held);
+    return why || (managed && !held && cur?.OptionSet ? notCustomizable(cur.OptionSet, noun, false) : '');
   };
 
 /** Ends a server message with a full stop so more text can follow it. */
@@ -1261,9 +1287,8 @@ function sure(rec: Mine, cur: any, c: Change, label: LabelOf): boolean {
  * of each label it edits (the metadata PUTs, UpdateStateValue), 'all' the whole definition (a relationship's PUT).
  */
 type Back = 'langs' | 'labels' | 'all';
-/** A read before writing still behind this page's own write after every wait (see flowOnce): nothing was written. */
-const behindMsg = (s: Slot): string =>
-  `Not saved: Dataverse doesn't show your last change to this ${KIND_NAMES[s.kind][0].toLowerCase()} yet, and saving now could undo it. Try again in a minute.`;
+/** A read before writing still behind this page's own write after every wait (see flowOnce): nothing was written (model.ts behindText). */
+const behindMsg = (s: Slot): string => behindText(KIND_NAMES[s.kind][0].toLowerCase());
 
 /**
  * True when a language that a write of `todo` sends back as read (one it does not edit) reads otherwise than the slot's
@@ -1390,7 +1415,10 @@ async function flowOnce(
     // one writing that same text again: so a write really dropped (finding 62) is written again by the next round or Try
     // again. With the storage blocked (MINE incomplete) a conflict, a text already as asked and a language sent back that
     // differs from the slot (behind()) are read again after 1 and 2 s first: the read may lag behind a write made before.
-    const rewrites = (m: Own) => asking.some((c) => idOf(c) === idOf(m.c) && text(c) === m.text);
+    // A write of this page's own last text there again (behindOf's `again`): that text, or Publish again's repair of a column
+    // label (againAttribute), that text with MARK after it, made on it (`before`) over a read that may still show the text
+    // from before it (Change.alsoBefore, LIVE-FINDINGS 118).
+    const rewrites = (m: Own) => asking.some((c) => idOf(c) === idOf(m.c) && (text(c) === m.text || (c.alsoBefore !== undefined && blank(c.before) === m.text)));
     // A text already as asked is no answer from a read behind any write of this page: it may lag behind someone else's too.
     // The solution layers tell what the record can't: a read behind a write of this page that they showed made (dbBehind).
     const old =
@@ -1554,8 +1582,12 @@ async function race(ctx: Ctx, url: string, label: LabelOf, back: Back, cur: any,
     const langs = back === 'langs' ? cs.map((c) => c.lcid) : [...new Set([...Object.keys(was), ...Object.keys(seen), ...cs.map((c) => String(c.lcid))].map(Number))];
     for (const l of langs) {
       if (db && !(l in db)) continue; // no layer holds it: unknown
-      if (blank(seen[l]) === blank(was[l]) || (!db && lagged((x) => x.slot.key === key, l, was[l], seen[l]))) continue;
       const c = cs.find((x) => x.lcid === l);
+      // Publish again's repair of a column label (againAttribute) is made over a read that may still show the text from
+      // before the save (Change.alsoBefore, LIVE-FINDINGS 118): the database is the witness, and anything it holds but the
+      // text the repair was made on is someone else's, the text that read shows included.
+      const read = db && c?.alsoBefore !== undefined && todo.includes(c) ? blank(c.before) : blank(was[l]);
+      if (blank(seen[l]) === read || (!db && lagged((x) => x.slot.key === key, l, was[l], seen[l]))) continue;
       const ours = c && todo.includes(c) ? text(c) : blank(was[l]);
       if (blank(seen[l]) === ours) continue; // the same text: nothing replaced
       hits.push({ c: c ?? cs[0], l, own: !!c, theirs: seen[l] ?? '', ours, db: !!db });
@@ -1837,6 +1869,24 @@ const attributeSource = (cs: Change[]): Source => ({
   url: `${attrPath(cs[0].slot.ref.entity, cs[0].slot.ref.attribute)}?$select=LogicalName,DisplayName,Description,IsRenameable,IsCustomizable,IsManaged,AttributeType,AttributeTypeName`,
   label: ownLabel,
 });
+
+/**
+ * A column's names and tooltips in every language as Dataverse serves them, read strong as its writer reads it: the check
+ * after publishing (ui/review.ts unpublishedForms) compares them with what a save left (LIVE-FINDINGS 118). Rejects when
+ * the read fails or brings no names.
+ */
+export async function columnLabels(ctx: Ctx, entity: string, attribute: string, signal?: AbortSignal): Promise<Partial<Record<Prop, Labels>>> {
+  const x = await ctx.http.get(`${attrPath(entity, attribute)}?$select=DisplayName,Description`, { headers: STRONG, signal });
+  if (!x?.DisplayName) throw new Error('No column names.');
+  return { DisplayName: toLabels(x.DisplayName), Description: toLabels(x.Description) };
+}
+
+/**
+ * Whether `labels`, a read of a change's label in every language, show the change as its write left it, measured as
+ * verify() measures it: its text (text()), only spaces counting as none; one saved empty (savesEmpty) only as a '' stored.
+ */
+export const showsWritten = (labels: Labels, c: Change, base: Lcid): boolean =>
+  blank(labels[c.lcid]) === text(c) && !(!text(c) && savesEmpty(c.slot, c.lcid, base, c.untranslated) && labels[c.lcid] === undefined);
 const globalSetSource = (cs: Change[]): Source => ({
   url: `GlobalOptionSetDefinitions(Name='${q(cs[0].slot.ref.name)}')?$select=MetadataId,Name,DisplayName,Description,IsCustomizable,IsManaged`,
   label: ownLabel,
@@ -1890,7 +1940,7 @@ function saveEntity(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<Change
   const e: string = changes[0].slot.ref.entity;
   const path = entityPath(e);
   const { url, label } = entitySource(changes);
-  return flow(ctx, changes, o, url, label, guard('table'), () => o.publish.entities.add(e), async (cur, todo) => {
+  return flow(ctx, changes, o, url, label, guard(ctx, 'table'), () => o.publish.entities.add(e), async (cur, todo) => {
     // One PUT per table (each costs ~6 s server-side), all edited properties together.
     await put(ctx, path, { '@odata.type': T + 'EntityMetadata', LogicalName: cur.LogicalName, ...props(cur, todo) });
   }, 'labels', keep((x, p) => x[p], ['DisplayName', 'DisplayCollectionName', 'Description']), 'Entity');
@@ -1900,7 +1950,7 @@ function saveAttribute(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<Cha
   const { entity: e, attribute: a, odataType } = changes[0].slot.ref;
   const path = attrPath(e, a);
   const { url, label } = attributeSource(changes);
-  return flow(ctx, changes, o, url, label, guard('column'), () => o.publish.entities.add(e), async (cur, todo) => {
+  return flow(ctx, changes, o, url, label, guard(ctx, 'column'), () => o.publish.entities.add(e), async (cur, todo) => {
     // The derived type is required; OptionSet / GlobalOptionSet are never sent (options have their own actions).
     const type = String(cur['@odata.type'] || odataType || T + 'AttributeMetadata').replace('#', '');
     // LookupAttributeMetadata also stands for Owner and Customer columns: without their AttributeType Dataverse
@@ -1910,10 +1960,44 @@ function saveAttribute(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<Cha
   }, 'labels', keep((x, p) => x[p], ['DisplayName', 'Description']), 'Attribute');
 }
 
+/**
+ * Publish again's repair (Writer.again) of column names and tooltips the check after publishing found saved but not
+ * served as saved (ui/review.ts unpublishedForms): every metadata read of a renamed column, strong or as if published,
+ * still gave its old name long after the save and its publish, while its solution layer held the new one (LIVE-FINDINGS
+ * 118). Written again as form labels are (formxml.ts rewrite, 117), each write as save() writes it, per column, while no
+ * UI-language switch window is open (LangSession.quiet, as the saver runs every metadata job: LIVE-FINDINGS 62). The first
+ * is made on the text saved as written (text()) over a read that may still show the text the save replaced
+ * (Change.alsoBefore): no conflict there, and the layers then tell whether the database holds the text saved (race()). A
+ * text someone else saved there since is never written over: a conflict.
+ */
+const againAttribute: NonNullable<Writer['again']> = (ctx, cs, o, publish) =>
+  rewrite(
+    cs,
+    publish,
+    async (list, signal = o.signal) => {
+      const so = signal === o.signal ? o : { ...o, signal };
+      const columns = new Map<string, Change[]>();
+      for (const c of list) (columns.get(c.slot.group) ?? columns.set(c.slot.group, []).get(c.slot.group)!).push(c);
+      const out: ChangeResult[] = [];
+      for (const g of columns.values())
+        try {
+          out.push(...(await o.lang.quiet(() => saveAttribute(ctx, g, so), signal)));
+        } catch (e) {
+          out.push(...g.map((change): ChangeResult => (isAbort(e) ? { change, outcome: 'skipped', message: CANCELLED } : { change, outcome: 'error', message: friendly(e) })));
+        }
+      return out;
+    },
+    (c) => {
+      const t = text(c);
+      const was = blank(c.before);
+      return { slot: c.slot, lcid: c.lcid, before: t, after: t + MARK, ...(was !== t ? { alsoBefore: was } : {}) };
+    },
+  );
+
 function saveGlobalSet(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<ChangeResult[]> {
   const { name, boolean } = changes[0].slot.ref;
   const { url, label } = globalSetSource(changes);
-  return flow(ctx, changes, o, url, label, guard('global choice'), () => o.publish.optionsets.add(name), async (cur, todo) => {
+  return flow(ctx, changes, o, url, label, guard(ctx, 'global choice'), () => o.publish.optionsets.add(name), async (cur, todo) => {
     const type = String(cur['@odata.type'] || `${T}${boolean ? 'Boolean' : ''}OptionSetMetadata`).replace('#', '');
     // Sparse, like the SDK's own "update a global option set" sample (Name, IsGlobal and the edited labels).
     // This request never changes the options themselves; those go through UpdateOptionValue.
@@ -1934,7 +2018,7 @@ function saveOption(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<Change
     o,
     url,
     label,
-    (cur, c) => gone(cur) || guard(global ? 'global choice' : 'choice column')(cur, c),
+    (cur, c) => gone(cur) || guard(ctx, global ? 'global choice' : 'choice column')(cur, c),
     () => (global ? o.publish.optionsets.add(r.name) : o.publish.entities.add(r.entity)),
     async (cur, todo) => {
       const op = opt(cur);
@@ -2089,7 +2173,7 @@ function saveRelationship(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<
   const { metadataId: id, type } = changes[0].slot.ref;
   const t = `${T}${type}RelationshipMetadata`;
   const { url, label, menu } = relationshipSource(changes);
-  return flow(ctx, changes, o, url, label, guard('relationship'), (cur) => {
+  return flow(ctx, changes, o, url, label, guard(ctx, 'relationship'), (cur) => {
     for (const e of [cur.ReferencedEntity, cur.ReferencingEntity, cur.Entity1LogicalName, cur.Entity2LogicalName]) if (e) o.publish.entities.add(e);
   }, async (cur, todo) => {
     // The full definition as just read (Microsoft's documented way to update a relationship): Behavior,
@@ -2115,7 +2199,7 @@ function saveRelationship(ctx: Ctx, changes: Change[], o: SaveOptions): Promise<
 
 export const metadataWriters: Writer[] = [
   { kinds: ['entity'], lane: 'metadata', save: saveEntity, read: reader(entitySource) },
-  { kinds: ['attribute'], lane: 'metadata', save: saveAttribute, read: reader(attributeSource) },
+  { kinds: ['attribute'], lane: 'metadata', save: saveAttribute, read: reader(attributeSource), again: againAttribute },
   { kinds: ['option', 'status', 'state', 'boolean', 'globaloption'], lane: 'metadata', save: saveOption, read: reader(optionSource) },
   { kinds: ['globaloptionset'], lane: 'metadata', save: saveGlobalSet, read: reader(globalSetSource) },
   { kinds: ['relationship'], lane: 'metadata', save: saveRelationship, read: reader(relationshipSource) },

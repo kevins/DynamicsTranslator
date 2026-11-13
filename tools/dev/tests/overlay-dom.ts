@@ -307,7 +307,7 @@ export function register(t: Kit): void {
    * (marked 48..82 × 143..161); our app host. One frame has measured the labels. ON, BESIDE (in the label's zone, right
    * of its text), OUI and SWITCH are pointer positions.
    */
-  async function setup() {
+  async function setup(more: Partial<OverlayHooks> = {}) {
     const undo = install();
     const body = dom.doc.children[0];
     const box = (tag: string, rect: [number, number, number, number]) => Object.assign(new FakeEl(tag), { rect });
@@ -335,7 +335,7 @@ export function register(t: Kit): void {
     const v = { el: toggle, comp: 'option|e.a|1', kind: 'option', key: 'o', role: 'value' } as unknown as Anchor;
     const opened: string[] = [];
     const alts: boolean[] = [];
-    const hooks: OverlayHooks = { look: () => 'ok', open: (x) => opened.push(x.comp), mutated() {}, ours: () => [app as unknown as Node], alt: (h) => alts.push(h) };
+    const hooks: OverlayHooks = { look: () => 'ok', open: (x) => opened.push(x.comp), mutated() {}, ours: () => [app as unknown as Node], alt: (h) => alts.push(h), ...more };
     const { Overlay } = await overlay();
     const ov = new Overlay(hooks);
     ov.start();
@@ -344,6 +344,74 @@ export function register(t: Kit): void {
     const sheet = () => (document.adoptedStyleSheets as unknown as Array<{ text: string }>)[0];
     return { undo, ov, a, label, span, input, check, yes, toggle, inApp, sec, opened, alts, sheet, ON: at(30, 112), BESIDE: at(150, 112), OUI: at(60, 152), SWITCH: at(25, 152) };
   }
+
+  test("overlay dom: selecting labels (selection()): a press that moves draws a box; the labels it covers show as selected as it goes and are selected once it is let go (boxed); its release and click reach neither the page nor a label; a press that doesn't move is a click as always; Escape cancels a box; Alt, a finger, our own UI or a label that can't be selected never take part; off, no box", async () => {
+    const got: string[][] = [];
+    const sel = new Set<string>();
+    const s = await setup({ boxed: (as) => (got.push(as.map((a) => a.comp)), as.forEach((a) => sel.add(a.comp))) });
+    try {
+      let can = (_: Anchor) => true;
+      s.ov.selection({ has: (a) => sel.has(a.comp), can: (a) => can(a) });
+      const o = s.ov as unknown as { recs: Map<Anchor, { g: { className: string } }>; lasso: { hidden: boolean; style: Record<string, string> } };
+      const cls = () => [s.a, { el: s.toggle } as Anchor].map((x) => [...o.recs].find(([a]) => a.el === x.el)![1].g.className.includes('is-pk'));
+      const p = (x: number, y: number, more: Record<string, unknown> = {}) => ({ clientX: x, clientY: y, pointerId: 1, buttons: 1, ...more }) as never;
+      const frame = () => dom.raf?.();
+      frame();
+      // A press on the section left of the labels, then a move of less than a few px: nothing yet.
+      ok(!fire('pointerdown', s.sec, p(2, 95)).prevented, 'the press goes on as usual');
+      fire('pointermove', s.sec, p(4, 97));
+      frame();
+      eq([o.lasso.hidden, cls()], [true, [false, false]], 'a press that barely moved draws nothing');
+      // Dragged over both labels ("Nom" 8..52 × 103..121, "Oui" 48..82 × 143..161): both show as selected as it goes.
+      fire('pointermove', s.sec, p(100, 170));
+      frame();
+      eq([o.lasso.hidden, o.lasso.style.transform, o.lasso.style.width, o.lasso.style.height, cls()], [false, 'translate(2px,95px)', '98px', '75px', [true, true]]);
+      const up = ['pointerup', 'mouseup', 'click'].map((k) => fire(k, s.sec, p(100, 170)));
+      ok(up.every((e) => e.prevented && e.stopped), 'its release and click are the box\'s');
+      frame();
+      eq([got, s.opened, o.lasso.hidden, cls()], [[['field|f|1', 'option|e.a|1']], [], true, [true, true]], 'both selected once let go; nothing opened');
+      // A press that doesn't move: a click on the label as always (the mode selects or unselects it then).
+      eq(clickOn(s.span, s.ON).map((e) => e.prevented), [true, true, true, true, true]);
+      eq(s.opened, ['field|f|1']);
+      // Escape while a box is drawn: it goes, nothing is selected, its release is still the box's.
+      sel.clear();
+      fire('pointerdown', s.sec, p(2, 95));
+      fire('pointermove', s.sec, p(100, 170));
+      frame();
+      const esc = fire('keydown', s.sec, { key: 'Escape' } as never);
+      frame();
+      ok(esc.prevented && esc.stopped && o.lasso.hidden, 'Escape takes the box away');
+      ok(['pointerup', 'mouseup', 'click'].map((k) => fire(k, s.sec, p(100, 170))).every((e) => e.prevented && e.stopped));
+      eq([got.length, cls()], [1, [false, false]]);
+      // Only labels that can be selected: the Yes/No value can't, a box over both selects the field alone.
+      can = (a) => a.comp !== 'option|e.a|1';
+      fire('pointerdown', s.sec, p(2, 95));
+      fire('pointermove', s.sec, p(100, 170));
+      frame();
+      eq(cls(), [true, false], 'only what can be selected shows as selected while it is drawn');
+      fire('pointerup', s.sec, p(100, 170));
+      eq(got[1], ['field|f|1']);
+      // With Alt, with a finger, from our own UI: no box (the page, or our UI, gets the gesture).
+      sel.clear();
+      for (const [t, more] of [[s.sec, { altKey: true }], [s.sec, { pointerType: 'touch' }], [s.inApp, {}]] as const) {
+        fire('pointerdown', t, p(2, 95, more));
+        fire('pointermove', t, p(100, 170, more));
+        frame();
+        ok(o.lasso.hidden && !fire('pointerup', t, p(100, 170, more)).stopped, `no box: ${JSON.stringify(more)}`);
+      }
+      eq(got.length, 2);
+      // Not selecting: a drag is the page's.
+      s.ov.selection(null);
+      fire('pointerdown', s.sec, p(2, 95));
+      fire('pointermove', s.sec, p(100, 170));
+      frame();
+      ok(o.lasso.hidden && !fire('pointerup', s.sec, p(100, 170)).prevented, 'no box when not selecting');
+      eq(got.length, 2);
+    } finally {
+      s.ov.stop();
+      s.undo();
+    }
+  });
 
   test('overlay dom: the parts of one text get a mark each; a click opens the part under the pointer, nothing between or past them', async () => {
     const undo = install();

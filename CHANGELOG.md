@@ -1,5 +1,94 @@
 # Changes
 
+## 1.1.0 (November 2026)
+
+Form field labels on main forms. A save now writes only the labels it changes, so it no longer stores copies of
+column names as the form's own labels. Emptying the last form label a field has, in any language, makes the field
+follow its column again in every language, as a field just added to the form does: the *Form label* says *Shows “…”*,
+and a later rename of the column shows on the form. Where another language keeps a form label of its own, emptying
+works as in 1.0.0: an emptied translation gets the column's name in that language as a label of the form's own, and an
+emptied English label is kept by Dataverse. A save Dataverse's database turns away as a deadlock is tried again. Ask
+everyone who translates in the environment to update their favourite: a save by 1.0.0 posts the whole form back and
+stores those copies again.
+
+**What is new**
+
+* **A field's popup** shows its *Column name*, *Tooltip* and *Form label*, in that order, and opens with the caret in
+  the *Column name* (in the *Form label* where the column's name can't be changed).
+* **The *Form label* shows whether the form has one.** On a main form, a language where the form has no label of its
+  own for a field, so the field shows the column's name and follows it, has an empty *Form label* in the popup and the
+  *Edit translations* dialog, with *Shows “…”* the column's name; a label of the form's own shows its text, even one
+  worded as the column's name. Typing there gives the field a label; emptying it again changes nothing. It is known as
+  the popup opens, from the copy Dynamics keeps to draw the form: in your Dynamics language, and in each other language
+  the form was shown in on this browser. A language without one is read a moment after the page's labels load, without
+  slowing them (another language than yours while your Dynamics language is switched to it for a moment), only where a
+  field shows the column's name there, and remembered until the form is published again; until then such a field shows
+  as in your Dynamics language. A form with a change not published yet shows its fields as in 1.0.0 until it is
+  published. After the translator's own publish, of a form with no other change, what was known of
+  it is kept for the form's new version with what the publish changed, so the page that loads after it reads nothing
+  and shows each field right away.
+* **Typing a *Column name* changes the page.** The fields that show the column's name, because they have no label of
+  their own or follow the column, show the name as you type it, as a *Form label* does; undone, the page is as before.
+* **The timeline's popup** says which heading it is, with no input: the timeline's label saved on the form, which the
+  page never shows, is translated in the Workbench.
+* **Publishing needs the System Administrator or System Customizer role**, your own or one of your teams'. Without
+  either, the translator says so when it starts (*Only System Administrators and System Customizers can publish
+  translations. You can look at them and export them.*), and Review and publish and Recent publishes show their lists
+  without **Publish** or **Undo**.
+* **Allow changes to managed labels** (**⋯** › *Settings*), off each time the translator opens. After a question, labels
+  from managed solutions become editable where their solution allows it; their popups and Review and publish say that
+  publishing one adds an unmanaged layer on top of its solution. Classic command bar labels from managed solutions stay
+  read-only.
+* **Select labels to export** (in the bar's **⋯** menu): click labels on the page, or drag a box over several as on the
+  Windows desktop, across tabs, forms and records, then **Download…** them as a workbook or a CSV file, choosing what to
+  include (*Form labels*, *Column names*, *Tooltips*, *Choice values*, *Other labels*) and the languages. The file is
+  the Workbench's, so it can be edited and imported back there.
+* **Undo all** in the Publish dialog, with two changes or more: after a question (*Undo all changes?*), every change in
+  the list goes back to its text before, as one step that Ctrl+Z brings back.
+
+**Fixes**
+
+* **A form save writes only what it changes.** On main forms, a save no longer posts every field's labels back as
+  read. In 1.0.0 it did, and Dataverse then stored the column's name as the form's own label in every language a field
+  had no label of its own in, wherever it had one in another language: a later rename of the column no longer showed
+  on that form. After each write, the translator checks that nothing else on the form changed. A label Dataverse
+  dropped is written back, and the save says so (*Dataverse dropped 1 label of the form “Information” that this save
+  did not change. It was written back; check the form.*); one changed on the server while it saved is listed with its
+  text instead, never written over.
+* **A column rename and a form label change in the same publish** no longer end in a false
+  *Someone changed this label*, and the form never keeps the column's old name: a form whose save still posts some
+  fields as read (another form type) is written once the publish's renames are saved.
+* **A form label changes on the page as you type it** also where the page shows another text than the one the
+  translator loaded: a form label saved and not published yet, which the page shows as published.
+* **A field label the published form doesn't show is no longer called published.** Once, on a large main form, field
+  labels stayed out of the published form though the form was published, and a publish took them only once a write
+  changed their text. The *Checking* step now also reads the published form in your Dynamics language, with the same
+  request, and checks each field label of that language as saved, also when a second save finds the text already
+  there, which before reported it published without publishing anything. Labels of other languages are still checked
+  by the form's versions only.
+* **A column name Dynamics doesn't serve as saved is no longer called published.** The *Checking* step also reads each
+  column whose name or tooltip the publish saved, in every language.
+* **The *Checking* step repairs what it finds, once, before it says anything.** A form or table it finds not published
+  is published again at once, a label it finds missing written again first, with a zero-width space after it, which no
+  one sees, then published, written as it is and published again; a label someone else changed since is left as they
+  saved it. Then it checks again: only what is still not published leaves its form or table *Saved, but not
+  published*, and **Publish again**, or **Publish** in Recent publishes, repairs it the same way.
+* **Publishing waits for a language switch to end.** The publish of a save, **Publish again** and Recent publishes ›
+  **Publish** wait while your Dynamics language is switched for a moment, and no switch starts while they run; the read
+  of which field labels are the form's own waits while a save or a publish runs.
+* **Table names in the paths** of command bar labels and of form and view names are always in your language: one read
+  while your Dynamics language was switched for a moment, to read labels of another language, could name its table in
+  that language.
+* **A quick view's or a side pane's form not read in every language** says so on the bar with **Try again**, which reads
+  it again, as for the page's own form.
+
+**Correction of the 1.0.0 notes**
+
+* The 1.0.0 notes said that a form label is often a copy of the column's name saved when the field was added. A field
+  added in the form designer has no label of its own: it shows the column's name and follows it. A later save of the
+  form, in the form designer or by translator 1.0.0, stores the column's name as the field's label in each language it
+  has none in, when it has one in another language.
+
 ## 1.0.0 (October 2026)
 
 The first public release. Compared with the last private build, it includes the fixes from a security and privacy

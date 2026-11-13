@@ -392,6 +392,28 @@ export function register(t: Kit): void {
     eq(scan(new El('body').add(nav('navAudit', 'Historique d’audit')), [...pageForm, audit]).want, []);
   });
 
+  test("a form field label keeps the text its node showed as it was found (Anchor.orig), also one the store hasn't loaded (published, while another text is saved and not published yet), never a text the preview swapped in", () => {
+    // "Nom" is loaded; the page shows the published "Nom publié".
+    const body = new El('body').add(new El('ul').add(tab('general', 'Général')), panel('general', section('s1', 'Informations', field(PAGE, 'new_name', 'Nom publié'), field(PAGE, 'ownerid', 'Propriétaire'))));
+    const r = scan(body, [...pageForm, ...tables]);
+    const orig = () => r.sc.list.filter((a) => a.key.startsWith('field|')).map((a) => [a.key, a.orig]);
+    eq(orig(), [
+      [`field|${PAGE}|c1|Label`, 'Nom publié'],
+      [`field|${PAGE}|c2|Label`, 'Propriétaire'],
+    ]);
+    // The preview swapped a staged text in: scanned again, the anchor still keeps the text the page showed.
+    const node = body.querySelector(`label[id$="-new_name-field-label"]`)!.node;
+    node.nodeValue = 'Nom 2';
+    withDom(body, () => {
+      r.sc.textOf = (t) => (t === (node as unknown as Text) ? 'Nom publié' : t.nodeValue || '');
+      r.sc.full(r.x);
+    });
+    eq(orig(), [
+      [`field|${PAGE}|c1|Label`, 'Nom publié'],
+      [`field|${PAGE}|c2|Label`, 'Propriétaire'],
+    ]);
+  });
+
   test('the Related tab is built-in Microsoft text once its form is known; a click only opens its popup; a form tab stays translatable', async () => {
     const { clickLabel } = await import('../../../src/inspector/mode');
     // As UCI renders it (live 2026-10-16, new_dxttest and account forms): its text twice (a hidden sizing copy) and a chevron.
@@ -774,14 +796,14 @@ export function register(t: Kit): void {
     eq(calls, []);
   });
 
-  test('page loads: a side pane\'s form in every language, a quick view\'s form for its cells, a view\'s query, each once and quietly', async () => {
+  test('page loads: a side pane\'s form in every language, a quick view\'s form for its cells (the switch there only for a cell kept per language), a view\'s query, each once and quietly', async () => {
     const calls: string[] = [];
     const store = new Store();
     const lang = { name: 'the language switch' };
     const providers = {
-      loadFormXml: async (_c: unknown, refs: Array<{ formId: string }>, langs: number[], o: { lang?: unknown }) => {
+      loadFormXml: async (_c: unknown, refs: Array<{ formId: string }>, langs: number[], o: { lang?: unknown }, kinds?: ReadonlySet<string>) => {
         const id = refs[0].formId;
-        calls.push(`form ${id} ${langs.join('+')} ${o.lang === lang ? 'switch' : 'no switch'}`);
+        calls.push(`form ${id} ${langs.join('+')} ${o.lang === lang ? 'switch' : 'no switch'} ${kinds ? [...kinds].join('+') : 'every kind'}`);
         if (id === QV) throw new Error('gone');
         // The pane's form holds a quick view too: its form is read next.
         return id === PANE ? [...paneForm, cell(PANE, 'l3', 'kindqv', 'new_kindid', 'Kind', 'Type', 'new_dxtlinked', G, { quickForms: ['00000000-0000-0000-0000-0000000000a1'] })] : [];
@@ -795,15 +817,226 @@ export function register(t: Kit): void {
     ld.request([WANT_FORM + PANE, WANT_VIEW + VIEW]); // asked once
     for (let i = 0; i < 50 && (ld.busy.size || calls.length < 6); i++) await new Promise((r) => setTimeout(r, 5));
     eq(calls.sort(), [
-      `form ${PANE} ${EN}+${FR} switch`,
-      `form ${QV} ${EN}+${FR} no switch`,
-      'form 00000000-0000-0000-0000-0000000000a1 1033+1036 no switch',
+      `form ${PANE} ${EN}+${FR} switch every kind`,
+      `form ${QV} ${EN}+${FR} switch field`,
+      'form 00000000-0000-0000-0000-0000000000a1 1033+1036 switch field',
       'table new_dxtlinked',
       `view ${VIEW}`,
     ].sort());
     ok(store.get(`field|${PANE}|l1|Label`), 'the pane form\'s labels are in the store');
     eq([...(ld.queries.get(VIEW)?.keys() || [])], [ALIAS], 'the view\'s linked tables');
     eq([...ld.errors.values()], [], 'a form that could not be read says nothing on the bar');
+  });
+
+  test("page loads: a quick view a side pane's form shows (asked for by that read, not by the scanner) read in some languages only counts as failed: its label kept, the bar says so; Try again reads it again, and a read again that fails outright still says so and can be tried again; the next one completes it, an edit staged meanwhile kept, and nothing is read after that", async () => {
+    const store = new Store();
+    const lang = { name: 'the language switch' };
+    const QV2 = '00000000-0000-0000-0000-0000000000a1';
+    const KEY = `field|${QV2}|w1|Label`;
+    // The quick view's web resource cell (kept per language): French read, English missed by the first read.
+    const wr = (en: boolean): Slot => {
+      const s = cell(QV2, 'w1', 'WebResource_kind', '', 'Kind details', 'Détails du type', 'new_dxtlinked', G);
+      return en ? s : ({ ...s, labels: { [FR]: 'Détails du type' }, ref: { ...s.ref, partial: true, unread: { [EN]: 'Dynamics did not answer in English, so its form labels were not used. Try again.' } } } as Slot);
+    };
+    const reads: string[] = [];
+    const next = ['partial', 'gone', 'whole'];
+    const providers = {
+      loadFormXml: async (_c: unknown, refs: Array<{ formId: string }>) => {
+        const id = refs[0].formId;
+        reads.push(id === PANE ? 'pane' : 'quick view');
+        if (id === PANE) return [...paneForm, cell(PANE, 'l3', 'kindqv', 'new_kindid', 'Kind', 'Type', 'new_dxtlinked', G, { classid: QVCLASS, quickForms: [QV2] })];
+        const n = next.shift();
+        if (n === 'gone') throw new Error('Service unavailable.');
+        return [wr(n === 'whole')];
+      },
+      loadTables: async () => [],
+      viewQuery: async () => FETCH,
+    };
+    const app = { ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store, lang } as unknown as ConstructorParameters<typeof PageLoader>[0];
+    const ld = new PageLoader(app, () => {});
+    const settle = async () => {
+      for (let i = 0; i < 200 && ld.busy.size; i++) await new Promise((r) => setTimeout(r, 5));
+    };
+    const state = () => [reads.slice(), [...ld.errors.values()], store.get(KEY)?.labels ?? null, store.get(KEY)?.ref.partial ?? null];
+    const MSG = 'Could not load the form labels in every language.';
+    ld.request([WANT_FORM + PANE]);
+    await settle();
+    eq(state(), [['pane', 'quick view'], [MSG], { [FR]: 'Détails du type' }, true], 'the first read: English missed');
+    store.set(KEY, FR, 'Détails');
+    ld.retry();
+    await settle();
+    eq(state(), [['pane', 'quick view', 'quick view'], [MSG], { [FR]: 'Détails du type' }, true], 'read again, which fails outright: still said');
+    ld.retry();
+    await settle();
+    eq(state(), [['pane', 'quick view', 'quick view', 'quick view'], [], { [EN]: 'Kind details', [FR]: 'Détails du type' }, null], 'read again: complete');
+    eq([store.value(KEY, FR), store.isEdited(KEY)], ['Détails', true], 'the edit kept');
+    ld.retry();
+    await settle();
+    eq(reads.length, 4, 'nothing read after that');
+  });
+
+  test("page loads: the scanner's request for a quick view's form that its host form's read already reads (the usual order) joins that read: one that fails outright gives the request up with it, quietly, as one the scanner asked for first, so Try again and the next scan read it again; one that succeeds gives nothing up", async () => {
+    const QV2 = '00000000-0000-0000-0000-0000000000a1';
+    const KEY = `field|${QV2}|q1|Label`;
+    const WANT = WANT_QUICK + QV2;
+    const whole = { [EN]: 'Linked name', [FR]: 'Nom lié' };
+    for (const fails of [true, false]) {
+      const store = new Store();
+      const reads: string[] = [];
+      let go = () => {};
+      let fail = fails;
+      const providers = {
+        loadFormXml: async (_c: unknown, refs: Array<{ formId: string }>) => {
+          const id = refs[0].formId;
+          reads.push(id === PANE ? 'pane' : 'quick view');
+          if (id === PANE) return [...paneForm, cell(PANE, 'l3', 'kindqv', 'new_kindid', 'Kind', 'Type', 'new_dxtlinked', G, { classid: QVCLASS, quickForms: [QV2] })];
+          // The quick view's first read waits for the scanner's request, then fails outright (nothing read) or succeeds.
+          if (reads.length === 2) await new Promise<void>((r) => (go = r));
+          if (fail) {
+            fail = false;
+            throw new Error('Service unavailable.');
+          }
+          return [cell(QV2, 'q1', 'new_name', 'new_name', 'Linked name', 'Nom lié', 'new_dxtlinked', QP)];
+        },
+        loadTables: async () => [],
+        viewQuery: async () => FETCH,
+      };
+      const app = { ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store, lang: { name: 'the language switch' } } as unknown as ConstructorParameters<typeof PageLoader>[0];
+      const ld = new PageLoader(app, () => {});
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
+      };
+      const state = () => [reads.slice(), [...ld.errors.values()], [...ld.gaveUp], store.get(KEY)?.labels ?? null];
+      ld.request([WANT_FORM + PANE]);
+      await until(() => reads.length === 2);
+      // The pane's labels are in: the scanner asks for its quick view's form while the read the pane's read asked for runs.
+      ld.request([WANT]);
+      go();
+      await until(() => !ld.busy.size);
+      if (!fails) {
+        eq(state(), [['pane', 'quick view'], [], [], whole], 'read: nothing given up');
+        continue;
+      }
+      eq(state(), [['pane', 'quick view'], [], [WANT], null], 'failed outright: the request given up with it, the bar says nothing');
+      ld.request([WANT]); // the next scan
+      await until(() => !ld.busy.size);
+      eq(reads.length, 2, 'not asked again before Try again');
+      ld.retry();
+      ld.request([WANT]); // the scan after Try again
+      await until(() => reads.length === 3 && !ld.busy.size);
+      eq(state(), [['pane', 'quick view', 'quick view'], [], [], whole], 'read again: its labels are in');
+    }
+  });
+
+  test("page loads: a request that a load already running answers joins it: a grid's view whose id another grid spells differently is given up with the read of its query that fails (quietly), so neither grid waits for it any more, and after Try again one read answers both", async () => {
+    const calls: string[] = [];
+    let fail = 1;
+    const providers = {
+      viewQuery: async (_c: unknown, id: string) => {
+        calls.push(id);
+        if (fail-- > 0) throw new Error('Too many requests.');
+        return FETCH;
+      },
+    };
+    const ld = new PageLoader({ ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store: new Store(), lang: {} } as unknown as ConstructorParameters<typeof PageLoader>[0], () => {});
+    const settle = async (n: number) => {
+      for (let i = 0; i < 100 && (calls.length < n || ld.busy.size); i++) await new Promise((r) => setTimeout(r, 5));
+      await new Promise((r) => setTimeout(r, 5));
+    };
+    const SPELT = `{${VIEW.toUpperCase()}}`;
+    ld.request([WANT_VIEW + VIEW]);
+    ld.request([WANT_VIEW + SPELT]); // another grid of that view, while its query is read
+    await settle(1);
+    eq([calls, [...ld.gaveUp].sort(), [...ld.errors.values()]], [[VIEW], [WANT_VIEW + VIEW, WANT_VIEW + SPELT].sort(), []], 'one read, failed: both given up');
+    ld.retry();
+    ld.request([WANT_VIEW + VIEW]);
+    ld.request([WANT_VIEW + SPELT]);
+    await settle(2);
+    eq([calls, [...ld.gaveUp], ld.viewTables.get(VIEW)], [[VIEW, VIEW], [], 'new_dxttest'], 'read again once: nothing given up');
+  });
+
+  test("page loads: a grid's table the scanner asks for while the page's own read of that table runs joins that read; if it fails, the request is given up with it, so after Try again it is read even where the page no longer reads that table itself", async () => {
+    const calls: string[] = [];
+    let fail = 1;
+    const providers = {
+      loadTables: async (_c: unknown, t: string[]) => {
+        calls.push(t.join());
+        if (fail-- > 0) throw new Error('Service unavailable.');
+        return linked;
+      },
+    };
+    const store = new Store();
+    const ld = new PageLoader({ ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store, lang: {} } as unknown as ConstructorParameters<typeof PageLoader>[0], () => {});
+    const settle = async (n: number) => {
+      for (let i = 0; i < 100 && (calls.length < n || ld.busy.size); i++) await new Promise((r) => setTimeout(r, 5));
+      await new Promise((r) => setTimeout(r, 5));
+    };
+    const WANT = WANT_TABLE + 'new_dxtlinked';
+    // A record of new_dxtlinked, its form not known yet: start() reads the page's table, a load no request asked for.
+    ld.page = { info: { type: 'entityrecord', entity: 'new_dxtlinked' }, sig: 'linked', entity: 'new_dxtlinked', formId: '', viewId: '', bpfId: '' } as unknown as PageLoader['page'];
+    ld.start();
+    ld.request([WANT]); // a side pane's grid of that table, while it is read
+    await settle(1);
+    eq([calls, [...ld.gaveUp], [...ld.errors.values()]], [['new_dxtlinked'], [WANT], ['Could not load the table and its columns. Service unavailable.']], 'one read, failed: the request given up with it');
+    ld.page = null; // the user moved on: no page that reads the table itself; the side pane's grid stays
+    ld.retry();
+    ld.request([WANT]);
+    await settle(2);
+    eq([calls, [...ld.gaveUp], [...ld.errors.values()], !!store.get('attribute|new_dxtlinked.new_name|DisplayName')], [['new_dxtlinked', 'new_dxtlinked'], [], [], true], 'read again: its columns are in');
+  });
+
+  test("page loads: a view selector's entry for the list's own view, asked for while the page's read of its name runs, joins that read; if it fails, the request is given up with it, so after Try again it is read even where the page no longer reads that name itself", async () => {
+    const calls: string[] = [];
+    let fail = 1;
+    const providers = {
+      loadTables: async () => [],
+      loadRecords: async (_c: unknown, kind: string, ids: string[]) => {
+        calls.push(`${kind} ${ids.join()}`);
+        if (fail-- > 0) throw new Error('Too many requests.');
+        return ids.map((id) => S('view', `view|${id}|Name`, 'Linked Associated View', 'Vue des éléments liés', { id, table: 'savedquery', entitySet: 'savedqueries', column: 'name', entity: 'new_dxtlinked', type: 2 }, 'new_dxtlinked', 'Name'));
+      },
+    };
+    const store = new Store();
+    const ld = new PageLoader({ ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store, lang: {} } as unknown as ConstructorParameters<typeof PageLoader>[0], () => {});
+    const settle = async (n: number) => {
+      for (let i = 0; i < 100 && (calls.length < n || ld.busy.size); i++) await new Promise((r) => setTimeout(r, 5));
+      await new Promise((r) => setTimeout(r, 5));
+    };
+    const WANT = WANT_VIEW_NAME + VIEW3;
+    // The list page of new_dxtlinked in view VIEW3: start() reads the view's name, a load no request asked for.
+    ld.page = { info: { type: 'entitylist', entity: 'new_dxtlinked' }, sig: 'list', entity: 'new_dxtlinked', formId: '', viewId: VIEW3, bpfId: '' } as unknown as PageLoader['page'];
+    ld.start();
+    ld.request([WANT]); // the view selector lists the page's own view
+    await settle(1);
+    eq([calls, [...ld.gaveUp], [...ld.errors.values()]], [[`view ${VIEW3}`], [WANT], ['Could not load the view name. Too many requests.']], 'one read, failed: the request given up with it');
+    ld.page = null; // the user moved on: no page that reads that name itself; a view selector still lists the view
+    ld.retry();
+    ld.request([WANT]);
+    await settle(2);
+    eq([calls, [...ld.gaveUp], [...ld.errors.values()], !!store.get(`view|${VIEW3}|Name`)], [[`view ${VIEW3}`, `view ${VIEW3}`], [], [], true], 'read again: its name is in');
+  });
+
+  test("page loads: a quick view's form keeps only its cells: its tabs and sections, read in the user's language alone, never reach the store (they never show, and would be Not loaded in the Workbench); a side pane's form keeps them", async () => {
+    const store = new Store();
+    const lang = { name: 'the language switch' };
+    // The read as loadFormXml returns it for a quick view: its cell in every language, its tab and section in French only.
+    const partial = (s: ReturnType<typeof S>) => ({ ...s, labels: { [FR]: s.labels[FR] }, ref: { ...s.ref, partial: true } });
+    const form = (id: string) => [
+      partial(S('tab', `tab|${id}|qt|Label`, 'General', 'Général', { formId: id, tabName: 't1' }, 'new_dxtlinked')),
+      partial(S('section', `section|${id}|qs|Label`, 'Details', 'Détails', { formId: id, sectionName: 's1' }, 'new_dxtlinked')),
+      cell(id, 'q1', 'new_name', 'new_name', 'Linked name', 'Nom lié', 'new_dxtlinked', ['t1', 's1']),
+    ];
+    const providers = {
+      loadFormXml: async (_c: unknown, refs: Array<{ formId: string }>) => form(refs[0].formId),
+      loadTables: async () => [],
+      viewQuery: async () => FETCH,
+    };
+    const app = { ctx: { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] }, providers, store, lang } as unknown as ConstructorParameters<typeof PageLoader>[0];
+    const ld = new PageLoader(app, () => {});
+    ld.request([WANT_QUICK + QV, WANT_FORM + PANE]);
+    for (let i = 0; i < 50 && (ld.busy.size || !store.get(`field|${PANE}|q1|Label`)); i++) await new Promise((r) => setTimeout(r, 5));
+    eq([`tab|${QV}|qt|Label`, `section|${QV}|qs|Label`, `field|${QV}|q1|Label`].map((k) => !!store.get(k)), [false, false, true], 'the quick view: its cell only');
+    eq([`tab|${PANE}|qt|Label`, `section|${PANE}|qs|Label`, `field|${PANE}|q1|Label`].map((k) => !!store.get(k)), [true, true, true], 'the side pane: everything');
   });
 
   test('a side pane\'s grid: its table and view come from the grid itself, never from the page form\'s control of that name', () => {

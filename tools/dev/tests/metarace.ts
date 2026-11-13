@@ -3,9 +3,11 @@
 // (LIVE-FINDINGS 49). A PUT carries every language of the labels it writes as read (finding 2), so what someone saved
 // in another language after that read is put back by it: the solution layers read in the write's batch say what it was,
 // and it is written back. register() is called by tools/dev/unit.ts.
-import { DvError, type BatchPart, type PartResult } from '../../../src/core/http';
+import { DvError, abortError, isAbort, type BatchPart, type PartResult } from '../../../src/core/http';
 import { toLabels } from '../../../src/core/labels';
 import { PublishSet, type Change, type ChangeResult, type Labels, type Slot } from '../../../src/core/model';
+import { PartialPublishError } from '../../../src/core/publish';
+import { MARK } from '../../../src/providers/formxml';
 import { metadataWriters } from '../../../src/providers/metadata';
 import { changeId } from '../../../src/providers/types';
 import type { Kit } from './kit';
@@ -111,7 +113,10 @@ function rig(kind: 'attribute' | 'relationship' | 'option', db: Props) {
   const w = metadataWriters.find((x) => x.kinds.includes(kind))!;
   const save = (cs: Change[]): Promise<ChangeResult[]> =>
     w.save(ctx as never, cs, { signal: new AbortController().signal, publish: new PublishSet(), progress: (m: string) => void st.said.push(m), force: new Set<string>(), ran: st.ran, lang: null as never, allowPublish: true });
-  return Object.assign(st, { slot, save });
+  /** Publish again's repair of these saved changes (Writer.again), with this language session and `publish`. */
+  const again = (cs: Change[], lang: unknown, publish: (signal?: AbortSignal) => Promise<void>, signal = new AbortController().signal): Promise<ChangeResult[]> =>
+    w.again!(ctx as never, cs, { signal, publish: new PublishSet(), progress: (m: string) => void st.said.push(m), force: new Set<string>(), ran: st.ran, lang: lang as never, allowPublish: true }, publish);
+  return Object.assign(st, { slot, save, again, http });
 }
 
 const change = (slot: Slot, lcid: number, after: string, before = slot.labels[lcid] ?? ''): Change => ({ slot, lcid, before, after });
@@ -269,6 +274,77 @@ export function register(t: Kit): void {
       const res = await r.save([change(r.slot('1'), FR, 'Les contacts')]);
       t.eq(res[0].outcome, 'error');
       t.ok(/someone else changed this relationship at the same moment, and this save may have put back what it had before/.test(res[0].message!), res[0].message);
+    }),
+  );
+
+  t.test("metadata writer: Publish again's repair of a column name (Writer.again, LIVE-FINDINGS 118) writes it with MARK, then as it is, each write while no language switch window is open (LangSession.quiet, as the saver runs every metadata job: LIVE-FINDINGS 62); stopped while its first publish runs, the name is written as it is all the same and published again, as that publish served it with MARK, then the stop is told; that publish refused, the name is written as it is, then the refusal is told; that publish failing with a server error (it may have run), the name is written as it is and published again, and once that publish goes through, it is saved; stopped while the MARK write runs, the reads still showing the name from before the save (not confirmed: an error), the name is written as it is all the same; that publish publishing all but the apps, the name is written as it is and published again, then its error is told; the publish after the name written back turned away past its own waits, it is sent again after a wait; the name written back turned away by a busy Dataverse past the writer's own tries, it is written again after a wait; stopped before the repair, nothing is written", () =>
+    fast(async () => {
+      const name = "Nom de l'équipe";
+      const LOCK = 'Cannot start another [Import] because there is a previous [Import] running at this moment.';
+      let away = 0;
+      const go = async (how: 'done' | 'stopped' | 'failed' | 'server error' | 'stopped in the write' | 'partial' | 'turned away' | 'write turned away' | 'stopped before') => {
+        const r = rig('attribute', { DisplayName: { [EN]: 'Team name', [FR]: name }, Description: { [EN]: 'The team.' } });
+        // Every metadata read still gives the name from before the save, the database holding the new one (LIVE-FINDINGS 118).
+        if (how === 'stopped in the write') r.stale = { DisplayName: { [EN]: 'Team name', [FR]: 'Nom' }, Description: { [EN]: 'The team.' } };
+        // The rename a save made, which the check after its publish found not served as saved.
+        const c = change(r.slot('DisplayName'), FR, name, 'Nom');
+        let quiet = 0;
+        const lang = {
+          quiet: async <T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+            if (signal?.aborted) throw abortError();
+            quiet++;
+            try {
+              return await fn();
+            } finally {
+              quiet--;
+            }
+          },
+        };
+        const puts: string[] = [];
+        const ac = new AbortController();
+        const batch = r.http.batch;
+        let n = 0;
+        away = 0;
+        r.http.batch = (parts: BatchPart[], o?: { stop?: boolean }) => {
+          // The name written back: its batch turned away five times by a busy Dataverse (the writer's own try and its four again).
+          if (how === 'write turned away' && n > 0 && parts.some((p) => p.method === 'PUT') && away < 5) {
+            away++;
+            throw new DvError(LOCK, 400);
+          }
+          for (const p of parts) if (p.method === 'PUT') puts.push(`${toLabels((p.body as { DisplayName: never }).DisplayName)[FR]}${quiet ? '' : ' (outside quiet())'}`);
+          // Stop while the PUT runs: it runs to its end.
+          if (how === 'stopped in the write' && parts.some((p) => p.method === 'PUT')) ac.abort();
+          return batch(parts, o);
+        };
+        if (how === 'stopped before') ac.abort();
+        const served: string[] = [];
+        const publish = async (signal = ac.signal) => {
+          if (signal.aborted) throw abortError();
+          const k = n++;
+          if (k === 0 && how === 'failed') throw new DvError('You do not have permission to do this.', 403);
+          if (k === 0 && how === 'server error') throw new DvError('Generic SQL error.', 500);
+          // The publish after the name written back, turned away past PublishXml's own waits for the lock.
+          if (k === 1 && how === 'turned away') throw new DvError(LOCK, 400);
+          if (k === 0 && how === 'stopped') ac.abort(); // Stop while PublishXml runs: it runs to its end
+          served.push(r.db.DisplayName[FR]);
+          // Published but for the apps, which Dataverse refuses every time (core/publish.ts).
+          if (how === 'partial') throw new PartialPublishError(`Everything except the app was published (${n}).`);
+        };
+        const out = await r.again([c], lang, publish, ac.signal).then(
+          (rs) => rs.map((x) => x.outcome).join(),
+          (e: Error) => (isAbort(e) ? 'stopped' : e.message),
+        );
+        return [puts, served, r.db.DisplayName[FR], out];
+      };
+      t.eq(await go('done'), [[name + MARK, name], [name + MARK, name], name, 'saved']);
+      t.eq(await go('stopped'), [[name + MARK, name], [name + MARK, name], name, 'stopped']);
+      t.eq(await go('failed'), [[name + MARK, name], [], name, 'You do not have permission to do this.']);
+      t.eq(await go('server error'), [[name + MARK, name], [name], name, 'saved']);
+      t.eq(await go('stopped in the write'), [[name + MARK, name], [], name, 'stopped']);
+      t.eq(await go('partial'), [[name + MARK, name], [name + MARK, name], name, 'Everything except the app was published (1).']);
+      t.eq(await go('turned away'), [[name + MARK, name], [name + MARK, name], name, 'saved']);
+      t.eq([await go('write turned away'), away], [[[name + MARK, name], [name + MARK, name], name, 'saved'], 5]);
+      t.eq(await go('stopped before'), [[], [], name, 'stopped']);
     }),
   );
 }

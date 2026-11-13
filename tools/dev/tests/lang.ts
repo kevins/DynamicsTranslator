@@ -12,9 +12,10 @@ import { createSaver } from '../../../src/core/saver';
 import { Store } from '../../../src/core/store';
 import { langLock, markerKey, NotConfirmed, setUiLanguage, windowLock } from '../../../src/core/uilang';
 import { loadBpfStored } from '../../../src/providers/bpf';
-import { formNote, formXmlWriter, loadFormsScope, loadFormXml, mergeReads, NO_UNPUB, PUB_ONLY } from '../../../src/providers/formxml';
+import { formNote, formXmlWriter, knownOwnLabels, loadFormsScope, loadFormXml, loadOwnLabels, mergeReads, NO_UNPUB, pageOwnLabels, PUB_ONLY } from '../../../src/providers/formxml';
+import { PageLoader, WANT_FORM, WANT_QUICK } from '../../../src/inspector/pageload';
 import { recordsWriter } from '../../../src/providers/records';
-import type { SaveOptions, Writer } from '../../../src/providers/types';
+import type { OwnCopy, SaveOptions, Writer } from '../../../src/providers/types';
 import type { Kit } from './kit';
 import { batchOf } from './records';
 
@@ -73,8 +74,14 @@ interface Fake {
   dropAnswer: number;
   /** Called before each part runs (tests change the server under the writer). */
   onPart?: (p: BatchPart, i: number) => void;
-  /** The `Labels` GetClientMetadata answers with per UI language (the process names the page shows, LIVE-FINDINGS 85). */
-  gcm: Record<number, unknown[]>;
+  /**
+   * The `Labels` GetClientMetadata answers with per UI language (the process names the page shows, LIVE-FINDINGS 85; a
+   * form's labels of its own, 114), beside the form and its published versionnumber; null: the call fails; 'no Labels':
+   * an answer without them.
+   */
+  gcm: Record<number, unknown[] | null | 'no Labels'>;
+  /** GetClientMetadata's metadata comes as an object, as the page's own read asks for it, not as a JSON string. */
+  gcmObject: boolean;
   /** The form is from a managed solution (its ismanaged, in every read of it). */
   managed: boolean;
   /**
@@ -117,6 +124,7 @@ function fake(ui: Lcid = FR): Fake {
     gap: 0,
     dropAnswer: 0,
     gcm: {},
+    gcmObject: false,
     managed: false,
     extra: false,
     timeline: { [EN]: 'Note Text', [FR]: 'Texte de la remarque' },
@@ -202,7 +210,13 @@ function fake(ui: Lcid = FR): Fake {
       S.vun++;
       return ok(null, 204);
     }
-    if (u.startsWith('GetClientMetadata(') && p.method === 'GET') return ok({ Metadata: JSON.stringify({ Labels: S.gcm[S.ui] ?? [] }) });
+    if (u.startsWith('GetClientMetadata(') && p.method === 'GET') {
+      // The form the query asks for.
+      const id = String(JSON.parse(decodeURIComponent(u.split('@q=')[1])).MetadataId);
+      const labels = S.gcm[S.ui];
+      const md = { Forms: [{ FormId: `{${id.toUpperCase()}}`, VersionNumber: S.vpub }], ...(labels === 'no Labels' ? {} : { Labels: labels ?? [] }) };
+      return S.gcm[S.ui] === null ? fail(500, 'Generic SQL error.') : ok({ Metadata: S.gcmObject ? md : JSON.stringify(md) });
+    }
     return fail(404, 'Resource not found for the segment.');
   };
   S.http = {
@@ -283,6 +297,19 @@ function fake(ui: Lcid = FR): Fake {
 function memStorage() {
   const m = new Map<string, string>();
   return { m, getItem: (k: string) => m.get(k) ?? null, setItem: (k: string, v: string) => void m.set(k, v), removeItem: (k: string) => void m.delete(k) };
+}
+
+/** Runs `fn` with a working localStorage (the saver's history journal, the answers loadOwnLabels keeps), or `storage`. */
+async function withStorage(fn: () => Promise<void>, storage: object = memStorage()): Promise<void> {
+  const g = globalThis as { localStorage?: unknown };
+  const had = Object.getOwnPropertyDescriptor(g, 'localStorage');
+  Object.defineProperty(g, 'localStorage', { configurable: true, value: storage });
+  try {
+    await fn();
+  } finally {
+    if (had) Object.defineProperty(g, 'localStorage', had);
+    else delete g.localStorage;
+  }
 }
 
 /**
@@ -1127,6 +1154,474 @@ export function register(t: Kit): void {
     t.eq(r.S.ui, FR);
   });
 
+  /** A main form's column cells as a form load gives them (`ref.sparse`, with the version read). */
+  const cellsOf = async (r: ReturnType<typeof rig>) => (await loadFormXml(r.ctx as never, [{ formId: FORM, entity: '', name: '', type: NaN }], [EN, FR], { signal: new AbortController().signal, progress() {}, lang: r.lang })).filter((s) => s.ref.sparse);
+  const ownOf = async (r: ReturnType<typeof rig>, cells: Slot[], signal = new AbortController().signal) => [...(await loadOwnLabels(r.ctx as never, cells, signal))];
+  const GCM = 'GET GetClientMetadata(ClientMetadataQuery=@q)';
+  const reads = (r: ReturnType<typeof rig>) => r.S.log.filter((x) => x.includes('GetClientMetadata')).length;
+  /** The batches sent since the first `n`, by their parts. */
+  const since = (r: ReturnType<typeof rig>, n: number) => r.S.batches.slice(n).map((b) => shape(b.parts));
+  /** A batch whose `parts` run in English: switched to it and back (the rig's user is French). */
+  const inEnglish = (...parts: string[]) => ['GET usersettingscollection(u)', 'PATCH usersettingscollection(u) 1033', 'PROBE', ...parts, 'PATCH usersettingscollection(u) 1036'];
+  /** The answers kept in the browser, by key. */
+  const keptIn = (storage: ReturnType<typeof memStorage>) => [...storage.m.keys()].filter((k) => k.startsWith('dxt:own:')).sort();
+  /** A load of the page asking for the language lock (a read in the user's language). */
+  const aLoad = (r: ReturnType<typeof rig>) => r.lang.hold((h) => h.batch(FR, [{ method: 'GET', url: 'load' }]));
+
+  t.test("lang: a form load never reads GetClientMetadata (its switch window is as before); loadOwnLabels reads it for a main form's column cells in the user's language, in a batch of its own without a switch, then in the other language, in a switch window of its own after it: each gets whether it lists a label of the cell's own there (displayname, never the base language's displayname_1033); a read that fails, isn't proven to be in its language or answers without `Labels` leaves that language unknown and keeps nothing of it (LIVE-FINDINGS 114)", async () => {
+    await withStorage(async () => {
+      const r = rig();
+      // Read in French, the cell has no French label of its own (its English one is served instead); in English, it has one.
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname_1033', Value: 'Name' }], [EN]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Name' }] };
+      const cells = await cellsOf(r);
+      t.eq([cells.map((s) => [s.kind, s.ref.formVersion, s.ref.own]), reads(r)], [[['field', '7', undefined]], 0], 'the load never asks');
+      t.eq(since(r, 0), [['PROBE', 'GET systemforms/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple()'], inEnglish(`GET systemforms(${FORM})`)], "the load's window as before");
+      const n = r.S.batches.length;
+      t.eq(await ownOf(r, cells), [[cells[0].key, { [EN]: true, [FR]: false }]], 'both languages');
+      t.eq(since(r, n), [['PROBE', GCM], inEnglish(GCM)], "the user's language without a switch, then English in a window of its own");
+      // The part of the page's own read of the form that holds its labels (LIVE-FINDINGS 114): no x-ms-gcm-object header,
+      // which leaves a $batch part's answer empty.
+      const q = JSON.parse(decodeURIComponent(r.S.batches[n].parts[1].url.split('@q=')[1]));
+      t.eq(q, { MetadataType: 'form', MetadataSubtype: 'Main', EntityLogicalName: 'acc', MetadataId: FORM, MetadataNames: ['{"Exclude":["entity","ribbon","webresource"]}'], GetDefault: false, DependencyDepth: 'OnDemandWithoutContext' });
+      t.eq(r.S.batches[n].parts[1].headers, undefined, 'no headers');
+      t.eq(r.S.batches[n + 1].parts[3].url, r.S.batches[n].parts[1].url, 'the same query in English');
+      await r.lang.restore();
+      t.eq(r.S.ui, FR);
+    });
+    // A read that fails, or isn't proven to be in English (Dynamics ignores the switch; the batch is tried once more, as
+    // any read not proven): that language unknown, nothing kept of it.
+    const cases: Array<[string, Record<number, unknown[] | null | 'no Labels'>, boolean, Record<number, boolean> | null]> = [
+      ['French failing', { [FR]: null, [EN]: [] }, false, { [EN]: false }],
+      ['English failing', { [FR]: [], [EN]: null }, false, { [FR]: false }],
+      ['English not proven', { [FR]: [], [EN]: [] }, true, { [FR]: false }],
+      ['both failing', { [FR]: null, [EN]: null }, false, null],
+      ['English without Labels', { [FR]: [], [EN]: 'no Labels' }, false, { [FR]: false }],
+    ];
+    for (const [why, gcm, ignore, own] of cases) {
+      const storage = memStorage();
+      await withStorage(async () => {
+        const f = rig();
+        f.S.gcm = gcm;
+        const cells = await cellsOf(f);
+        f.S.ignoreSwitch = ignore;
+        t.eq([await ownOf(f, cells), keptIn(storage)], [own ? [[cells[0].key, own]] : [], Object.keys(own ?? {}).map((l) => `dxt:own:o:${FORM}:${l}`)], why);
+        f.S.ignoreSwitch = false;
+        await f.lang.restore();
+        t.eq(f.S.ui, FR, why);
+      }, storage);
+    }
+  });
+
+  t.test("lang: loadOwnLabels keeps each answer in the browser, per language, with the published version it describes: a form loaded at that version sends nothing again, no read and no window, also in another UI language; a form loaded with a change not published (the answer is the published form's, and the load's quick read says that isn't the version loaded) gets no version, so nothing is read, kept or known of it until it is published; a new version is read again; a language whose answer is gone or holds something else is read alone; storage that throws keeps nothing, and the reads still give the answer", async () => {
+    const storage = memStorage();
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }] };
+      let cells = await cellsOf(r);
+      t.eq([await ownOf(r, cells), reads(r), keptIn(storage)], [[[cells[0].key, { [EN]: false, [FR]: true }]], 2, [`dxt:own:o:${FORM}:${EN}`, `dxt:own:o:${FORM}:${FR}`]]);
+      cells = await cellsOf(r);
+      let n = r.S.batches.length;
+      t.eq([await ownOf(r, cells), since(r, n)], [[[cells[0].key, { [EN]: false, [FR]: true }]], []], 'loaded again at that version: kept in both languages, nothing sent');
+      // Published since: read again.
+      r.S.vun = r.S.vpub = 8;
+      r.S.gcm = { [FR]: [] };
+      cells = await cellsOf(r);
+      t.eq([await ownOf(r, cells), reads(r)], [[[cells[0].key, { [EN]: false, [FR]: false }]], 4], 'a new version');
+      // A visit with English as the UI language, the same version: both kept, nothing read.
+      const e = rig(EN, EN);
+      e.S.vun = e.S.vpub = 8;
+      t.eq([await ownOf(e, await cellsOf(e)), reads(e)], [[[cells[0].key, { [EN]: false, [FR]: false }]], 0], 'in English');
+      // Saved again without publishing: the answer describes the published form, not the one loaded (the load's quick read
+      // in English says so), so nothing is read, kept or known (its labels show as loaded) until it is published, then
+      // read once.
+      r.S.vun = 9;
+      cells = await cellsOf(r);
+      n = r.S.batches.length;
+      t.eq([cells[0].ref.formVersion, await ownOf(r, cells), since(r, n), keptIn(storage).length], [undefined, [], [], 2], 'a change not published');
+      r.S.vpub = 9;
+      for (const k of [6, 6]) {
+        cells = await cellsOf(r);
+        t.eq([cells[0].ref.formVersion, await ownOf(r, cells), reads(r)], ['9', [[cells[0].key, { [EN]: false, [FR]: false }]], k], 'published');
+      }
+      // Something else under French's key: French read again, alone. English's gone: English read again, alone.
+      storage.m.set(`dxt:own:o:${FORM}:${FR}`, '{"v":"9","k":"c1"}');
+      cells = await cellsOf(r);
+      n = r.S.batches.length;
+      t.eq([await ownOf(r, cells), since(r, n)], [[[cells[0].key, { [EN]: false, [FR]: false }]], [['PROBE', GCM]]], 'French');
+      storage.m.delete(`dxt:own:o:${FORM}:${EN}`);
+      cells = await cellsOf(r);
+      n = r.S.batches.length;
+      t.eq([await ownOf(r, cells), since(r, n)], [[[cells[0].key, { [EN]: false, [FR]: false }]], [inEnglish(GCM)]], 'English');
+    }, storage);
+    const blocked = () => {
+      throw new DOMException('The operation is insecure.', 'SecurityError');
+    };
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }] };
+      const cells = await cellsOf(r);
+      for (const n of [2, 4]) t.eq([await ownOf(r, cells), reads(r)], [[[cells[0].key, { [EN]: false, [FR]: true }]], n], 'storage blocked');
+    }, { getItem: blocked, setItem: blocked, removeItem: blocked });
+  });
+
+  t.test("lang: loadOwnLabels takes no answer of another version than the one its cells were loaded at, nor keeps it: a form with a change not published, loaded without a read in another language to say so (its field labels only), or one published again since it was loaded", async () => {
+    const run = async (o: { fieldsOnly?: boolean; publishedSince?: boolean }) => {
+      const storage = memStorage();
+      let out: unknown[] = [];
+      await withStorage(async () => {
+        const r = rig();
+        r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+        if (o.fieldsOnly) r.S.vun = 8; // saved without publishing: the published form is version 7
+        const cells = o.fieldsOnly
+          ? (await loadFormXml(r.ctx as never, [{ formId: FORM, entity: '', name: '', type: NaN }], [EN, FR], { signal: new AbortController().signal, progress() {}, lang: r.lang }, new Set<Kind>(['field']))).filter((s) => s.ref.sparse)
+          : await cellsOf(r);
+        if (o.publishedSince) r.S.vun = r.S.vpub = 8;
+        out = [cells.map((s) => s.ref.formVersion), (await ownOf(r, cells)).map(([k, v]) => [k === cells[0].key ? 'the cell' : k, v]), reads(r), keptIn(storage)];
+        await r.lang.restore();
+      }, storage);
+      return out;
+    };
+    t.eq(await run({}), [['7'], [['the cell', { [EN]: false, [FR]: true }]], 2, [`dxt:own:o:${FORM}:${EN}`, `dxt:own:o:${FORM}:${FR}`]], 'the version loaded: taken and kept');
+    t.eq(await run({ fieldsOnly: true }), [['8'], [], 2, []], 'a change not published');
+    t.eq(await run({ publishedSince: true }), [['7'], [], 2, []], 'published again since');
+  });
+
+  t.test("lang: the answers kept in the browser (OWN_KEY) stay within a budget: those of the 100 forms of the org written last, each with the time it was written, every language of a form together; one an earlier build kept, without its time, is read as before and goes first; storage that is full makes room the same way, the form written longest ago first, and another org's are never touched", async () => {
+    /** localStorage as browsers have it, its keys listed (length, key) in the order written; full past `cap` characters. */
+    const listed = () => {
+      const m = new Map<string, string>();
+      const size = () => [...m].reduce((n, [k, v]) => n + k.length + v.length, 0);
+      const s = {
+        m,
+        cap: Infinity,
+        size,
+        get length() {
+          return m.size;
+        },
+        key: (i: number) => [...m.keys()][i] ?? null,
+        getItem: (k: string) => m.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          if (size() - (m.has(k) ? k.length + m.get(k)!.length : 0) + k.length + v.length > s.cap) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+          m.set(k, v);
+        },
+        removeItem: (k: string) => void m.delete(k),
+      };
+      return s;
+    };
+    const kept = (v: string, t?: number) => JSON.stringify({ ...(t === undefined ? {} : { t }), v, k: ['x'.repeat(100)] });
+    /** The forms of the org with an answer kept, in the order written. */
+    const forms = (s: ReturnType<typeof listed>) => [...new Set([...s.m.keys()].filter((k) => k.startsWith('dxt:own:o:')).map((k) => k.split(':')[3]))];
+    /** Loads the rig's form and reads its answers (its English one kept by an earlier build for the version loaded), over `s`. */
+    const load = async (s: ReturnType<typeof listed>, cap = false) => {
+      let out: unknown[] = [];
+      s.m.set(`dxt:own:o:${FORM}:${EN}`, JSON.stringify({ v: '7', k: [] }));
+      await withStorage(async () => {
+        const r = rig();
+        r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Name' }] };
+        const cells = await cellsOf(r);
+        if (cap) s.cap = s.size() + 20;
+        out = [(await ownOf(r, cells)).map(([, v]) => v), reads(r)];
+        await r.lang.restore();
+      }, s);
+      const fr = JSON.parse(s.m.get(`dxt:own:o:${FORM}:${FR}`) ?? 'null');
+      return [...out, typeof fr?.t === 'number' && fr.v === '7' && fr.k.join() === 'c1'];
+    };
+    // 100 other forms of the org kept: one by an earlier build, then 99 written since, oldest first; one of another org.
+    const s = listed();
+    for (const l of [EN, FR]) s.m.set(`dxt:own:o:old:${l}`, kept('3'));
+    for (let i = 1; i <= 99; i++) for (const l of [EN, FR]) s.m.set(`dxt:own:o:f${i}:${l}`, kept('3', 1000 + i));
+    s.m.set(`dxt:own:p:f0:${EN}`, kept('3', 1));
+    // English kept by the earlier build: read as before (no request); French read, and kept with its time.
+    t.eq(await load(s), [[{ [EN]: false, [FR]: true }], 1, true]);
+    const left = forms(s);
+    t.eq([left.length, left.includes('old'), left.includes('f1'), left.includes(FORM), s.m.has(`dxt:own:o:old:${EN}`), s.m.has(`dxt:own:p:f0:${EN}`)], [100, false, true, true, false, true], "the earlier build's form goes, in every language; the 99 others and another org's stay");
+    // Storage full: the form written longest ago goes, in every language, until the answer fits.
+    const full = listed();
+    for (let i = 1; i <= 9; i++) for (const l of [EN, FR]) full.m.set(`dxt:own:o:f${i}:${l}`, kept('3', 1000 + i));
+    t.eq(await load(full, true), [[{ [EN]: false, [FR]: true }], 1, true]);
+    t.eq(forms(full), ['f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', FORM], 'f1 made room');
+  });
+
+  t.test("lang: loadOwnLabels reads the other language once the user's language is in, every form in one window, and gives what is known before that window; the window is a hold of its own, so a load that asks for the lock while the user's language is read goes first", async () => {
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+      const cells = await cellsOf(r);
+      // The same cells on a second form.
+      const F2 = '5e07410a-0000-4000-8000-000000000072';
+      const two = [...cells, ...cells.map((s) => ({ ...s, key: s.key.replace(FORM, F2), ref: { ...s.ref, formId: F2 } }))];
+      const n = r.S.batches.length;
+      const known: unknown[] = [];
+      const own = await loadOwnLabels(r.ctx as never, two, new AbortController().signal, (o) => known.push([[...o], r.S.batches.length - n]));
+      t.eq(since(r, n), [['PROBE', GCM], ['PROBE', GCM], inEnglish(GCM, GCM)], "each form in the user's language, then both in one English window");
+      t.eq(r.S.batches[n + 2].parts.slice(3, 5).map((p) => JSON.parse(decodeURIComponent(p.url.split('@q=')[1])).MetadataId), [FORM, F2]);
+      t.eq(known, [[two.map((s) => [s.key, { [FR]: true }]), 2]], 'French, before the window');
+      t.eq([...own], two.map((s) => [s.key, { [EN]: false, [FR]: true }]));
+    });
+    await withStorage(async () => {
+      const r = rig();
+      const cells = await cellsOf(r);
+      const n = r.S.batches.length;
+      let load: Promise<unknown> | undefined;
+      r.S.onPart = (p) => void (!load && p.url.includes('GetClientMetadata') && (load = aLoad(r)));
+      await ownOf(r, cells);
+      await load;
+      t.eq(since(r, n), [['PROBE', GCM], ['PROBE', 'GET load'], inEnglish(GCM)], 'the load between the two');
+    });
+  });
+
+  t.test("lang: a load that starts before the other language's window is sent stops it (AbortError), nothing of it sent, and the user's language is kept, so the read run again sends that window alone; a load that starts once it is sent waits for it, and its answer is kept and given, never read again", async () => {
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+      const cells = await cellsOf(r);
+      const n = r.S.batches.length;
+      // A load starts as the window is taken: the window's hold has the lock by then.
+      const ac = new AbortController();
+      const request = r.locks.request;
+      r.locks.request = (name, o, fn) => {
+        if (name === windowLock('o', 'u') && o.mode !== 'shared') ac.abort();
+        return request(name, o, fn);
+      };
+      let err: unknown;
+      await ownOf(r, cells, ac.signal).catch((e) => (err = e));
+      r.locks.request = request;
+      t.ok(err instanceof DOMException && err.name === 'AbortError', String(err));
+      t.eq(since(r, n), [['PROBE', GCM]], 'nothing of the window sent');
+      t.eq(await ownOf(r, cells), [[cells[0].key, { [EN]: false, [FR]: true }]]);
+      t.eq(since(r, n), [['PROBE', GCM], inEnglish(GCM)], 'run again: the window alone');
+      await r.lang.restore();
+      t.eq(r.S.ui, FR);
+    });
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+      const cells = await cellsOf(r);
+      const n = r.S.batches.length;
+      // A load starts while the window runs.
+      const ac = new AbortController();
+      let load: Promise<unknown> | undefined;
+      r.S.onPart = (p) => void (!load && r.S.switching && p.url.includes('GetClientMetadata') && (ac.abort(), (load = aLoad(r))));
+      t.eq(await ownOf(r, cells, ac.signal), [[cells[0].key, { [EN]: false, [FR]: true }]], 'given');
+      await load;
+      r.S.onPart = undefined;
+      t.eq(since(r, n), [['PROBE', GCM], inEnglish(GCM), ['PROBE', 'GET load']], 'the load after the window');
+      t.eq([await ownOf(r, cells), reads(r)], [[[cells[0].key, { [EN]: false, [FR]: true }]], 2], 'kept: never read again');
+      await r.lang.restore();
+      t.eq(r.S.ui, FR);
+    });
+  });
+
+  t.test("lang: with English the user's language, the French answer read in its window, and then kept, makes a French form label whose text is the column's French name follow its column (Store.follows: empty in the popup, the name its placeholder); the English label of the cell's own doesn't", async () => {
+    await withStorage(async () => {
+      // No French label of the cell's own: every read fills in the column's French name there (LIVE-FINDINGS 103).
+      const r = rig(EN, EN);
+      r.S.cell[FR] = r.S.column[FR];
+      r.S.gcm = { [EN]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Name' }], [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname_1033', Value: 'Name' }] };
+      const COL = 'attribute|acc.name|DisplayName';
+      const page = async () => {
+        const st = new Store();
+        const cells = await cellsOf(r);
+        st.add([...cells, t.slot('attribute', COL, { [EN]: r.S.column[EN], [FR]: r.S.column[FR] })]);
+        const key = cells[0].key;
+        const before = st.follows(key, FR, EN);
+        st.setOwn(await loadOwnLabels(r.ctx as never, cells, new AbortController().signal));
+        return [before, st.follows(key, EN, EN), st.follows(key, FR, EN), reads(r)];
+      };
+      t.eq(await page(), [false, false, true, 2], 'read in its window');
+      t.eq(await page(), [false, false, true, 2], 'kept: nothing read');
+      await r.lang.restore();
+      t.eq(r.S.ui, EN);
+    });
+  });
+
+  t.test("lang: loadOwnLabels reads an answer whose metadata is an object (the page's own read asks for one) as it reads one whose metadata is a JSON string", async () => {
+    for (const gcmObject of [false, true])
+      await withStorage(async () => {
+        const r = rig();
+        r.S.gcmObject = gcmObject;
+        r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+        const cells = await cellsOf(r);
+        t.eq(await ownOf(r, cells), [[cells[0].key, { [EN]: false, [FR]: true }]], `an object: ${gcmObject}`);
+        await r.lang.restore();
+      });
+  });
+
+  t.test("lang: loadOwnLabels reads a language only where a cell is undecided there (its text is the column's name, Store.fillsIn): none in the user's language, no read without a switch; none in the other one, no window; none anywhere, nothing sent; an answer kept for the version is given all the same", async () => {
+    const cases: Array<[string, (s: Slot, l: Lcid) => boolean, Record<number, boolean> | null, string[][]]> = [
+      ['in both', () => true, { [EN]: false, [FR]: true }, [['PROBE', GCM], inEnglish(GCM)]],
+      ['in English only', (_s, l) => l === EN, { [EN]: false }, [inEnglish(GCM)]],
+      ['in French only', (_s, l) => l === FR, { [FR]: true }, [['PROBE', GCM]]],
+      ['in neither', () => false, null, []],
+    ];
+    for (const [why, undecided, own, sent] of cases)
+      await withStorage(async () => {
+        const r = rig();
+        r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+        const cells = await cellsOf(r);
+        const n = r.S.batches.length;
+        t.eq([...(await loadOwnLabels(r.ctx as never, cells, new AbortController().signal, undefined, undecided))], own ? [[cells[0].key, own]] : [], why);
+        t.eq(since(r, n), sent, why);
+        await r.lang.restore();
+        t.eq(r.S.ui, FR, why);
+      });
+    await withStorage(async () => {
+      const r = rig();
+      r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+      const cells = await cellsOf(r);
+      await ownOf(r, cells);
+      const n = r.S.batches.length;
+      t.eq([...(await loadOwnLabels(r.ctx as never, cells, new AbortController().signal, undefined, () => false)), since(r, n)], [[cells[0].key, { [EN]: false, [FR]: true }], []], 'kept');
+    });
+  });
+
+  // ---- the page's own copies of a form's answer (LIVE-FINDINGS 115) ----
+
+  const EXCL = '{"Exclude":["entity","ribbon","webresource"]}';
+  /**
+   * The metadata of the part of the page's read of a form that holds its labels: the form (`form`) at version `v`, its
+   * cells' labels of their own (`own`, by label key) and a custom control whose resource files are in `lcids`.
+   */
+  const labelsPart = (v: number, own: Record<string, string>, lcids: number[], form = FORM) => ({
+    Forms: [{ FormId: `{${form.toUpperCase()}}`, VersionNumber: v }],
+    Labels: [...Object.entries(own).map(([Id, Value]) => ({ Id, LabelColumnName: 'displayname', Value })), { Id: `{${form.toUpperCase()}}`, LabelColumnName: 'name', Value: 'Main' }],
+    CustomControls: lcids.map((l) => ({ Name: 'MscrmControls.FieldControls.TextBoxControl', Resources: [{ Name: `cc_MscrmControls.FieldControls.TextBoxControl/strings/TextBoxControl.${l}.resx`, LoadOrder: 0, Type: 5 }] })),
+  });
+  /** A cached request of the page's read of a form: its MetadataNames part, its answer's metadata (an object, or a JSON string), its table; `bad`: an answer that isn't JSON. */
+  interface Cached {
+    names: string;
+    md: unknown;
+    entity?: string;
+    bad?: true;
+  }
+  /**
+   * The service worker's caches as CacheStorage gives them (cache name → cached requests), recording the caches opened and
+   * the answers read ("<cache> <index>"). `fail`: the call that throws ('keys', 'open'), or 'hang' (keys() never answers).
+   */
+  const cacheStorage = (all: Record<string, Cached[]>, fail = '') => {
+    const opened: string[] = [];
+    const read: string[] = [];
+    const storage = {
+      keys: () => (fail === 'hang' ? new Promise<string[]>(() => {}) : fail === 'keys' ? Promise.reject(new DOMException('The operation is insecure.', 'SecurityError')) : Promise.resolve(Object.keys(all))),
+      open: async (n: string) => {
+        if (fail === 'open') throw new DOMException('The operation is insecure.', 'SecurityError');
+        opened.push(n);
+        const q = (x: Cached) => ({ MetadataType: 'form', MetadataSubtype: 'Main', EntityLogicalName: x.entity ?? 'acc', MetadataId: FORM, MetadataNames: [x.names], GetDefault: false });
+        const reqs = (all[n] ?? []).map((x, i) => ({ url: `https://org.test/api/data/v9.0/GetClientMetadata(ClientMetadataQuery=@ClientMetadataQuery)?@ClientMetadataQuery=${encodeURIComponent(JSON.stringify(q(x)))}&umv=${i}&mv=1` }));
+        return {
+          keys: async () => reqs,
+          match: async (r: unknown) => {
+            const i = reqs.indexOf(r as (typeof reqs)[number]);
+            read.push(`${n} ${i}`);
+            const x = all[n][i];
+            return { ok: true, json: async () => (x.bad ? Promise.reject(new SyntaxError('Unexpected token')) : { Metadata: x.md }) };
+          },
+        };
+      },
+    };
+    return { storage, opened, read };
+  };
+  /** Runs `fn` with `storage` as the page's CacheStorage (undefined: the page has none). */
+  async function withCaches(storage: unknown, fn: () => Promise<void>): Promise<void> {
+    const g = globalThis as { caches?: unknown };
+    const had = Object.getOwnPropertyDescriptor(g, 'caches');
+    Object.defineProperty(g, 'caches', { configurable: true, value: storage });
+    try {
+      await fn();
+    } finally {
+      if (had) Object.defineProperty(g, 'caches', had);
+      else delete g.caches;
+    }
+  }
+
+  t.test("lang: the page's own copies of a form's GetClientMetadata answer (pageOwnLabels, LIVE-FINDINGS 115): newest label cache first (gcm_<n>, not gcm_no_version), only a part that holds labels (a KeepOnly part is never read, even holding the form), per language the first copy its resource files prove, in a language this environment has; a copy with no or several resx languages, without the form, of another table, or not JSON is left out; its metadata an object or a JSON string; taken (knownOwnLabels), the user's language and French need no read, nothing is sent", async () => {
+    await withStorage(async () => {
+      const r = rig();
+      const cells = await cellsOf(r);
+      const n = r.S.batches.length;
+      const { storage, opened, read } = cacheStorage({
+        // Not in number order: the newest is looked at first all the same.
+        gcm_200_t_u: [{ names: EXCL, md: labelsPart(6, {}, [FR]) }, { names: EXCL, md: labelsPart(6, {}, [EN]) }],
+        // Each a copy that would say no cell has a label of its own, were it taken: with no resx language, a part without
+        // labels that holds the form all the same, one without `Labels`, an older English one.
+        gcm_310_t_u: [{ names: EXCL, md: labelsPart(7, {}, []) }],
+        gcm_300_t_u: [
+          { names: '{"KeepOnly":["entity"]}', md: labelsPart(7, {}, [EN]) },
+          { names: '{"KeepOnly":["ribbon"]}', md: { Ribbons: [] } },
+          { names: '{"KeepOnly":["webresource"]}', md: { WebResources: [] } },
+          { names: EXCL, md: null, bad: true },
+          { names: EXCL, md: { ...labelsPart(7, {}, [EN]), Labels: undefined } },
+          { names: EXCL, md: labelsPart(7, { '{C1}': 'Name' }, [EN, EN]) },
+        ],
+        gcm_295_t_u: [{ names: EXCL, md: labelsPart(6, {}, [EN]) }],
+        gcm_290_t_u: [{ names: EXCL, md: labelsPart(7, {}, [FR, EN]) }],
+        gcm_270_t_u: [{ names: EXCL, md: labelsPart(7, {}, [FR], '5e07410a-0000-4000-8000-000000000072') }],
+        gcm_260_t_u: [{ names: EXCL, md: labelsPart(7, {}, [FR]), entity: 'other' }],
+        gcm_255_t_u: [{ names: EXCL, md: labelsPart(7, {}, [DE]) }],
+        gcm_250_t_u: [{ names: EXCL, md: JSON.stringify(labelsPart(7, { '{C1}': 'Nom' }, [FR])) }],
+        gcm_100_t_u: [{ names: EXCL, md: labelsPart(5, {}, [FR]) }],
+      });
+      await withCaches(storage, async () => {
+        const copies = await pageOwnLabels(r.ctx as never, FORM, 'acc');
+        t.eq(copies, [
+          { form: FORM, l: EN, v: '7', k: ['c1'], t: { c1: 'Name' } },
+          { form: FORM, l: FR, v: '7', k: ['c1'], t: { c1: 'Nom' } },
+        ]);
+        t.eq(opened, ['gcm_310_t_u', 'gcm_300_t_u', 'gcm_295_t_u', 'gcm_290_t_u', 'gcm_270_t_u', 'gcm_260_t_u', 'gcm_255_t_u', 'gcm_250_t_u'], 'newest first, until each language has its copy');
+        t.eq(read, ['gcm_310_t_u 0', 'gcm_300_t_u 3', 'gcm_300_t_u 4', 'gcm_300_t_u 5', 'gcm_295_t_u 0', 'gcm_290_t_u 0', 'gcm_270_t_u 0', 'gcm_255_t_u 0', 'gcm_250_t_u 0'], "never a part without labels, nor another table's form");
+        t.eq([...knownOwnLabels(r.ctx as never, cells, copies)], [[cells[0].key, { [EN]: true, [FR]: true }]], 'taken');
+        t.eq(await ownOf(r, cells), [[cells[0].key, { [EN]: true, [FR]: true }]]);
+      });
+      t.eq(since(r, n), [], 'nothing sent');
+    });
+    // No French copy: every label cache is looked in, never another cache.
+    const one = { gcm_300_t_u: [{ names: EXCL, md: labelsPart(7, {}, [EN]) }] };
+    const all = cacheStorage({ ...one, gcm_no_version_t_u: [{ names: EXCL, md: labelsPart(7, {}, [FR]) }], CDN_Resources: [] });
+    await withCaches(all.storage, async () => t.eq([(await pageOwnLabels(rig().ctx as never, FORM, 'acc')).map((c) => c.l), all.opened], [[EN], ['gcm_300_t_u']], 'label caches only'));
+    // The search fails, or the page has no CacheStorage: none.
+    for (const fail of ['keys', 'open']) await withCaches(cacheStorage(one, fail).storage, async () => t.eq(await pageOwnLabels(rig().ctx as never, FORM, 'acc'), [], fail));
+    await withCaches(undefined, async () => t.eq(await pageOwnLabels(rig().ctx as never, FORM), [], 'no CacheStorage'));
+    // One that never answers: given up after 3 s (30 ms here).
+    await fast(() => withCaches(cacheStorage(one, 'hang').storage, async () => t.eq(await pageOwnLabels(rig().ctx as never, FORM, 'acc'), [], 'hangs')));
+  });
+
+  t.test("lang: what is known without a request (knownOwnLabels): the page's copies of the version loaded, each kept as its language's answer, so loadOwnLabels reads nothing for it (a French copy serving French), no read and no window; a copy of another version, whose text of a cell isn't the one loaded (a language other than its resource files say, a change not published), or that leaves out a cell whose text there isn't the one a read fills in (`fills`: a label of the cell's own it lacks, LIVE-FINDINGS 113; the column's names not loaded; no `fills`), is not taken, and its language is read; the answers kept for the version too", async () => {
+    const copy = (l: Lcid, v: string, own: Record<string, string>): OwnCopy => ({ form: FORM, l, v, k: Object.keys(own), t: own });
+    // The rig's cell: English "Name", French "Nom", the user's language French; a label of its own in French only, so its
+    // English text is the column's name a read fills in (the column's names "Name" and "Nom du compte").
+    const named: Record<number, string> = { [EN]: 'Name', [FR]: 'Nom du compte' };
+    const fills = (s: Slot, l: Lcid) => s.labels[l] === named[l];
+    const cases: Array<[string, OwnCopy[], Record<number, boolean> | null, string[][], ((s: Slot, l: Lcid) => boolean)?]> = [
+      ['both', [copy(EN, '7', {}), copy(FR, '7', { c1: 'Nom' })], { [EN]: false, [FR]: true }, []],
+      ['English only', [copy(EN, '7', {})], { [EN]: false }, [['PROBE', GCM]]],
+      ['French only', [copy(FR, '7', { c1: 'Nom' })], { [FR]: true }, [inEnglish(GCM)]],
+      ['other versions', [copy(EN, '6', {}), copy(FR, '8', { c1: 'Nom' })], null, [['PROBE', GCM], inEnglish(GCM)]],
+      ['a text not the one loaded', [copy(EN, '7', { c1: 'Nom' }), copy(FR, '7', { c1: 'Nom' })], { [FR]: true }, [inEnglish(GCM)]],
+      ["a label of the cell's own left out", [copy(EN, '7', {}), copy(FR, '7', {})], { [EN]: false }, [['PROBE', GCM]]],
+      ["the column's names not loaded", [copy(EN, '7', {}), copy(FR, '7', { c1: 'Nom' })], { [FR]: true }, [inEnglish(GCM)], () => false],
+    ];
+    for (const [why, copies, known, sent, check = fills] of cases) {
+      const storage = memStorage();
+      await withStorage(async () => {
+        const r = rig();
+        r.S.gcm = { [FR]: [{ Id: '{C1}', LabelColumnName: 'displayname', Value: 'Nom' }], [EN]: [] };
+        const cells = await cellsOf(r);
+        t.eq([[...knownOwnLabels(r.ctx as never, cells, copies, check)], keptIn(storage)], [known ? [[cells[0].key, known]] : [], Object.keys(known ?? {}).map((l) => `dxt:own:o:${FORM}:${l}`)], why);
+        const n = r.S.batches.length;
+        t.eq([await ownOf(r, cells), since(r, n)], [[[cells[0].key, { [EN]: false, [FR]: true }]], sent], why);
+        // Read or taken, kept: known without a request next time, with or without a copy.
+        t.eq([...knownOwnLabels(r.ctx as never, cells)], [[cells[0].key, { [EN]: false, [FR]: true }]], why);
+        await r.lang.restore();
+      }, storage);
+    }
+    await withStorage(async () => {
+      const r = rig();
+      const cells = await cellsOf(r);
+      t.eq([...knownOwnLabels(r.ctx as never, cells, [copy(EN, '7', {}), copy(FR, '7', { c1: 'Nom' })])], [[cells[0].key, { [FR]: true }]], 'no fills');
+      await r.lang.restore();
+    });
+  });
+
   t.test('lang: form load of a form with an unpublished change, or one published again between the reads, reads the other language the exact way', async () => {
     const exact = (r: ReturnType<typeof rig>) =>
       r.S.batches.some((b) => { const p = shape(b.parts); return p.includes('PATCH usersettingscollection(u) 1033') && p.includes('GET systemforms/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple()'); });
@@ -1251,6 +1746,87 @@ export function register(t: Kit): void {
     t.eq(fields.find((s) => s.kind === 'field')!.labels, { [FR]: 'Nom' });
     await r.lang.restore();
     await r2.lang.restore();
+  });
+
+  t.test("lang: a quick view's cell kept per language that a read left in the user's language alone (ref.partial) is read again in every language when the page shows the quick view, once that language can be read; an edit staged on it stays. Known in every language, or one no read can complete (ref.unreadable), it is not read again", async () => {
+    const signal = new AbortController().signal;
+    const providers = { loadFormXml, loadTables: async () => [], knownOwnLabels: () => new Map(), loadOwnLabels: async () => new Map() };
+    /** The page showing the form as a quick view, in a new page loader: the form reads and language switches it sent. */
+    const show = async (q: ReturnType<typeof rig>, st: Store) => {
+      const ld = new PageLoader({ ctx: q.ctx, providers, store: st, lang: q.lang } as never, () => {});
+      const n = q.S.log.length;
+      ld.request([WANT_QUICK + FORM]);
+      for (let i = 0; i < 400 && ld.busy.size; i++) await new Promise((go) => setTimeout(go, 5));
+      return q.S.log.slice(n).filter((x) => /systemforms|GetClientMetadata|^PATCH usersettings/.test(x));
+    };
+    const r = rig();
+    r.S.extra = true; // the timeline's cell: bound to no column, its label is kept per language (as a web resource's)
+    r.S.ignoreSwitch = true; // English can't be read
+    const st = new Store();
+    st.add(await loadFormXml(r.ctx as never, [{ formId: FORM, entity: '', name: '', type: NaN }], [EN, FR], { signal, progress() {}, lang: r.lang }));
+    const key = [...st.slots.values()].find((s) => s.kind === 'field' && s.ref?.partial)!.key;
+    t.eq([st.get(key)!.labels, !!st.get(key)!.ref.unread?.[EN]], [{ [FR]: 'Texte de la remarque' }, true], 'English not loaded');
+    st.set(key, FR, 'Remarques');
+    r.S.ignoreSwitch = false; // Dataverse switches again
+    const sent = await show(r, st);
+    t.ok(sent.some((x) => x.startsWith('PATCH usersettingscollection(u) {"uilanguageid":1033}')), `read in English: ${sent.join(' | ')}`);
+    t.eq([st.get(key)!.labels, st.get(key)!.ref.partial, st.value(key, FR), st.isEdited(key)], [{ [EN]: 'Note Text', [FR]: 'Texte de la remarque' }, undefined, 'Remarques', true], 'completed; the staged edit kept');
+    t.eq(await show(r, st), [], 'known in every language: nothing read');
+    await r.lang.restore();
+    t.eq(r.S.ui, FR);
+    // A form read through its published fallback: its cells are known in the user's language only for good.
+    const p = pubOnly();
+    const ps = new Store();
+    ps.add(await loadFormXml(p.ctx as never, [{ formId: FORM, entity: '', name: '', type: NaN }], [EN, FR], { signal, progress() {}, lang: p.lang }, new Set<Kind>(['field'])));
+    t.ok([...ps.slots.values()].some((s) => s.ref?.partial && s.ref.unreadable === PUB_ONLY));
+    t.eq(await show(p, ps), [], 'nothing read');
+    await p.lang.restore();
+  });
+
+  t.test("lang: a quick view's or a side pane's form read in some languages only (a language the read missed) counts as failed, as the page's own form does: what was read is kept, the bar says so and the request is given up; Try again (PageLoader.retry) reads it again in every language and completes it, an edit staged meanwhile kept, and then has nothing left to read. One no read can complete (ref.unreadable) says nothing", async () => {
+    const providers = { loadFormXml, loadTables: async () => [], knownOwnLabels: () => new Map(), loadOwnLabels: async () => new Map() };
+    const settle = async (ld: PageLoader) => {
+      for (let i = 0; i < 400 && ld.busy.size; i++) await new Promise((go) => setTimeout(go, 5));
+    };
+    const reads = (q: ReturnType<typeof rig>, from: number) => q.S.log.slice(from).filter((x) => /systemforms|^PATCH usersettings/.test(x));
+    const MSG = 'Could not load the form labels in every language.';
+    for (const [want, kind] of [[WANT_QUICK, 'field'], [WANT_FORM, 'tab']] as const) {
+      const r = rig();
+      r.S.extra = true; // the timeline's cell: bound to no column, its label is kept per language (as a web resource's)
+      r.S.ignoreSwitch = true; // English can't be read
+      const st = new Store();
+      const ld = new PageLoader({ ctx: r.ctx, providers, store: st, lang: r.lang } as never, () => {});
+      ld.request([want + FORM]);
+      await settle(ld);
+      const key = [...st.slots.values()].find((s) => s.kind === kind && s.ref?.partial)!.key;
+      t.eq([[...ld.errors.values()], [...ld.gaveUp], st.get(key)!.labels[EN] ?? null, !!st.get(key)!.labels[FR]], [[MSG], [want + FORM], null, true], `${kind}: failed, what was read kept`);
+      st.set(key, FR, 'Modifié');
+      r.S.ignoreSwitch = false; // Dataverse switches again
+      const n = r.S.log.length;
+      ld.retry();
+      await settle(ld);
+      t.ok(reads(r, n).includes('PATCH usersettingscollection(u) {"uilanguageid":1033}'), `${kind}: read again in English: ${reads(r, n).join(' | ')}`);
+      t.eq([[...ld.errors.values()], [...ld.gaveUp], st.get(key)!.ref.partial, !!st.get(key)!.labels[EN], st.value(key, FR), st.isEdited(key)], [[], [], undefined, true, 'Modifié', true], `${kind}: completed, the edit kept`);
+      const m = r.S.log.length;
+      ld.retry();
+      await settle(ld);
+      t.eq(reads(r, m), [], `${kind}: nothing left to read`);
+      await r.lang.restore();
+      t.eq(r.S.ui, FR);
+    }
+    // A form read through its published fallback: its cells are known in the user's language only for good.
+    const p = pubOnly();
+    const ps = new Store();
+    const pl = new PageLoader({ ctx: p.ctx, providers, store: ps, lang: p.lang } as never, () => {});
+    pl.request([WANT_QUICK + FORM]);
+    await settle(pl);
+    t.ok([...ps.slots.values()].some((s) => s.ref?.partial && s.ref.unreadable === PUB_ONLY));
+    t.eq([[...pl.errors.values()], [...pl.gaveUp]], [[], []], 'nothing said, nothing given up');
+    const k = p.S.log.length;
+    pl.retry();
+    await settle(pl);
+    t.eq(reads(p, k), [], 'nothing read again');
+    await p.lang.restore();
   });
 
   t.test('lang: a form a read in another language did not bring is read again once; still missing, it says so', async () => {
@@ -1453,6 +2029,25 @@ export function register(t: Kit): void {
     t.eq(r.S.ui, FR);
   });
 
+  t.test('lang: a form from a managed solution where this session allows changes to managed labels (Ctx.managedEdits): its labels load editable, both reasons kept; the Workbench brings it without read-only labels asked for; its save writes the form, also read as managed right before the write', async () => {
+    const r = rig();
+    (r.ctx as { managedEdits?: boolean }).managedEdits = true;
+    r.S.managed = true;
+    const by = await slotsOf(r);
+    t.eq([...by.values()].map((s) => [s.kind, s.readOnly, s.ref.managed, s.ref.lock, s.ref.held]), [['tab', '', true, '', MANAGED], ['section', '', true, '', MANAGED], ['field', '', true, '', MANAGED]]);
+    const all = r.S.http.all;
+    r.S.http.all = async (url: string) =>
+      url.startsWith('systemforms/') ? [{ formid: FORM, name: 'Main', type: 2, objecttypecode: 'acc', iscustomizable: { Value: true }, ismanaged: true }] : all(url);
+    const wb = await loadFormsScope(r.ctx as never, { entities: ['acc'], kinds: new Set<Kind>(['tab', 'section', 'field']) }, { signal: new AbortController().signal, progress() {}, lang: r.lang });
+    t.eq(wb.map((s) => [s.kind, s.readOnly]), [['tab', ''], ['section', ''], ['field', '']]);
+    r.S.http.all = all;
+    const res = await formXmlWriter.save(r.ctx as never, [change(by.get('field')!, FR, 'Nom 2'), change(by.get('tab')!, EN, 'Overview')], saveOpts(r));
+    t.eq(res.map((x) => x.outcome), ['saved', 'saved'], JSON.stringify(res.map((x) => x.message)));
+    t.eq([r.S.cell[FR], r.S.tab[EN]], ['Nom 2', 'Overview']);
+    await r.lang.restore();
+    t.eq(r.S.ui, FR);
+  });
+
   t.test('lang: the Workbench leaves a form from a managed solution, or one RetrieveUnpublished does not find, out unless read-only labels are asked for, then shows it read-only; an unmanaged form of the same table is in', async () => {
     const r = rig();
     r.S.managed = true;
@@ -1593,7 +2188,12 @@ export function register(t: Kit): void {
       const r = rig();
       const by = await slotsOf(r);
       r.S.throttle = 1;
-      r.S.onThrottle = () => void (r.S.cell[DE] = 'Name DE'); // another maker added German meanwhile
+      // Another maker meanwhile renamed the section (posted as read) and added German to the field (a main form's write
+      // posts no label of a field it doesn't change: Dataverse keeps it, LIVE-FINDINGS 104).
+      r.S.onThrottle = () => {
+        r.S.section[EN] = 'Details 2';
+        r.S.cell[DE] = 'Name DE';
+      };
       const n = r.S.batches.length;
       const res = await formXmlWriter.save(r.ctx as never, [change(by.get('tab')!, EN, 'Overview')], saveOpts(r));
       t.eq(res.map((x) => x.outcome), ['saved'], JSON.stringify(res));
@@ -1602,27 +2202,14 @@ export function register(t: Kit): void {
       t.eq(sent.map((b) => (b.parts.some(isWrite) ? 'write' : 'read')), ['read', 'write', 'read', 'write'], 'a new read before the second write');
       t.eq(sent.filter((b) => b.parts.some(isWrite)).map((b) => b.once), [true, true], 'never resent by Http');
       const body = (sent[3].parts.find(isWrite)!.body as { formxml: string }).formxml;
-      t.ok(body.includes('languagecode="1031"'), 'built from the second read (German kept)');
-      t.eq([r.S.tab[EN], r.S.cell[DE]], ['Overview', 'Name DE']);
+      t.ok(body.includes('description="Details 2"'), 'built from the second read (their section name kept)');
+      t.eq([r.S.tab[EN], r.S.section[EN], r.S.cell[DE]], ['Overview', 'Details 2', 'Name DE']);
       await r.lang.restore();
       t.eq([r.S.ui, r.storage.getItem(MARK)], [FR, null]);
     }),
   );
 
   // ---- saver lanes (core/saver.ts) ----
-
-  /** Runs `fn` with a working localStorage (the saver's history journal). */
-  const withStorage = async (fn: () => Promise<void>) => {
-    const g = globalThis as { localStorage?: unknown };
-    const had = Object.getOwnPropertyDescriptor(g, 'localStorage');
-    Object.defineProperty(g, 'localStorage', { configurable: true, value: memStorage() });
-    try {
-      await fn();
-    } finally {
-      if (had) Object.defineProperty(g, 'localStorage', had);
-      else delete g.localStorage;
-    }
-  };
 
   /**
    * A saver over fake writers that log "+key" / "-key" around their work and count how many run at once per
@@ -1682,7 +2269,7 @@ export function register(t: Kit): void {
     const results: string[] = [];
     const save = (publish = true) =>
       saver.save(store.changes(), { signal: new AbortController().signal, publish, onProgress: (p) => progress.push(p.done), onResult: (x) => results.push(`${x.change.slot.key}:${x.outcome}`) });
-    return { ev, most, st, add, save, progress, results, at: (e: string) => ev.indexOf(e) };
+    return { ev, most, st, store, add, save, progress, results, at: (e: string) => ev.indexOf(e) };
   }
 
   t.test('lang: saver runs form XML alongside metadata, metadata one at a time, no metadata or record write in a switch window (LIVE-FINDINGS 62), one publish after every write', () =>
@@ -1715,6 +2302,31 @@ export function register(t: Kit): void {
       t.eq([rep.saved, rep.published], [6, true]);
       t.eq(x.results.sort(), ['cell:saved', 'colA:saved', 'colB:saved', 'fname:saved', 'opt:saved', 'vname:saved'], 'one result per change');
       t.eq(x.progress.at(-1), 6, 'progress counts every change');
+    }),
+  );
+
+  t.test("lang: a form posting a cell of a column the same save renames as read (a footer cell, a quick view control, a form whose fields aren't loaded) waits for the metadata lane; a main form whose cells of it are body and header cells goes on beside it", () =>
+    withStorage(async () => {
+      const COL = 'attribute|e.name|DisplayName';
+      /** A save of the name column's English name and of a tab label of the form, its field slots `cells` loaded: whether the form waited for the rename. */
+      const waited = async (cells: Array<Record<string, unknown>>) => {
+        const x = saverRig(rig(), [
+          [['attribute'], 'metadata', 15],
+          [['field', 'tab'], 'xml', 5, 'form'],
+        ]);
+        x.store.add(cells.map((ref, i) => ({ ...t.slot('field', `field|${FORM}|c${i}|Label`), group: 'formxml|' + FORM, baseRequired: false, ref: { formId: FORM, ...ref } }) as Slot));
+        x.store.add([{ ...t.slot('attribute', COL), prop: 'DisplayName' } as Slot]);
+        x.store.set(COL, EN, 'Full name');
+        x.add('tab', 'tab', 'formxml|' + FORM, { formId: FORM });
+        await x.save(false);
+        return x.at('+tab') > x.at('-' + COL);
+      };
+      const name = { datafield: 'name', controlId: 'name' };
+      t.eq(await waited([{ ...name, area: 'footer' }]), true, 'a footer cell of the column');
+      t.eq(await waited([{ datafield: 'name', controlId: 'parent_name', classid: '{5C5600E0-1D6E-4205-A272-BE80DA87FD42}' }]), true, 'a quick view control on it');
+      t.eq(await waited([]), true, "a form whose fields aren't loaded");
+      t.eq(await waited([{ ...name, sparse: true }, { datafield: 'name', controlId: 'header_name', sparse: true }]), false, 'body and header cells of it: beside it');
+      t.eq(await waited([{ datafield: 'phone', controlId: 'phone', area: 'footer' }]), false, 'a footer cell of another column: beside it');
     }),
   );
 

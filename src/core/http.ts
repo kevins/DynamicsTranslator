@@ -119,14 +119,15 @@ export const isAbort = (e: unknown) => e instanceof DOMException && e.name === '
 
 /**
  * Dataverse turned the request away without running it: throttled (429, 503) or another customization holds the
- * org-wide lock (0x80071151, finding 4). A write that got this is safe to try again, from a fresh read. A write answered
+ * org-wide lock (0x80071151, finding 4), or its database rolled the request back as a deadlock's victim (SQL error
+ * 1205, "Rerun the transaction"). A write that got this is safe to try again, from a fresh read. A write answered
  * 503 as a whole without Retry-After is not turned away: a 503 alone says nothing of what ran (a gateway gives up with
  * it while Dataverse goes on: a POST that hung ~2 min, LIVE-FINDINGS 71), so it may have run (mayHaveRun). A read's 503
  * changed nothing, and a part's is Dataverse's own answer for that part: both still are.
  */
 export const turnedAway = (e: unknown): boolean =>
   e instanceof DvError &&
-  (e.status === 429 || (e.status === 503 && (!e.write || e.retryAfter > 0)) || /cannot start another|0x80071151|customizationlock|another \[/i.test(`${e.message} ${e.code}`));
+  (e.status === 429 || (e.status === 503 && (!e.write || e.retryAfter > 0)) || /cannot start another|0x80071151|customizationlock|another \[|was deadlocked on lock resources/i.test(`${e.message} ${e.code}`));
 
 /**
  * A write that failed may still have run: its answer was lost (network failure, gateway or server error, a 503 that

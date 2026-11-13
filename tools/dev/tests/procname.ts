@@ -1,7 +1,8 @@
 // The process update after a process name is saved (src/core/publish.ts rebuildProcess, LIVE-FINDINGS 83): a PATCH of
 // workflow.name with the base-language name, inside a base-language window, in one $batch between two reads of the name.
 // A base-language name someone else saved between the read the PATCH is built from and the PATCH is seen in the batch's
-// first read and put back; never silently replaced. A process from a managed solution is never updated.
+// first read and put back; never silently replaced. A process from a managed solution is updated only where this session
+// allows changes to managed labels (Ctx.managedEdits).
 // register() is called by tools/dev/unit.ts.
 import { DvError } from '../../../src/core/http';
 import { MANAGED, type Lcid } from '../../../src/core/model';
@@ -31,15 +32,20 @@ function rig(name: Record<number, string>) {
     fail: [] as number[],
     reads: new Map<number, Record<number, string> | number>(),
     n: 0,
-    /** What the process's ismanaged reads as (asked once before anything else; not in the log): a boolean, or a status that read fails with. */
-    managed: false as boolean | number,
+    /**
+     * What the process's ismanaged reads as (asked once before anything else; not in the log): a boolean, a status that
+     * read fails with, null for an answer without it, or a string (not a boolean).
+     */
+    managed: false as boolean | number | null | string,
+    /** Changes to labels from managed solutions are allowed (Ctx.managedEdits). */
+    edits: false,
   };
   const http: Record<string, any> = {
     fn: (fn: string, p: { EntityMoniker: { '@odata.id': string }; AttributeName: string }) => `${fn}(${p.EntityMoniker['@odata.id']},${p.AttributeName})`,
     get: async (u: string, o: { headers?: Record<string, string> } = {}) => {
       if (u === `workflows(${WF})?$select=ismanaged`) {
         if (typeof st.managed === 'number') throw new DvError('The read failed.', st.managed);
-        return { ismanaged: st.managed };
+        return st.managed === null ? {} : { ismanaged: st.managed };
       }
       st.log.push(`read${o.headers?.Consistency === 'Strong' ? '' : ' (not strong)'}`);
       if (u !== `RetrieveLocLabels(workflows(${WF}),name)`) throw new DvError('Resource not found for the segment.', 404);
@@ -80,7 +86,7 @@ function rig(name: Record<number, string>) {
       }
     },
   };
-  return Object.assign(st, { update: (olds?: string[]) => rebuildProcess(ctx as never, lang, WF, 'Processus test', undefined, olds) });
+  return Object.assign(st, { update: (olds?: string[]) => rebuildProcess({ ...ctx, managedEdits: st.edits } as never, lang, WF, 'Processus test', undefined, olds) });
 }
 
 export function register(t: Kit): void {
@@ -223,5 +229,25 @@ export function register(t: Kit): void {
     const err2 = await b.update().then(() => null, (e: unknown) => e);
     t.ok(err2 instanceof DvError && err2.status === 503, String(err2));
     t.eq(b.log, []);
+  });
+
+  t.test('process update where this session allows changes to managed labels (Ctx.managedEdits): a process read as from a managed solution, or not, is updated like any other (one batch in a base-language window, no other language changed, the UI language back); one whose ismanaged was not read never is', async () => {
+    for (const managed of [true, false]) {
+      const r = rig({ [EN]: 'bpf test', [FR]: 'Processus test' });
+      r.managed = managed;
+      r.edits = true;
+      t.eq(await r.update(), '', `ismanaged ${managed}`);
+      t.eq(r.log, ['[1033', 'read', 'batch', 'read', 'patch "bpf test" in 1033 once', 'read', ']'], `ismanaged ${managed}`);
+      t.eq([r.name, r.ui], [{ [EN]: 'bpf test', [FR]: 'Processus test' }, FR], `ismanaged ${managed}`);
+    }
+    for (const [managed, edits] of [[null, true], [null, false], ['true', true], [503, true]] as const) {
+      const r = rig({ [EN]: 'bpf test', [FR]: 'Processus test' });
+      r.managed = managed;
+      r.edits = edits;
+      const err = await r.update().then(() => null, (e: unknown) => e);
+      const want = managed === 503 ? err instanceof DvError && err.status === 503 : err instanceof DvError && err.code === 'unread';
+      t.ok(want, `ismanaged ${managed}, allowed ${edits}: ${String(err)}`);
+      t.eq([r.log, r.name], [[], { [EN]: 'bpf test', [FR]: 'Processus test' }], `ismanaged ${managed}, allowed ${edits}: nothing read, no window, no PATCH`);
+    }
   });
 }

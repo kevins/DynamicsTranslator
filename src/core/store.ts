@@ -1,7 +1,7 @@
 // Central state: loaded slots, pending edits (with undo/redo), per-cell save status.
 // Views subscribe with `store.on(fn)` and re-render what changed.
 
-import { isManaged, keepsEmpty, MANAGED, notLoaded, savesEmpty, standIn, type Change, type ChangeResult, type Labels, type Lcid, type Outcome, type Slot, type StandIn } from './model';
+import { fillsIn, follows, isManaged, keepsEmpty, MANAGED, managedHeld, managedReadOnly, notLoaded, savesEmpty, standIn, type Change, type ChangeResult, type Labels, type Lcid, type Outcome, type Slot, type StandIn } from './model';
 
 export type StoreEvent =
   | { type: 'slots' } // slots added, removed or refreshed
@@ -49,6 +49,8 @@ export class Store {
   readonly edits = new Map<string, Map<Lcid, string>>();
   readonly status = new Map<string, CellStatus>();
   busy = false;
+  /** Changes to labels from managed solutions are allowed (Ctx.managedEdits, setManagedEdits). */
+  managedEdits = false;
   /**
    * Base of each pending edit (`key#lcid`): the server text the user was looking at when they made it. It is
    * the edit's Change.before and survives slot refreshes, so a reload that brings another maker's newer text
@@ -87,6 +89,24 @@ export class Store {
   }
 
   /**
+   * Changes to labels from managed solutions allowed or not (Ctx.managedEdits): every such label its loader set up for it
+   * (model.ts managedSlot) becomes read-only, or not, as that says, a new slot object each (views redraw it); one 'slots'
+   * event. Staged edits stay: one on a label read-only again is refused at publish, with its reason.
+   */
+  setManagedEdits(on: boolean): void {
+    this.managedEdits = on;
+    let any = false;
+    for (const s of [...this.slots.values()]) {
+      if (!isManaged(s) || typeof s.ref?.held !== 'string') continue;
+      const ro = managedReadOnly(s, on);
+      if (s.readOnly === ro) continue;
+      this.slots.set(s.key, { ...s, readOnly: ro });
+      any = true;
+    }
+    if (any) this.emit({ type: 'slots' });
+  }
+
+  /**
    * A tick of the store's clock, taken by a load as it starts and given to add() with what it read (`since`): a text the
    * store gets after it (another load's that started later, a save's) is newer than that read.
    */
@@ -109,9 +129,10 @@ export class Store {
   add(slots: Slot[], since?: number): void {
     const t = since ?? this.tick();
     for (let s of slots) {
-      // A label from a managed solution is read-only, with the same reason everywhere, whatever its loader said (they say
-      // so already): every view then shows it read-only and nothing stages it.
-      if (!s.readOnly && isManaged(s)) s.readOnly = MANAGED;
+      // A label from a managed solution is read-only, with the same reason everywhere (they say so already), unless this
+      // session allows changes to managed labels and its loader set it up for that (model.ts managedSlot): every view then
+      // shows it as it is, and nothing stages one that is read-only.
+      if (isManaged(s)) s.readOnly = typeof s.ref?.held === 'string' ? managedReadOnly(s, this.managedEdits) : s.readOnly || MANAGED;
       const old = this.slots.get(s.key);
       if (old) {
         let newer: Labels | null = null;
@@ -164,6 +185,15 @@ export class Store {
     return b === null ? '' : (b ?? this.original(key, lcid));
   }
   /**
+   * before() as it is kept: null where the edit was made on no label at all (bases, Change.beforeMissing); without a
+   * pending edit, the base a new one gets now. A copy of it (the popup's Undo, the Workbench's editor) given back to set()
+   * keeps that, never the '' a reload may have stored there since.
+   */
+  base(key: string, lcid: Lcid): string | null {
+    const b = this.isEdited(key, lcid) ? this.bases.get(cell(key, lcid)) : undefined;
+    return b === undefined ? this.baseOf(key, lcid) : b;
+  }
+  /**
    * A pending edit whose server text changed since it was made (a reload brought other text): saving it is a conflict.
    * So is one made where its language had no label at all that now has one stored empty (bases: null).
    */
@@ -212,8 +242,45 @@ export class Store {
    */
   standIn(key: string, lcid: Lcid, base: Lcid): StandIn | undefined {
     const s = this.slots.get(key);
-    if (!s || !this.isEdited(key, lcid) || s.readOnly || isManaged(s)) return undefined;
+    if (!s || !this.isEdited(key, lcid) || s.readOnly || managedHeld(s, this.managedEdits)) return undefined;
     return standIn(s, lcid, base, this.original(key, lcid), this.value(key, lcid), (k, l) => this.text(k, l));
+  }
+
+  /**
+   * Whether a main form's field label follows its column in `lcid` as loaded (model.ts follows), whatever is typed there:
+   * the popup and the editor card show it empty while nothing is (isEdited), and an input emptied again there stages
+   * nothing (ui/editor.ts typedText). With `user`, the user's language: as it is shown, a language not known yet taking
+   * the user's answer, which the inputs stage by too.
+   */
+  follows(key: string, lcid: Lcid, base: Lcid, user?: Lcid): boolean {
+    const s = this.slots.get(key);
+    return !!s && follows(s, lcid, base, this.original(key, lcid), (k, l) => this.text(k, l, true), user);
+  }
+
+  /**
+   * Whether a main form's field label in `lcid` as loaded is the text a read fills in there (model.ts fillsIn), so that
+   * only GetClientMetadata tells whether it follows its column: the read behind the page's loads asks for a language only
+   * where some label is so (inspector/pageload.ts).
+   */
+  fillsIn(key: string, lcid: Lcid, base: Lcid): boolean {
+    const s = this.slots.get(key);
+    return !!s && fillsIn(s, lcid, base, this.original(key, lcid), (k, l) => this.text(k, l, true));
+  }
+
+  /**
+   * Sets, per slot key and language, whether a main form's field label has a text of its own there (`ref.own`, model.ts
+   * follows), as the read behind the page's loads tells it (inspector/pageload.ts). Each such slot is a new copy, so the
+   * views showing it render it again: an open popup then shows a label that follows empty.
+   */
+  setOwn(own: ReadonlyMap<string, Record<number, boolean>>): void {
+    let any = false;
+    for (const [key, o] of own) {
+      const s = this.slots.get(key);
+      if (!s) continue;
+      this.slots.set(key, { ...s, ref: { ...s.ref, own: { ...s.ref?.own, ...o } } });
+      any = true;
+    }
+    if (any) this.emit({ type: 'slots' });
   }
 
   /**
@@ -230,15 +297,15 @@ export class Store {
   /**
    * Sets a pending value. Setting it back to the server value removes the edit (and its base). A new edit
    * is measured against the server value now, or `base` when given (the server text it was really made
-   * on, e.g. a restored snapshot); an edit typed again keeps its first base. While a reload has moved the
-   * server text under an edit, typing the base text back keeps the edit pending on purpose: a cell typed
-   * through it ("Nom2" → "Nom" → "Nom3") must not lose its base, and saving it is a conflict that shows
-   * the user the other text.
+   * on, e.g. a restored snapshot; null: no label there at all, as base() gives it); an edit typed again keeps
+   * its first base. While a reload has moved the server text under an edit, typing the base text back keeps
+   * the edit pending on purpose: a cell typed through it ("Nom2" → "Nom" → "Nom3") must not lose its base,
+   * and saving it is a conflict that shows the user the other text.
    */
-  set(key: string, lcid: Lcid, text: string, base?: string): void {
+  set(key: string, lcid: Lcid, text: string, base?: string | null): void {
     const slot = this.slots.get(key);
     // Nothing is staged on a read-only label, nor on one from a managed solution that slipped through as editable.
-    if (!slot || slot.readOnly || isManaged(slot)) return;
+    if (!slot || slot.readOnly || managedHeld(slot, this.managedEdits)) return;
     const prev = this.edits.get(key)?.get(lcid);
     const server = slot.labels[lcid] ?? '';
     const next = text === server ? undefined : text;
@@ -395,6 +462,14 @@ export class Store {
         // and the one the change carries so views still holding it agree.
         const slot = this.slots.get(key);
         for (const s of new Set([slot, r.change.slot])) if (s) setServer(s, lcid, now);
+        // What is known of a main form field label of its own there (`ref.own`, model.ts follows) goes with the text it had:
+        // a text written there may be stored as the label's own or not (LIVE-FINDINGS 104), so nothing is known of it then.
+        for (const s of new Set([slot, r.change.slot]))
+          if (s?.ref?.own && lcid in s.ref.own) {
+            const own: Record<number, boolean> = { ...s.ref.own };
+            delete own[lcid];
+            s.ref = { ...s.ref, own };
+          }
         this.cellAt.set(k, this.tick()); // newer than any load still running: its answer never puts the old text back
         if (cur === undefined || held || cur === now) {
           this.write(key, lcid, undefined);

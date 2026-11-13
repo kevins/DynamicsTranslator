@@ -56,8 +56,8 @@
   }
   // 3. Option label (French) and boolean.
   for (const [key, attr, value] of [
-    [`option|${E}.new_priority|100000001`, 'new_priority', 100000001],
-    [`boolean|${E}.new_approved|0`, 'new_approved', 0],
+    [`option|${E}.new_priority|100000001|Label`, 'new_priority', 100000001],
+    [`boolean|${E}.new_approved|0|Label`, 'new_approved', 0],
   ]) {
     const cast = attr === 'new_approved' ? 'BooleanAttributeMetadata?$select=LogicalName&$expand=OptionSet($select=TrueOption,FalseOption)' : 'PicklistAttributeMetadata?$select=LogicalName&$expand=OptionSet($select=Options)';
     const read = async () => {
@@ -72,20 +72,41 @@
     ok(`${key} en untouched`, a[1033] === b[1033], { b, a });
     await editSave(key, 1036, b[1036] || '');
   }
-  // 4. Conflict: change the server value behind the translator's back.
+  // 4. Conflict: change the server value behind the translator's back, every language as read (the base language too:
+  // a label PUT without it writes the French text there, LIVE-FINDINGS 2); then put the description back exactly as
+  // read. Only one with a French and a base-language text (an empty one counts) can be: the write adds a language it has
+  // none in, and a metadata translation can't be removed again (LIVE-FINDINGS 31).
   {
     const key = `attribute|${E}.new_name|Description`;
-    const slot = store.get(key);
-    store.set(key, 1036, 'Mine');
-    await fetch(api + `EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'MSCRM.MergeLabels': 'true' },
-      body: JSON.stringify({ '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata', LogicalName: 'new_name', Description: { LocalizedLabels: [{ Label: slot.labels[1033] || 'Primary name', LanguageCode: 1033 }, { Label: 'Theirs', LanguageCode: 1036 }] } }),
-    });
-    const rep = await app.saver.save(store.changes((s) => s.key === key), opts());
-    const a = labelsOf((await get(`EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')?$select=Description`)).Description);
-    ok('conflict detected', rep.conflicts === 1 && a[1036] === 'Theirs', { rep, a });
-    store.resolve(key, 1036, false);
+    const url = `EntityDefinitions(LogicalName='${E}')/Attributes(LogicalName='new_name')`;
+    const read = async () => labelsOf((await get(`${url}?$select=Description`)).Description);
+    const put = async (labels) => {
+      const r = await fetch(api + url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'MSCRM.MergeLabels': 'true' },
+        body: JSON.stringify({ '@odata.type': 'Microsoft.Dynamics.CRM.StringAttributeMetadata', LogicalName: 'new_name', Description: { LocalizedLabels: Object.entries(labels).map(([l, t]) => ({ Label: t, LanguageCode: +l })) } }),
+      });
+      if (!r.ok) throw new Error(`${r.status} PUT ${url}: ${(await r.text()).slice(0, 200)}`);
+    };
+    const exact = (x) => JSON.stringify(Object.entries(x).sort());
+    const b = await read();
+    if (!(1036 in b) || !(ctx.base in b)) ok('conflict check: new_name has a French and a base-language description', false, { b, why: "the check's write would add the missing one, which can't be removed" });
+    else {
+      const theirs = 'Theirs ' + Date.now().toString(36);
+      store.set(key, 1036, 'Mine');
+      try {
+        await put({ ...b, 1036: theirs });
+        const rep = await app.saver.save(store.changes((s) => s.key === key), opts());
+        const a = await read();
+        ok('conflict detected', rep.conflicts === 1 && a[1036] === theirs, { rep, a });
+      } finally {
+        store.resolve(key, 1036, false);
+        store.revert(key, 1036);
+        if (exact(await read().catch(() => ({ unread: true }))) !== exact(b)) await put(b);
+        const back = await read();
+        ok('conflict description restored exactly', exact(back) === exact(b), { b, back });
+      }
+    }
   }
   return log;
 })();

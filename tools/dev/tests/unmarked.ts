@@ -4,12 +4,11 @@
 // (messages, statuses, counts, placeholders), which stay unmarked. A fake DOM (fakedom.ts) and a fake form API.
 import { MANAGED, type Slot } from '../../../src/core/model';
 import { Store } from '../../../src/core/store';
-import { BUILTIN_NOTE, describe, TIMELINE_LABEL_NOTE, TIMELINE_NAME_NOTE, TIMELINE_NOTE } from '../../../src/inspector/describe';
+import { BUILTIN_NOTE, describe, TIMELINE_NAME_NOTE, TIMELINE_NOTE } from '../../../src/inspector/describe';
 import { PageLoader, WANT_FORM, WANT_FORM_NAME, WANT_NAMES, WANT_TABLE, WANT_VIEW_NAME } from '../../../src/inspector/pageload';
 import { buildIndex, isBuiltin, isHeading, Scanner } from '../../../src/inspector/scan';
 import { look } from '../../../src/inspector/status';
 import type { Anchor } from '../../../src/inspector/types';
-import { placeholderOf } from '../../../src/ui/callout';
 import type { AppApi } from '../../../src/ui/types';
 import { El, withDom } from './fakedom';
 import type { Kit } from './kit';
@@ -244,7 +243,7 @@ export function register(t: Kit): void {
     ok(away.want.includes(WANT_FORM + OTHER), JSON.stringify(away.want));
   });
 
-  test("timeline: its heading is Dynamics' own text whatever its form cell's label says, found by the control id in the title's id: that cell's mark, grey, under a key of Microsoft's text; its popup offers the label, saved on the form but not shown (LIVE-FINDINGS 101)", () => {
+  test("timeline: its heading is Dynamics' own text whatever its form cell's label says, found by the control id in the title's id: that cell's mark, grey, under a key of Microsoft's text; its popup says which heading it is, with no input for the label, saved on the form but never shown (LIVE-FINDINGS 101)", () => {
     const title = (id = 'action_bar_header_titlenotescontrol', ...texts: string[]) => new El('h3', { id }).add(...(texts.length ? texts : ['Chronologie']).map((x) => new El('span', {}, x)));
     const wrapped = (h: El, f = FORM) => new El('body').add(section('timeline', new El('div', { 'data-id': 'notescontrol-FieldSectionItemContainer', id: `id-${f}-9-notescontrol-FieldSectionItemContainer` }).add(h)));
     const slots = [...form, timeline, ...columns];
@@ -288,23 +287,25 @@ export function register(t: Kit): void {
     eq(scan(wrapped(title('action_bar_header_titlename', 'Nom du compte')), slots).list, [], "a column's control: its label is its container's");
     eq(scan(wrapped(title('action_bar_header_titlenothing')), slots).list, [], 'no cell of that id');
 
-    // The heading's popup: Dynamics' text and why, then the timeline's label of its form with where it applies.
+    // The heading's popup: Dynamics' text and why, and no input: the timeline's label of its form is never shown (the
+    // Workbench translates it).
     const app = mkApp(slots);
     const m = describe(app, r.anchors[0].comp, r.anchors[0]);
-    eq([m.kind, m.title, m.icon, m.note, m.readOnly, m.blocks.map((b) => [b.key, b.heading, b.note, b.hidden])], ['Timeline', 'Chronologie', 'info', TIMELINE_NOTE, undefined, [[timeline.key, 'Form label', TIMELINE_LABEL_NOTE, true]]]);
+    eq([m.kind, m.title, m.icon, m.note, m.readOnly, m.blocks], ['Timeline', 'Chronologie', 'info', TIMELINE_NOTE, undefined, []]);
     // A timeline with a Name from the form designer shows that Name, one text for every language: the popup says so.
     const named = { ...timeline, ref: { ...timeline.ref, uniqueName: 'Timelines' } };
     const nm = describe(mkApp([...form, named, ...columns]), named.comp, { ...r.anchors[0], text: { nodeValue: 'Timelines' } as unknown as Text });
-    eq([nm.title, nm.note, nm.blocks.map((b) => b.key)], ['Timelines', TIMELINE_NAME_NOTE, [timeline.key]]);
-    // Its empty French input says it has none, not what shows in its place (nothing shows it).
-    eq(placeholderOf(app.store, { ...timeline, labels: L('Note Text', '') }, FR, EN, 'Form label', 'French', '', true), 'No French form label');
-    // A managed form's timeline: its label read-only, the reason said.
+    eq([nm.title, nm.note, nm.blocks], ['Timelines', TIMELINE_NAME_NOTE, []]);
+    // A managed form's timeline: the same, nothing to lock.
     const locked = { ...timeline, readOnly: MANAGED };
     const lm = describe(mkApp([...form, locked, ...columns]), r.anchors[0].comp, r.anchors[0]);
-    eq([lm.blocks.length, lm.readOnly], [1, MANAGED.trim().replace(/[.\s]+$/, '')]);
-    // The cell's own popup, from the list where its heading isn't on the page: the same block, no word of a heading.
+    eq([lm.note, lm.blocks, lm.readOnly], [TIMELINE_NOTE, [], undefined]);
+    // The cell's own popup, from the list where its heading isn't on the page: no input, no word of a heading.
     const c = describe(app, timeline.comp);
-    eq([c.kind, c.note, c.blocks.map((b) => [b.key, b.heading, b.note])], ['Timeline', undefined, [[timeline.key, 'Form label', TIMELINE_LABEL_NOTE]]]);
+    eq([c.kind, c.note, c.blocks], ['Timeline', undefined, []]);
+    // Its row in the page's list has its heading's look, never "Not translated": a label without French ("Note Text")
+    // is one the page can't edit.
+    eq(look(mkApp([...form, { ...timeline, labels: { [EN]: 'Note Text' } }, ...columns]), timeline.comp), 'builtin');
   });
 
   test('Form assist is built-in Microsoft text; a click only opens its popup', async () => {

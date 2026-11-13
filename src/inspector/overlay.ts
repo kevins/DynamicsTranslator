@@ -25,7 +25,7 @@
 import { h } from '../ui/dom';
 import { ITEM, LIST, OPENER } from './lists';
 import css from './overlay.css';
-import type { Anchor, Look, OverlayApi, OverlayHooks, Part, Pill, Role } from './types';
+import type { Anchor, Look, OverlayApi, OverlayHooks, Part, Pill, Role, SelectionLook } from './types';
 
 /** [left, top, width, height] in viewport pixels. */
 export type Box = [number, number, number, number];
@@ -445,6 +445,39 @@ const cut = (c: Clip, r: Clip): void => {
 const meets = (a: Box, b: Box): boolean => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
 /** Whether a point is in a box. */
 const within = (b: Box, p: { x: number; y: number }): boolean => p.x >= b[0] && p.x < b[0] + b[2] && p.y >= b[1] && p.y < b[1] + b[3];
+
+/** A mark of a label lies at least partly in the box (both in viewport px): a box dragged over the page covers it. */
+export const overlaps = (b: Box, marks: readonly Box[]): boolean => marks.some((m) => m[0] < b[0] + b[2] && m[0] + m[2] > b[0] && m[1] < b[1] + b[3] && m[1] + m[3] > b[1]);
+
+/** How far (px, either way) a press must move before it draws a selection box: less is a click. */
+export const BOX_MIN = 6;
+
+/** A press while selecting (Overlay.sel), which draws a box once it moves: the press (x0, y0) and the pointer now, in viewport px. */
+interface Sel {
+  id: number;
+  x0: number;
+  y0: number;
+  x: number;
+  y: number;
+  /** Moved far enough to draw (BOX_MIN): from then on the gesture is the box's. */
+  on: boolean;
+  /** Let go or cancelled: its release's mouseup and click are still the box's, until the next press. */
+  done: boolean;
+}
+
+/**
+ * The press is on a scrollbar of the element it is on: past that element's client area (which leaves its scrollbars out),
+ * by its offset from it. A box never starts there: the scrollbar is dragged.
+ */
+export function onScrollbar(e: Pick<MouseEvent, 'target' | 'offsetX' | 'offsetY'>): boolean {
+  const el = e.target as Element | null;
+  const w = el?.clientWidth ?? 0;
+  const h = el?.clientHeight ?? 0;
+  return (w > 0 && e.offsetX >= w) || (h > 0 && e.offsetY >= h);
+}
+
+/** The box between the press and the pointer. */
+export const dragBox =(s: Pick<Sel, 'x0' | 'y0' | 'x' | 'y'>): Box => [Math.min(s.x0, s.x), Math.min(s.y0, s.y), Math.abs(s.x - s.x0), Math.abs(s.y - s.y0)];
 /** A box grown by `d` px on every side. */
 const grow = (b: Box, d: number): Box => [b[0] - d, b[1] - d, b[2] + 2 * d, b[3] + 2 * d];
 /** Whether a point is on one of a label's marks, or within SLOP px of one. */
@@ -579,12 +612,22 @@ export class Overlay implements OverlayApi {
   private removed = false;
   private timer = 0;
   private tick = 0;
+  /** Selecting labels for an export (selection()); null when not. */
+  private sx: SelectionLook | null = null;
+  /** A press while selecting, which draws a box once it moves (boxing); null when none. */
+  private sel: Sel | null = null;
+  /** The labels the box being drawn covers this frame: they show as selected until it is let go. */
+  private boxed = new Set<Anchor>();
+  private lasso = h('i', { class: 'lasso', hidden: true });
+  /** The page's own user-select on <html> while a box is drawn (no text gets selected meanwhile); null when none is. */
+  private us: string | null = null;
+  private selT = 0;
 
   constructor(private readonly o: OverlayHooks) {
     // Just below the translator's own layer (2147483646) so the bar, callouts and menus stay on top, and
     // above every Dynamics layer.
     this.host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483645;pointer-events:none;contain:strict';
-    this.wrap.append(this.layer, this.pillLayer, this.tip);
+    this.wrap.append(this.layer, this.pillLayer, this.tip, this.lasso);
     this.host.attachShadow({ mode: 'open' }).append(h('style', null, css), this.wrap);
   }
 
@@ -646,6 +689,7 @@ export class Overlay implements OverlayApi {
     this.onPill = null;
     this.pens = [];
     this.pt = null;
+    this.endBox();
     removeEventListener('keydown', this.onKey, true);
     removeEventListener('keyup', this.onKeyUp, true);
     removeEventListener('blur', this.reset);
@@ -826,6 +870,7 @@ export class Overlay implements OverlayApi {
       clearTimeout(this.plT);
       this.pl = null;
       this.pens = []; // hidden with the layer: none is pointed at on resume
+      this.endBox();
     }
     this.paused = on;
     this.gs.g = this.gs.end = undefined;
@@ -841,6 +886,141 @@ export class Overlay implements OverlayApi {
   invalidate(n = 2): void {
     if (n > this.settle) this.settle = n;
     if (!this.raf && this.live()) this.raf = requestAnimationFrame(this.frame);
+  }
+
+  selection(s: SelectionLook | null): void {
+    if (!s) this.endBox();
+    this.sx = s;
+    this.wrap.classList.toggle('is-sel', !!s);
+    this.invalidate(1);
+  }
+
+  // ---- selection box ----
+
+  /**
+   * While selecting: a press anywhere but our own UI (the primary button, without Alt, not a finger, which scrolls) may
+   * draw a box. It shows once the pointer has moved BOX_MIN px, and from then on the gesture is the box's: neither the
+   * page nor a label gets its release or click. Let go, it selects the labels it covers (OverlayHooks.boxed). A press
+   * that doesn't move is a click as always, and one on a scrollbar scrolls. True when the event was the box's.
+   */
+  private boxing(m: MouseEvent, t: string, mine: boolean): boolean {
+    if (t === 'pointerdown') {
+      this.endBox();
+      const p = m as PointerEvent;
+      if (p.button !== 0 || p.altKey || mine || p.pointerType === 'touch' || onScrollbar(p)) return false;
+      this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, on: false, done: false };
+      addEventListener('pointermove', this.onBoxMove, true);
+      addEventListener('pointercancel', this.onBoxCancel, true);
+      addEventListener('dragstart', this.onBoxDrag, true);
+      addEventListener('selectstart', this.onBoxText, true);
+      return false;
+    }
+    const s = this.sel;
+    if (!s) return false;
+    if (!s.on) {
+      if (t === 'pointerup') this.endBox(); // a click
+      return false;
+    }
+    m.preventDefault();
+    m.stopImmediatePropagation();
+    if (t === 'pointerup' && !s.done) this.letGo(true);
+    return true;
+  }
+
+  private onBoxMove = (e: PointerEvent): void => {
+    const s = this.sel;
+    if (!s || s.done || e.pointerId !== s.id) return;
+    // Released where no pointerup reached the page (outside the window): a drawn box selects as if let go here.
+    if (!(e.buttons & 1)) return s.on ? this.letGo(true) : this.endBox();
+    s.x = e.clientX;
+    s.y = e.clientY;
+    if (!s.on) {
+      if (Math.abs(s.x - s.x0) < BOX_MIN && Math.abs(s.y - s.y0) < BOX_MIN) return;
+      s.on = true;
+      this.noText(true);
+    }
+    this.invalidate(1);
+  };
+
+  private onBoxCancel = (e: PointerEvent): void => {
+    if (this.sel && e.pointerId === this.sel.id) this.endBox();
+  };
+
+  /** A press while selecting never drags a link or an image of the page: the box goes on instead. */
+  private onBoxDrag = (e: Event): void => {
+    if (this.sel && !this.sel.done) e.preventDefault();
+  };
+
+  /** Nor does it select the page's text. */
+  private onBoxText = (e: Event): void => {
+    if (this.sel && !this.sel.done && !this.ours(e.composedPath())) e.preventDefault();
+  };
+
+  /**
+   * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go. Its release's mouseup and
+   * click are still the box's (boxing), until the next press or a moment later.
+   */
+  private letGo(take: boolean): void {
+    const s = this.sel;
+    if (!s || s.done) return;
+    s.done = true;
+    const got = take && s.on ? this.covered(s) : [];
+    this.boxed.clear();
+    this.noText(false);
+    removeEventListener('pointermove', this.onBoxMove, true);
+    clearTimeout(this.selT);
+    this.selT = window.setTimeout(() => this.sel === s && this.endBox(), 100);
+    this.invalidate(1);
+    if (got.length)
+      try {
+        this.o.boxed?.(got);
+      } catch (e) {
+        if (__DEV__) console.error('[translator] box', e);
+      }
+  }
+
+  /** Forgets the press and its box, if any. */
+  private endBox(): void {
+    clearTimeout(this.selT);
+    if (!this.sel) return;
+    this.sel = null;
+    this.boxed.clear();
+    this.noText(false);
+    removeEventListener('pointermove', this.onBoxMove, true);
+    removeEventListener('pointercancel', this.onBoxCancel, true);
+    removeEventListener('dragstart', this.onBoxDrag, true);
+    removeEventListener('selectstart', this.onBoxText, true);
+    this.invalidate(1);
+  }
+
+  /** The labels a box covers that can be selected, by their marks in the last frame. */
+  private covered(s: Sel): Anchor[] {
+    const sx = this.sx;
+    if (!sx) return [];
+    const b = dragBox(s);
+    const out: Anchor[] = [];
+    for (const r of this.recs.values()) if (!this.dead(r.a) && overlaps(b, r.boxes) && sx.can(r.a)) out.push(r.a);
+    return out;
+  }
+
+  /** While a box is drawn no text of the page gets selected (user-select on <html>, put back after). */
+  private noText(on: boolean): void {
+    if (on === (this.us !== null)) return;
+    try {
+      const st = document.documentElement.style;
+      if (on) {
+        this.us = st.getPropertyValue('user-select');
+        st.setProperty('user-select', 'none', 'important');
+        getSelection()?.removeAllRanges();
+      } else {
+        if (this.us) st.setProperty('user-select', this.us);
+        else st.removeProperty('user-select');
+      }
+    } catch {
+      /* no style to set (the box still draws), or nothing selected */
+    }
+    if (!on) this.us = null;
+    else this.us ??= '';
   }
 
   // ---- events ----
@@ -960,6 +1140,7 @@ export class Overlay implements OverlayApi {
     const path = m.composedPath();
     const mine = this.ours(path);
     this.altFrom(m, mine);
+    if (this.sx && this.boxing(m, t, mine)) return;
     const d = decide(this.gs, t, mine ? null : this.here(m, path, t), m.detail);
     // Our own hosts always get their events, even at the end of a gesture that started on a label.
     if (!d.swallow || mine) return;
@@ -1054,6 +1235,12 @@ export class Overlay implements OverlayApi {
 
   private onKey = (e: KeyboardEvent): void => {
     if (!this.live()) return;
+    // Escape while a selection box is drawn: it goes, selecting nothing.
+    if (e.key === 'Escape' && this.sel?.on && !this.sel.done) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return this.letGo(false);
+    }
     if (e.key === 'Alt') {
       if (!this.ours(e.composedPath())) this.setAlt(true);
       return;
@@ -1255,11 +1442,17 @@ export class Overlay implements OverlayApi {
     this.hover = this.under();
     // Where the pencil of a hovered or active label can go, read here: like a pill, never over a popup that doesn't hold
     // the label, except one the label itself floats over (an option of a dropdown opened from the header flyout).
+    // While selecting: selected labels, and those a box being drawn covers, show a check where the pencil goes.
+    const sx = this.sx;
+    const s = this.sel;
+    if (s?.on && !s.done) this.boxed = new Set(this.covered(s));
+    else if (this.boxed.size) this.boxed.clear();
+    const picked = (a: Anchor): boolean => !!sx && (this.boxed.has(a) || sx.has(a));
     const penOk = new Map<Rec, boolean>();
     const pens: Array<[Anchor, Box]> = [];
     for (const r of this.recs.values()) {
       const act = !!this.act && r.a.comp === this.act && (this.actA === undefined || r.a === this.actA);
-      if (r.a !== this.hover && !act) continue;
+      if (r.a !== this.hover && !act && !picked(r.a)) continue;
       const b = penAt(r);
       if (!b) continue;
       const ok = !top.length || !this.covers(r.a.zone ?? r.a.el, [b], top, pops, float, () => hits-- > 0).length;
@@ -1275,8 +1468,10 @@ export class Overlay implements OverlayApi {
       const act = live && !!this.act && r.a.comp === this.act && (this.actA === undefined || r.a === this.actA);
       const fl = live && !!this.fl && r.a.comp === this.fl;
       const pl = live && r.a === this.pl;
-      this.draw(r, `g is-${r.look || 'na'}${hv ? ' is-hv' : ''}${act ? ' is-act' : ''}${fl ? ' is-fl' : ''}${pl ? ' is-pl' : ''}`, hv || act, view, dpr, penOk.get(r) ?? false, after.get(r.a));
+      const pk = live && picked(r.a);
+      this.draw(r, `g is-${r.look || 'na'}${hv ? ' is-hv' : ''}${act ? ' is-act' : ''}${fl ? ' is-fl' : ''}${pl ? ' is-pl' : ''}${pk ? ' is-pk' : ''}`, hv || act || pk, view, dpr, penOk.get(r) ?? false, after.get(r.a));
     }
+    this.place(this.lasso, s?.on && !s.done ? dragBox(s) : null);
     for (const p of this.pills) this.drawPill(p);
     this.drawTip(view, dpr);
     for (const fn of this.subs)

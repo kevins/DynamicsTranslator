@@ -5,13 +5,14 @@
 // published row (LIVE-FINDINGS 22, 47) and the process PATCH refuses If-Match (29). So every write batch is
 // [probe, PATCH, read back], and a $batch runs its parts in order: the probe shows exactly the document the PATCH
 // replaced. When that is not the document the edit was built on, someone saved in between and the PATCH erased their
-// change. The writer then builds its own label/language pairs again on the probe's document and writes that from a new
-// read, which must still show its own PATCH (otherwise someone saved after it too, and nothing more is written). A pair
-// they changed as well keeps their text and comes back as a conflict. Only a read-back showing their document again,
-// with the edits on it, is "saved"; anything less is said. A probe that could not be read gives "Saved, but … can't be
-// ruled out" at most, and so does one older than the read (a lower versionnumber: a read that lags, LIVE-FINDINGS 66),
-// which written back would undo the saves it lags behind. No read can show a save landing between the probe and the
-// PATCH inside the same batch.
+// change. The writer then builds its own label/language pairs again on the probe's document (a form posts the clashed
+// pairs as the probe has them too: it posts nothing it doesn't change) and writes that from a new read, which must still
+// show its own PATCH (otherwise someone saved after it too, and nothing more is written). A pair they changed as well
+// keeps their text and comes back as a conflict. Only a read-back showing their document again, with the edits on it,
+// is "saved"; anything less is said. A probe that could not be read gives "Saved, but … can't be ruled out" at most,
+// and so does one older than the read (a lower versionnumber: a read that lags, LIVE-FINDINGS 66), which written back
+// would undo the saves it lags behind. No read can show a save landing between the probe and the PATCH inside the same
+// batch.
 
 import { DvError, pause, turnedAway } from '../core/http';
 import type { Change, ChangeResult } from '../core/model';
@@ -41,8 +42,12 @@ export interface DocOps<D, B> {
   dropped(c: Change): string;
   /** A fresh read (never cancelled: a repair always finishes); throws when it can't be read. */
   read(): Promise<D>;
-  /** `todo` built on `base`, only those label/language pairs (the writer's safety check runs; it throws). */
-  build(base: D, todo: Change[]): B;
+  /**
+   * `todo` built on `base`, only those label/language pairs (the writer's safety check runs; it throws); `theirs`: pairs
+   * someone else changed too, whose text `base` holds: a writer that posts only what changes (the form writer,
+   * LIVE-FINDINGS 104) posts them explicitly so their text goes back; one that posts the whole document has them already.
+   */
+  build(base: D, todo: Change[], theirs?: Change[]): B;
   /** One write batch [probe, PATCH, read back], with `fresh`'s etag where there is one. Throws the PATCH's error, or Unsent. */
   send(body: B, fresh: D): Promise<Sent<D>>;
   /** Two reads show the same document. */
@@ -89,12 +94,14 @@ export function olderVersion(a: unknown, b: unknown): boolean {
 const ROUNDS = 3;
 
 /**
- * After a write batch whose PATCH ran: null when its probe shows the document the edit was built on (`base`), so the
- * caller checks the read-back as before; otherwise the result of every change of `todo`, in order, once their change
- * is back (or why it could not be).
+ * After a write batch whose PATCH ran: null when its probe shows the document the edit was built on (`base`) and is no
+ * older than it, so the caller checks the read-back as before; otherwise the result of every change of `todo`, in order,
+ * once their change is back (or why it could not be).
  */
 export async function settle<D, B>(ops: DocOps<D, B>, base: D, todo: Change[], sent: Sent<D>): Promise<ChangeResult[] | null> {
-  if (sent.probe && ops.same(sent.probe, base)) return null;
+  // A probe older than the read is not the document the PATCH replaced (LIVE-FINDINGS 66): however like the read it looks,
+  // it never shows that nobody saved in between.
+  if (sent.probe && !ops.older(sent.probe, base) && ops.same(sent.probe, base)) return null;
   const w = raceText(ops.noun, ops.publish);
   const err = (change: Change, message: string): ChangeResult => ({ change, outcome: 'error', message });
   const read = () => ops.read().catch(() => null);
@@ -138,7 +145,7 @@ export async function settle<D, B>(ops: DocOps<D, B>, base: D, todo: Change[], s
     if (!F || !(V ? ops.same(F, V) : ops.alike(F, B, W) && W.every((c) => ops.holds(F, c)))) return finish(F ?? V, false);
     let s: Sent<D>;
     try {
-      s = await ops.send(ops.build(P, T), F);
+      s = await ops.send(ops.build(P, T, [...clash]), F);
     } catch (e) {
       // Not run (turned away, its probe failed, or published meanwhile: 412): the same repair from a new read.
       if ((e instanceof Unsent || turnedAway(e) || (e instanceof DvError && e.status === 412)) && waits < 3) {
@@ -148,8 +155,9 @@ export async function settle<D, B>(ops: DocOps<D, B>, base: D, todo: Change[], s
       return finish(F, false);
     }
     round++;
-    // A probe that can't be read, or lags behind the read this write was built from: what the write replaced is unknown.
-    if (!s.probe || (!ops.same(s.probe, F) && ops.older(s.probe, F))) {
+    // A probe that can't be read, or lags behind the read this write was built from (however like it it looks): what the
+    // write replaced is unknown.
+    if (!s.probe || ops.older(s.probe, F)) {
       if (sure === 'yes') sure = 'unseen';
       const v = s.back ?? (await read());
       return finish(v, !!v && ops.alike(v, P, T));

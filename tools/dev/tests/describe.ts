@@ -80,7 +80,7 @@ const anchor = (app: AppApi, key: string, role: Role, focus?: string): Anchor =>
   return { el: {} as Element, comp: s.comp, kind: s.kind, key, role, ...(focus ? { focus } : {}) };
 };
 const heads = (m: CalloutModel) => m.blocks.map((b) => [b.key, b.heading]);
-/** A field popup's Form label block (its first: before Tooltip and Column name). */
+/** A field popup's Form label block (its last: after Column name and Tooltip). */
 const formLabel = (m: CalloutModel) => m.blocks.find((b) => b.heading === 'Form label')!;
 /** The model's fields: nothing of the v2 popup (where, more, alt, altHint, scope, help) is left. */
 const fields = (m: CalloutModel) => Object.keys(m).sort();
@@ -89,11 +89,13 @@ export function register(t: Kit): void {
   const { test, eq, ok } = t;
 
   // ---- describe: fields ----
-  test('describe field: Form label (this form, instead of the column name), then Tooltip and Column name (everywhere), each saying where it applies', () => {
+  test('describe field: Column name and Tooltip (everywhere), then Form label (this form, instead of the column name), each saying where it applies', () => {
     const app = mkApp();
     const m = describe(app, 'field|f1|c1');
     eq([m.kind, m.title, m.icon, m.loading], ['Field', 'Account Name', 'field', false]);
     eq(m.blocks, [
+      { key: 'attribute|account.name|DisplayName', heading: 'Column name', long: false, note: 'everywhere: views, search and forms without a form label' },
+      { key: 'attribute|account.name|Description', heading: 'Tooltip', long: true, note: 'everywhere' },
       {
         key: 'field|f1|c1|Label',
         heading: 'Form label',
@@ -101,16 +103,15 @@ export function register(t: Kit): void {
         also: { keys: ['field|f1|c2|Label', 'field|f1|c3|Label'], on: true },
         note: 'this form only, shown instead of the column name',
       },
-      { key: 'attribute|account.name|Description', heading: 'Tooltip', long: true, note: 'everywhere' },
-      { key: 'attribute|account.name|DisplayName', heading: 'Column name', long: false, note: 'everywhere: views, search and forms without a form label' },
     ]);
     eq(FIELD_NOTES.label, 'this form only, shown instead of the column name');
     eq(fields(m), ['blocks', 'comp', 'icon', 'kind', 'loading', 'title'], 'no where, more, alt, altHint, choices, readOnly or action');
-    // Clicked on the page (the cell's label): the same order; the popup focuses the text the page shows (callout.ts).
+    // Clicked on the page (the cell's label): the same order, never the clicked text first; the popup focuses the
+    // column's name (callout.ts focusKeys).
     eq(heads(describe(app, 'field|f1|c1', anchor(app, 'field|f1|c1|Label', 'label'))), [
-      ['field|f1|c1|Label', 'Form label'],
-      ['attribute|account.name|Description', 'Tooltip'],
       ['attribute|account.name|DisplayName', 'Column name'],
+      ['attribute|account.name|Description', 'Tooltip'],
+      ['field|f1|c1|Label', 'Form label'],
     ]);
   });
 
@@ -165,7 +166,7 @@ export function register(t: Kit): void {
     eq(m.choices, { keys: ['status|account.statuscode|1|Label', 'status|account.statuscode|2|Label'], open: false });
     const f = describe(app, 'field|f1|c4', anchor(app, 'field|f1|c4|Label', 'value', 'status|account.statuscode|2|Label'));
     eq(f.choices, { keys: ['status|account.statuscode|1|Label', 'status|account.statuscode|2|Label'], open: true, focus: 'status|account.statuscode|2|Label' });
-    eq(heads(f), [['field|f1|c4|Label', 'Form label'], ['attribute|account.statuscode|Description', 'Tooltip'], ['attribute|account.statuscode|DisplayName', 'Column name']], "the field's texts keep their order");
+    eq(heads(f), [['attribute|account.statuscode|DisplayName', 'Column name'], ['attribute|account.statuscode|Description', 'Tooltip'], ['field|f1|c4|Label', 'Form label']], "the field's texts keep their order");
   });
 
   test('describe field: a global choice says how many columns share it', () => {
@@ -240,12 +241,12 @@ export function register(t: Kit): void {
       S('attribute', 'attribute|new_dxttest.new_name', 'Description', { [EN]: 'The page table\'s own column' }, { entity: 'new_dxttest', ref: { entity: 'new_dxttest', attribute: 'new_name' } }),
     ]);
     const m = describe(app, `field|${qv}|q1`);
-    eq([m.kind, heads(m)], ['Field', [[`field|${qv}|q1|Label`, 'Form label'], ['attribute|new_dxtlinked.new_name|Description', 'Tooltip'], ['attribute|new_dxtlinked.new_name|DisplayName', 'Column name']]]);
+    eq([m.kind, heads(m)], ['Field', [['attribute|new_dxtlinked.new_name|DisplayName', 'Column name'], ['attribute|new_dxtlinked.new_name|Description', 'Tooltip'], [`field|${qv}|q1|Label`, 'Form label']]]);
     // Its label belongs to the quick view form, which every form embedding it shows: never "this form only".
     eq(m.blocks.map((b) => b.note), [
-      'this quick view (on every form that shows it), instead of the column name',
-      'everywhere',
       'everywhere: views, search and forms without a form label',
+      'everywhere',
+      'this quick view (on every form that shows it), instead of the column name',
     ]);
   });
 
@@ -266,7 +267,7 @@ export function register(t: Kit): void {
     const slots = fixture().map((s) => (s.key === 'field|f1|c1|Label' ? { ...s, labels: {}, title: 'name' } : s));
     const m = describe(mkApp(slots), 'field|f1|c1');
     eq(m.title, 'Account Name', 'the page shows the column name, not the control id');
-    eq(heads(m), [['field|f1|c1|Label', 'Form label'], ['attribute|account.name|Description', 'Tooltip'], ['attribute|account.name|DisplayName', 'Column name']]);
+    eq(heads(m), [['attribute|account.name|DisplayName', 'Column name'], ['attribute|account.name|Description', 'Tooltip'], ['field|f1|c1|Label', 'Form label']]);
   });
 
   test('describe field: the tooltip appears once the table is loaded', () => {
@@ -340,9 +341,9 @@ export function register(t: Kit): void {
     ok(!m.readOnly);
     const other = describe(app, 'status|account.statuscode|2');
     eq([other.title, other.blocks, other.choices!.keys.length, other.choices!.focus, other.choices!.open], ['Inactive', [], 2, 'status|account.statuscode|2|Label', true], 'opened from the list: the same');
-    // A field popup keeps its Form label, Tooltip and Column name, and a closed Choices list.
+    // A field popup keeps its Column name, Tooltip and Form label, and a closed Choices list.
     const f = describe(app, 'field|f1|c4', anchor(app, 'field|f1|c4|Label', 'label'));
-    eq([heads(f).map((b) => b[1]), f.choices!.open, f.choices!.focus], [['Form label', 'Tooltip', 'Column name'], false, undefined]);
+    eq([heads(f).map((b) => b[1]), f.choices!.open, f.choices!.focus], [['Column name', 'Tooltip', 'Form label'], false, undefined]);
   });
 
   test('describe value: a managed choice says why in one line', () => {

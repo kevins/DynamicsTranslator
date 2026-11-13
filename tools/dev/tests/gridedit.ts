@@ -464,4 +464,23 @@ export function register(t: Kit): void {
       eq([store.pendingCount(), toasts.length], [1, 1], 'nothing more to say');
     }),
   );
+
+  test(
+    "grid editor: a French tooltip typed where it had no text at all stays measured against none through a reload that brought one stored empty (someone saved it empty), so saving it is a conflict; one typed over a '' stored already is measured against that",
+    withRows([{ ...tips()[0], labels: { [EN]: 'Type a.' } } as Slot], ({ store, grid, key }) => {
+      const K = 'attribute|acc.a|Description';
+      const edit = (v: string) => {
+        key('F2');
+        type(dom.layer.querySelector('textarea')!, v);
+        // French stored empty comes in while the editor is open (store.add, then the Workbench's setRows commits it).
+        const fresh = { ...store.get(K)!, labels: { [EN]: 'Type a.', [FR]: '' } };
+        store.add([fresh]);
+        grid.setRows([fresh]);
+        return [store.moved(K, FR), store.changes().map((c) => [c.before, c.after, c.beforeMissing ?? null])];
+      };
+      eq(edit('Tapez a.'), [true, [['', 'Tapez a.', true]]]);
+      store.revert(K, FR);
+      eq(edit('Tapez b.'), [false, [['', 'Tapez b.', null]]]);
+    }),
+  );
 }

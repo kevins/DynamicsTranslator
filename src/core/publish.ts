@@ -2,12 +2,12 @@
 // the org. One PublishXml call carries everything a save touched. Business process flows are never
 // published: one whose name was saved is updated instead (rebuildProcess).
 
-import type { Ctx } from './context';
+import { NOT_CUSTOMIZER, type Ctx } from './context';
 import { DvError, abortError, guid, partError, pause, turnedAway, type BatchPart, type PartResult } from './http';
 import { toLabels } from './labels';
 import type { LangSession } from './langsession';
 import { lcidName } from './lcid';
-import { MANAGED, PublishSet, isManaged, type Change, type Labels, type Lcid } from './model';
+import { MANAGED, PublishSet, managedHeld, type Change, type Labels, type Lcid } from './model';
 import { xmlAttr } from './xml';
 
 /**
@@ -16,7 +16,7 @@ import { xmlAttr } from './xml';
  * unrelated errors and turn them into pointless retries and a misleading "busy" message.
  */
 export const isLockError = (e: unknown): boolean =>
-  e instanceof DvError && (e.status === 429 || /Cannot start|0x80071151|CustomizationLock|another \[/i.test(`${e.message} ${e.code}`));
+  e instanceof DvError && (e.status === 429 || /Cannot start|0x80071151|CustomizationLock|another \[|was deadlocked on lock resources/i.test(`${e.message} ${e.code}`));
 
 /**
  * Thrown when everything was published except the apps (the server rejected <appmodules>), so callers
@@ -59,6 +59,8 @@ function parameterXml(set: PublishSet, apps: boolean): string {
  * apps, it still throws, so apps are never reported as published when they were not.
  */
 export async function publishXml(ctx: Ctx, set: PublishSet, signal?: AbortSignal, onRetry?: (msg: string) => void): Promise<void> {
+  // Without either role nothing is published (Ctx.customizer): Publish again and Recent publishes come here directly.
+  if (ctx.customizer === false) throw new Error(NOT_CUSTOMIZER);
   let apps = set.appmodules.size > 0;
   let rejected = '';
   for (let waits = 0; ; ) {
@@ -104,9 +106,10 @@ export async function publishXml(ctx: Ctx, set: PublishSet, signal?: AbortSignal
  * (which switches the user's UI language), and nothing is sent while it still shows one (the PATCH would put the old
  * name back); a batch read showing one is nobody's save, never put back. Resolves with what the saver says ('' when all
  * is well): that race, or the languages whose name the read after it shows changed from both reads before it (none,
- * unless Dataverse wrote another one). A process from a managed solution, or one not read as unmanaged right before, is
- * never updated (it rejects): that PATCH would be an unmanaged layer on it. run() needs the exclusive switch window: never
- * call this from a quiet() job (the save lanes), it would wait for itself.
+ * unless Dataverse wrote another one). A process from a managed solution is updated only where this session allows
+ * changes to managed labels (Ctx.managedEdits), and one not read as managed or unmanaged right before never is (it
+ * rejects): that PATCH is an unmanaged layer on a managed one. run() needs the exclusive switch window: never call this
+ * from a quiet() job (the save lanes), it would wait for itself.
  */
 export async function rebuildProcess(ctx: Ctx, lang: Pick<LangSession, 'run'>, id: string, title: string, signal?: AbortSignal, olds: readonly string[] = []): Promise<string> {
   const wf = guid(id);
@@ -128,11 +131,12 @@ export async function rebuildProcess(ctx: Ctx, lang: Pick<LangSession, 'run'>, i
   const behind = (t: string | undefined): boolean => t !== undefined && olds.includes(t);
   const late = () => new DvError(`Dataverse doesn't show the new ${lcidName(ctx.base)} name of the process yet.`, 0, 'behind');
   if (signal?.aborted) throw abortError();
-  // Never a process from a managed solution: the PATCH would put an unmanaged layer on it. A process not read as
-  // unmanaged is not updated (the read's failure is the saver's "may show the old name").
+  // A process from a managed solution only where this session allows changes to managed labels (Ctx.managedEdits): the
+  // PATCH puts an unmanaged layer on it. A process not read as either is not updated (the read's failure is the saver's
+  // "may show the old name").
   const managed = (await ctx.http.get(`workflows(${wf})?$select=ismanaged`, { signal, headers: { Consistency: 'Strong' } }))?.ismanaged;
-  if (managed === true) throw new DvError(`The process ${title} was not updated. ${MANAGED}`, 0, 'managed');
-  if (managed !== false) throw new DvError(`The process ${title} was not updated: Dataverse did not say whether it is from a managed solution.`, 0, 'unread');
+  if (managed === true && !ctx.managedEdits) throw new DvError(`The process ${title} was not updated. ${MANAGED}`, 0, 'managed');
+  if (typeof managed !== 'boolean') throw new DvError(`The process ${title} was not updated: Dataverse did not say whether it is from a managed solution.`, 0, 'unread');
   if (olds.length)
     for (let i = 0; behind((await read(signal))[ctx.base]); i++) {
       if (i === 4) throw late();
@@ -186,13 +190,13 @@ export async function rebuildProcess(ctx: Ctx, lang: Pick<LangSession, 'run'>, i
 }
 
 /** Predicts what a save of these changes will publish (for the review dialog and the pending-work check). */
-export function publishTargets(changes: Change[]): PublishSet {
+export function publishTargets(changes: Change[], managed?: boolean): PublishSet {
   const p = new PublishSet();
   const add = (set: Set<string>, v: unknown, id = false) => {
     if (v && v !== 'none') set.add(id ? guid(v) : String(v));
   };
   for (const { slot: s } of changes) {
-    if (s.readOnly || isManaged(s)) continue; // never saved, so never published
+    if (s.readOnly || managedHeld(s, managed)) continue; // never saved, so never published
     const r = s.ref || {};
     switch (s.kind) {
       case 'globaloptionset':

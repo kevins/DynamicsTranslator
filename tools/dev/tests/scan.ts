@@ -413,10 +413,11 @@ export function register(t: Kit): void {
 
   // ---- page loads ----
 
-  /** A page loader on these fake providers, and a wait until its loads are done. */
+  /** A page loader on these fake providers (by default the page keeps no copy of a form's own labels, and none is kept), and a wait until its loads are done. */
   const loader = (providers: Record<string, unknown>, store = new Store()) => {
     const ctx = { xrm: {}, user: FR, base: EN, langs: [{ lcid: EN }, { lcid: FR }] };
-    const ld = new PageLoader({ ctx, providers, store, lang: {} } as unknown as ConstructorParameters<typeof PageLoader>[0], () => {});
+    const all = { pageOwnLabels: async () => [], knownOwnLabels: () => new Map(), ...providers };
+    const ld = new PageLoader({ ctx, providers: all, store, lang: {} } as unknown as ConstructorParameters<typeof PageLoader>[0], () => {});
     const settle = async (calls: unknown[], k: number) => {
       for (let i = 0; i < 100 && (calls.length < k || ld.busy.size); i++) await new Promise((r) => setTimeout(r, 5));
       await new Promise((r) => setTimeout(r, 5));
@@ -445,6 +446,178 @@ export function register(t: Kit): void {
     const lost = { ...tab, labels: { [FR]: 'Général' }, ref: { ...tab.ref, partial: true } } as Slot;
     eq(await load([lost, cell]), { errors: ['Could not load the form labels in every language.'], kept: true, calls: ['form'] });
     eq((await load([tab, { ...cell, ref: { ...cell.ref, unreadable: undefined } } as Slot])).errors, ['Could not load the form labels in every language.'], 'a cell a read could complete');
+  });
+
+  test("page loads: which field labels of the page's main form are its own is read once none of the page's loads runs any more, never in their way (providers/formxml.ts loadOwnLabels): a load that starts meanwhile stops the read, which runs again once none runs; each language is set on the labels as it comes in (Store.setOwn), the user's before another language's window; a label loaded again since from another version of its form keeps what it has", async () => {
+    const tab = S('tab', `tab|${FORM}|t1|Label`, { [EN]: 'General', [FR]: 'Général' }, { formId: FORM, tabName: 'general' });
+    const cell = S('field', `field|${FORM}|c1|Label`, { [EN]: 'Name', [FR]: 'Nom' }, { formId: FORM, elId: 'c1', controlId: 'name', datafield: 'name', sparse: true, formVersion: '7' });
+    const run = async (o: { reloaded?: boolean; late?: boolean } = {}) => {
+      const calls: string[] = [];
+      let table = () => {};
+      let answer = () => {};
+      const { ld, store, settle } = loader({
+        loadFormXml: async () => (calls.push('form'), [tab, cell]),
+        loadRecords: async () => [],
+        loadTables: (_c: unknown, ts: string[]) => (calls.push(`table ${ts}`), new Promise<Slot[]>((r) => (table = () => r([])))),
+        // The user's language (French) given at once, English once its window is in; stopped as Http stops a request.
+        loadOwnLabels: (_c: unknown, cells: Slot[], signal: AbortSignal, known: (own: Map<string, Record<number, boolean>>) => void) => (
+          calls.push(`own ${cells.map((s) => s.key)}`),
+          known(new Map([[cell.key, { [FR]: false }]])),
+          new Promise((r, j) => {
+            answer = () => r(new Map([[cell.key, { [EN]: true, [FR]: false }]]));
+            signal.addEventListener('abort', () => j(new DOMException('The operation was aborted.', 'AbortError')));
+          })
+        ),
+      });
+      ld.page = { info: { type: 'entityrecord' } as never, sig: 's', entity: 'account', formId: FORM, viewId: '', bpfId: '' };
+      (ld as unknown as { form(id: string, kind: string): void }).form(FORM, 'form');
+      ld.request([WANT_TABLE + 'contact']);
+      await settle(calls, 2);
+      eq(calls, ['form', 'table contact'], 'not while a load runs');
+      table();
+      await settle(calls, 3);
+      eq(calls[2], `own ${cell.key}`, "then, for the main form's column cells (sparse)");
+      if (o.late) {
+        // A table the page shows now: its load stops the read (it holds the language lock), which runs again after it.
+        ld.request([WANT_TABLE + 'lead']);
+        await settle(calls, 4);
+        eq(calls.slice(3), ['table lead']);
+        table();
+        await settle(calls, 5);
+        eq(calls.slice(4), [`own ${cell.key}`], 'read again');
+      }
+      if (o.reloaded) store.add([{ ...cell, ref: { ...cell.ref, formVersion: '8' } }]);
+      const first = store.get(cell.key)!.ref.own;
+      answer();
+      await settle(calls, 3);
+      return [first, store.get(cell.key)!.ref.own, store.get(tab.key)!.ref.own];
+    };
+    eq(await run(), [{ [FR]: false }, { [EN]: true, [FR]: false }, undefined]);
+    eq(await run({ late: true }), [{ [FR]: false }, { [EN]: true, [FR]: false }, undefined], 'stopped by a load that started, then read again');
+    eq(await run({ reloaded: true }), [undefined, undefined, undefined], 'loaded again from another version');
+  });
+
+  test("page loads: the read of which field labels are their own waits while a save or a publish runs (Store.busy), and one that starts stops it as a load does: it holds the language lock, which the save's form label writes need; it runs again once the save is done, and only then", async () => {
+    const cell = S('field', `field|${FORM}|c1|Label`, { [EN]: 'Name', [FR]: 'Nom' }, { formId: FORM, elId: 'c1', controlId: 'name', datafield: 'name', sparse: true, formVersion: '7' });
+    const calls: string[] = [];
+    let answer = () => {};
+    const { ld, store, settle } = loader({
+      loadFormXml: async () => (calls.push('form'), [{ ...cell, ref: { ...cell.ref } }]),
+      loadRecords: async () => [],
+      loadTables: async () => [],
+      // Stopped as Http stops a request.
+      loadOwnLabels: (_c: unknown, _cells: Slot[], signal: AbortSignal) => (
+        calls.push('own'),
+        new Promise((r, j) => {
+          answer = () => r(new Map([[cell.key, { [EN]: true }]]));
+          signal.addEventListener('abort', () => (calls.push('stopped'), j(new DOMException('The operation was aborted.', 'AbortError'))));
+        })
+      ),
+    });
+    store.setBusy(true, 'Saving');
+    ld.page = { info: { type: 'entityrecord' } as never, sig: 's', entity: 'account', formId: FORM, viewId: '', bpfId: '' };
+    (ld as unknown as { form(id: string, kind: string): void }).form(FORM, 'form');
+    await settle(calls, 2);
+    eq(calls, ['form'], 'not while a save runs');
+    store.setBusy(false);
+    await settle(calls, 2);
+    eq(calls, ['form', 'own'], 'once it is done');
+    store.setBusy(true, 'Saving');
+    await settle(calls, 3);
+    eq(calls.slice(2), ['stopped'], 'a save that starts stops it');
+    store.setBusy(true, 'Saving 1 of 2');
+    await settle(calls, 4);
+    eq(calls.slice(3), [], 'not again while it runs');
+    store.setBusy(false);
+    await settle(calls, 4);
+    eq(calls.slice(3), ['own'], 'read again');
+    answer();
+    await settle(calls, 5);
+    eq([calls.length, store.get(cell.key)!.ref.own], [4, { [EN]: true }]);
+  });
+
+  test("page loads: the page's copies of what says which field labels of its form are their own (providers/formxml.ts pageOwnLabels) are looked for as the form's read starts and never hold it up: found by the time its labels are stored, what is known without a request (knownOwnLabels) is on the labels before that, so a popup is right from its first frame; found later, it is set as it comes in (Store.setOwn), once they are stored and the page's table is in; a dashboard has none to look for", async () => {
+    const cell = S('field', `field|${FORM}|c1|Label`, { [EN]: 'Name', [FR]: 'Nom' }, { formId: FORM, elId: 'c1', controlId: 'name', datafield: 'name', sparse: true, formVersion: '7' });
+    const COPIES = [{ form: FORM, l: EN, v: '7', k: [], t: {} }];
+    /** `when`: the copies are found before the read is in, as it comes in (before its labels are stored), or after. */
+    const run = async (kind: string, when: 'before' | 'with' | 'after') => {
+      const calls: string[] = [];
+      let read = () => {};
+      let found: (c: unknown[]) => void = () => {};
+      const { ld, store, settle } = loader({
+        pageOwnLabels: (_c: unknown, id: string, entity: string) => (calls.push(`scan ${id === FORM} ${entity}`), new Promise((r) => (found = r))),
+        loadFormXml: () => (calls.push('form'), new Promise<Slot[]>((r) => (read = () => r([{ ...cell, ref: { ...cell.ref } }])))),
+        // What the copies tell: English follows the column.
+        knownOwnLabels: (_c: unknown, cells: Slot[], copies?: unknown[]) => new Map(copies?.length ? [[cells[0].key, { [EN]: false }]] : []),
+        loadOwnLabels: async () => (calls.push('own'), new Map()),
+        loadRecords: async () => [],
+        loadTables: async () => [],
+      });
+      /** What the label has as it is first stored. */
+      const first: unknown[] = [];
+      store.on(() => void (store.get(cell.key) && !first.length && first.push(store.get(cell.key)!.ref.own ?? null)));
+      ld.page = { info: { type: 'entityrecord' } as never, sig: 's', entity: 'account', formId: FORM, viewId: '', bpfId: '' };
+      (ld as unknown as { form(id: string, kind: string): void }).form(FORM, kind);
+      const started = [...calls];
+      if (when === 'before') found(COPIES);
+      await new Promise((r) => setTimeout(r, 5));
+      read();
+      if (when === 'with') found(COPIES);
+      await settle(calls, kind === 'form' && when !== 'after' ? 3 : 2);
+      const stored = store.get(cell.key)?.ref.own ?? null;
+      found(COPIES);
+      await settle(calls, kind === 'form' ? 3 : 2);
+      return { started, first: first[0], stored, after: store.get(cell.key)?.ref.own ?? null, own: calls.includes('own') };
+    };
+    eq(await run('form', 'before'), { started: ['scan true account', 'form'], first: { [EN]: false }, stored: { [EN]: false }, after: { [EN]: false }, own: true }, 'found first: on the labels as they are stored');
+    eq(await run('form', 'with'), { started: ['scan true account', 'form'], first: null, stored: { [EN]: false }, after: { [EN]: false }, own: true }, 'found as the read comes in: set once the labels are stored');
+    eq(await run('form', 'after'), { started: ['scan true account', 'form'], first: null, stored: null, after: { [EN]: false }, own: true }, 'found later: stored without it, set as it comes');
+    eq((await run('dashboard', 'before')).started, ['form'], 'a dashboard');
+  });
+
+  test("page loads: a copy is checked against the field labels as their form's read brought them and their columns' names in the store (the `fills` knownOwnLabels gets, model.ts fillsIn): one the column's names aren't in yet to check, as the labels are stored, is set once the page's table is in, before the read behind the page's loads", async () => {
+    const cell = S('field', `field|${FORM}|c1|Label`, { [EN]: 'Name', [FR]: 'Nom' }, { formId: FORM, elId: 'c1', controlId: 'name', datafield: 'name', sparse: true, formVersion: '7' });
+    const column = S('attribute', 'attribute|account.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom du compte' }, { entity: 'account', attribute: 'name' });
+    const calls: string[] = [];
+    let table = () => {};
+    let fills: (s: Slot, l: number) => boolean = () => true;
+    const { ld, store, settle } = loader({
+      pageOwnLabels: async () => [{ form: FORM, l: EN, v: '7', k: [], t: {} }],
+      loadFormXml: async () => (calls.push('form'), [{ ...cell, ref: { ...cell.ref } }]),
+      loadTables: () => (calls.push('table'), new Promise<Slot[]>((r) => (table = () => r([column])))),
+      // As the provider takes a copy that lists no label of the cell's own: where the cell's text is the one a read fills in.
+      knownOwnLabels: (_c: unknown, cells: Slot[], copies: unknown[] | undefined, f: typeof fills) => ((fills = f), new Map(copies?.length && f(cells[0], EN) ? [[cells[0].key, { [EN]: false }]] : [])),
+      loadOwnLabels: async () => (calls.push(`own ${JSON.stringify(store.get(cell.key)?.ref.own ?? null)}`), new Map()),
+      loadRecords: async () => [],
+    });
+    ld.page = { info: { type: 'entityrecord', recordId: 'r1' } as never, sig: 's', entity: 'account', formId: FORM, viewId: '', bpfId: '' };
+    ld.start();
+    await settle(calls, 2);
+    eq([calls, store.get(cell.key)?.ref.own ?? null, fills(cell, EN), fills({ ...cell, labels: {} }, EN)], [['form', 'table'], null, false, false], "stored before the column's names are in: not taken");
+    table();
+    await settle(calls, 3);
+    eq([calls, store.get(cell.key)?.ref.own], [['form', 'table', `own ${JSON.stringify({ [EN]: false })}`], { [EN]: false }], 'taken once they are, before the read');
+    eq([fills(cell, EN), fills(cell, FR), fills({ ...cell, labels: { [EN]: 'Account' } }, EN)], [true, false, false], "the text as read, against the column's name in that language");
+  });
+
+  test("page loads: the read behind the page's loads asks for a language only where a field label's text is its column's name there (Store.fillsIn): the predicate it gets reads the store as it is then", async () => {
+    const cell = S('field', `field|${FORM}|c1|Label`, { [EN]: 'Name', [FR]: 'Nom' }, { formId: FORM, elId: 'c1', controlId: 'name', datafield: 'name', sparse: true, formVersion: '7' });
+    const column = S('attribute', 'attribute|account.name|DisplayName', { [EN]: 'Name', [FR]: 'Nom du compte' }, { entity: 'account', attribute: 'name' });
+    const calls: string[] = [];
+    let undecided: (s: Slot, l: number) => boolean = () => true;
+    const { ld, store, settle } = loader({
+      loadFormXml: async () => (calls.push('form'), [cell]),
+      loadOwnLabels: async (_c: unknown, _cells: Slot[], _signal: AbortSignal, _known: unknown, u: typeof undecided) => (calls.push('own'), (undecided = u), new Map()),
+      loadRecords: async () => [],
+      loadTables: async () => [],
+    });
+    store.add([column]);
+    ld.page = { info: { type: 'entityrecord' } as never, sig: 's', entity: 'account', formId: FORM, viewId: '', bpfId: '' };
+    (ld as unknown as { form(id: string, kind: string): void }).form(FORM, 'form');
+    await settle(calls, 2);
+    eq([undecided(cell, EN), undecided(cell, FR)], [true, false], "English is the column's name, French another text");
+    store.add([{ ...column, labels: { [EN]: 'Account name', [FR]: 'Nom' } }]);
+    eq([undecided(cell, EN), undecided(cell, FR)], [false, true], 'the column renamed');
   });
 
   test("page loads: the names of the forms in the form selector's list and of views in a list of views are read on demand, together, once; a personal view's (no savedquery) is never asked for again", async () => {

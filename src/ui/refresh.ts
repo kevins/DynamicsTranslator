@@ -429,6 +429,12 @@ function shadowBox(tag: string, css: string): { host: HTMLElement; root: ShadowR
  */
 const STAYED = 8000;
 
+/**
+ * How long the refresh waits for the user's language to be back (ms) while no language switch of the translator runs
+ * (one whose answer was lost, which the next start waits out all the same; another tab's).
+ */
+const RESTORE_WAIT = 3000;
+
 /** A small "Refreshing…" note at the top of the page while the purge runs; gone with the reload. */
 function showNote(text: string): { set(text: string): void; remove(): void } {
   try {
@@ -478,6 +484,8 @@ export interface RefreshOptions {
   teardown(): boolean;
   /** Puts the user's Dynamics language back (LangSession.restore), so the reload boots in it. */
   restore(): Promise<void>;
+  /** True while a language switch of the translator runs whose answer isn't lost (LangSession.active, not waiting). */
+  switching(): boolean;
   /**
    * Runs once the questions are answered, before anything is torn down (the language switch). When it throws,
    * its message is shown and nothing is reloaded.
@@ -491,6 +499,8 @@ export interface RefreshOptions {
   note?(text: string): { remove(): void };
   /** STAYED. */
   stayed?: number;
+  /** RESTORE_WAIT. */
+  restoreWait?: number;
 }
 
 /**
@@ -531,8 +541,18 @@ export async function refreshPage(o: RefreshOptions): Promise<boolean> {
     return false;
   }
   const note = (o.note ?? showNote)('Refreshing the page…');
-  // The save already restored it; this waits for a language switch a page load may have had running.
-  await Promise.race([o.restore().catch(() => {}), sleep(3000)]);
+  // The save already restored it; this waits for a language switch a page load may have had running, for as long as it
+  // runs (the one behind the page that reads a form's own labels takes seconds): a reload in the middle of it makes the
+  // next start wait until it can no longer run (LangSession LOST_MS). Anything else, RESTORE_WAIT at most.
+  let back = false;
+  const restored = o
+    .restore()
+    .catch(() => {})
+    .finally(() => (back = true));
+  for (;;) {
+    await Promise.race([restored, sleep(o.restoreWait ?? RESTORE_WAIT)]);
+    if (back || !o.switching()) break;
+  }
   const storage = o.storage === undefined ? quietly(() => localStorage) : o.storage;
   try {
     if (o.items.length) storage?.setItem(verifyKey(o.orgId), JSON.stringify({ at: (o.now ?? Date.now)(), items: o.items } satisfies VerifyEntry));

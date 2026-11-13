@@ -1,7 +1,7 @@
 // Bookmarklet entry point. Clicking the bookmark again shows the running instance; once that instance
 // was closed (✕) or torn down, the next click always starts a fresh one.
 
-import { createCtx, findXrm } from './core/context';
+import { createCtx, findXrm, NOT_CUSTOMIZER } from './core/context';
 import { LangSession } from './core/langsession';
 import { lcidName } from './core/lcid';
 import { createSaver } from './core/saver';
@@ -123,6 +123,8 @@ void (async () => {
     self.destroy = app.destroy;
     self.starting = false;
     if (restored) app.api.toast('Your Dynamics language was restored after an interrupted save.', 'info');
+    // Without either role nothing is published or undone (Ctx.customizer); looking and exporting still work.
+    if (ctx.customizer === false) app.api.toast(`${NOT_CUSTOMIZER} You can look at them and export them.`, 'warn');
     if (devWin) devWin.__dxtDev = devInfo = { ctx, store, lang, providers, app: app.api };
   } catch (e) {
     if (!current()) return; // superseded by a newer click; that instance reports its own problems

@@ -3,7 +3,8 @@
 // for every shown language, staging, Done / Enter / Esc / click outside, Undo changes, Ctrl+Z / Ctrl+Y, the copies
 // checkbox and the choices; also where the editor card (ui/editor.ts) puts the focus first. The fake globals are
 // installed for each DOM test and removed after it.
-import { MANAGED, type Lcid, type Prop, type Slot } from '../../../src/core/model';
+import { MANAGED, MANAGED_OPEN, type Lcid, type Prop, type Slot } from '../../../src/core/model';
+import { createSaver } from '../../../src/core/saver';
 import { Store } from '../../../src/core/store';
 import { BUILTIN_NOTE, describe } from '../../../src/inspector/describe';
 import { Preview } from '../../../src/inspector/preview';
@@ -71,12 +72,27 @@ const fieldModel = (o: Partial<CalloutModel> = {}, also?: { keys: string[]; on: 
   loading: false,
   ...o,
 });
-/** A form field's blocks as describe() gives them (inspector/describe.ts field()): Form label, Tooltip, Column name. */
+/** A form field's blocks as describe() gives them (inspector/describe.ts field()): Column name, Tooltip, Form label. */
 const FIELD_BLOCKS: CalloutModel['blocks'] = [
-  { key: L1, heading: 'Form label', long: false },
-  { key: TIP, heading: 'Tooltip', long: true },
   { key: COL, heading: 'Column name', long: false },
+  { key: TIP, heading: 'Tooltip', long: true },
+  { key: L1, heading: 'Form label', long: false },
 ];
+/** A main form's body cell of the name column as the loader makes it (sparse, never base-required: providers/formxml.ts). */
+const MAIN = { formId: 'f', elId: 'c1', formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name', sparse: true };
+/**
+ * The name field of a main form, a save posting its Form label only where it changes it (providers/formxml.ts SPARSE): its
+ * own label English "Full name", French "Nom" (`labels`), the column's names English "Name", French "Nom V4", its tooltip.
+ */
+function mainForm(labels: Record<number, string> = { [EN]: 'Full name', [FR]: 'Nom' }): Store {
+  const s = new Store();
+  s.add([
+    S('field', 'field|f|c1', 'Label', labels, { baseRequired: false, ref: MAIN }),
+    S('attribute', 'attribute|acc.name', 'DisplayName', { [EN]: 'Name', [FR]: 'Nom V4' }, { ref: { entity: 'acc', attribute: 'name' } }),
+    S('attribute', 'attribute|acc.name', 'Description', { [EN]: 'Primary name' }, { ref: { entity: 'acc', attribute: 'name' } }),
+  ]);
+  return s;
+}
 
 // ---- a tiny DOM: just what the popup and its widgets use (the Publish dialog tests in savepath.ts use it too) ----
 
@@ -506,6 +522,29 @@ export function register(t: Kit): void {
     eq(restore(s, snap.values()), 1, 'also after a revert');
     eq(s.before(L1, FR), 'Nom');
   });
+  test("callout: Undo changes brings back an edit made where a tooltip had no text at all in its language as made on none, so a '' someone stored there since is still a conflict at save, cleared and typed again or not; one made over a '' stored then stays measured against it", () => {
+    const s = fixture();
+    s.set(TIP, FR, 'Brouillon'); // staged where the tooltip had no French at all
+    const snap = snapshot(s, [TIP], [FR]);
+    eq(snap.get(`${TIP}#1036`)!.base, null);
+    s.add([{ ...s.get(TIP)!, labels: { [EN]: 'Type the name.', [FR]: '' } }]); // someone saved it empty: reloaded
+    ok(s.moved(TIP, FR));
+    const now = () => [s.value(TIP, FR), s.moved(TIP, FR), s.changes().map((c) => [c.before, c.after, c.beforeMissing ?? null])];
+    for (const retyped of [false, true]) {
+      s.set(TIP, FR, ''); // cleared in the popup: the edit and its base are gone
+      if (retyped) s.set(TIP, FR, 'Autre');
+      eq(restore(s, snap.values()), 1);
+      eq(now(), ['Brouillon', true, [['', 'Brouillon', true]]], retyped ? 'cleared, typed again' : 'cleared');
+    }
+    // Made over the '' stored: brought back measured against it, which nothing changed since.
+    s.revert(TIP, FR);
+    s.set(TIP, FR, 'Mien');
+    const over = snapshot(s, [TIP], [FR]);
+    eq(over.get(`${TIP}#1036`)!.base, '');
+    s.set(TIP, FR, '');
+    eq(restore(s, over.values()), 1);
+    eq(now(), ['Mien', false, [['', 'Mien', null]]]);
+  });
   test('callout: server values that change underneath are not changes made here; a cell shown later keeps its first state', () => {
     const s = fixture();
     const snap = snapshot(s, [L1, 'zz'], [FR]);
@@ -580,6 +619,106 @@ export function register(t: Kit): void {
     eq([one.node.nodeValue, two.node.nodeValue, becomes(s, s.get(L1)!, FR, EN)], ['Account Name', 'Account Name', "Becomes “Account Name”: Dataverse can't remove a translation here, so French gets the column's English name."]);
     eq([shows(s, s.get(L2)!, FR, EN), placeholderOf(s, s.get(L2)!, FR, EN, 'Label', 'French')], ['Account Name', 'Shows “Account Name”'], 'the popup and the page name the same text');
   });
+  test("preview: a form label the page shows with another text than the one loaded (published, while a text saved since isn't) changes as it is typed: the text its node showed when the label was found (Anchor.orig) is swapped too, only on that label's own nodes, and put back by restore(); without it, as before, nothing is swapped", () => {
+    // Loaded: "Full name" (the unpublished text); the page shows the published "Request title".
+    const s = mainForm();
+    const p = new Preview({ store: s, ctx: { base: EN, user: EN } } as unknown as AppApi, (fn) => fn());
+    const el = Object.assign(new El('label', {}, 'Request title'), { isConnected: true });
+    const other = Object.assign(new El('span', {}, 'Request title'), { isConnected: true });
+    const page = new El('div').add(el, other);
+    const apply = (orig?: string) => withPage(page, () => p.apply([{ key: L1, el, text: el.node, ...(orig ? { orig } : {}) }] as unknown as Anchor[]));
+    s.set(L1, EN, 'Request titles');
+    apply();
+    eq(el.node.nodeValue, 'Request title', 'without the text it showed: not swapped');
+    apply('Request title');
+    eq([el.node.nodeValue, other.node.nodeValue], ['Request titles', 'Request title'], "typed: swapped, never another label's node");
+    s.set(L1, EN, 'Request titles 2');
+    apply('Request title');
+    eq(el.node.nodeValue, 'Request titles 2', 'typed on');
+    p.restore();
+    eq(el.node.nodeValue, 'Request title', 'put back');
+  });
+  test("preview: a related menu item whose node shows none of its own texts (a built-in item the form renames in English only shows the language pack's French text, LIVE-FINDINGS 63, 80) is never swapped, whatever is staged; one that shows its own title changes as it is typed and is put back once undone, and by restore(), as before", () => {
+    const s = new Store();
+    const nav = (id: string, labels: Record<number, string>, relationship: string) =>
+      S('navitem', `navitem|f|${id}`, 'Label', labels, { baseRequired: false, ref: { formId: 'f', elId: id, area: 'nav', relationship } });
+    const audit = nav('navaudit', { [EN]: 'Audit Trail' }, 'hardcoded_{B7196B13-6B9D-42CD-BD58-B19A3953126F}navAudit');
+    const contacts = nav('nav_contacts', { [EN]: 'Contacts', [FR]: 'Contacts (FR)' }, 'contact_customer_accounts');
+    s.add([audit, contacts]);
+    const p = new Preview({ store: s, ctx: { base: EN, user: FR } } as unknown as AppApi, (fn) => fn());
+    const node = (text: string) => Object.assign(new El('span', {}, text), { isConnected: true });
+    const [a, c] = [node('Historique d’audit'), node('Contacts (FR)')];
+    const page = new El('div').add(a, c);
+    // As the scanner anchors them: each with the text its node showed when found (Anchor.orig).
+    const apply = () => withPage(page, () => p.apply([{ key: audit.key, el: a, text: a.node, orig: 'Historique d’audit' }, { key: contacts.key, el: c, text: c.node, orig: 'Contacts (FR)' }] as unknown as Anchor[]));
+    const shown = () => [a.node.nodeValue, c.node.nodeValue];
+    s.set(contacts.key, FR, 'Contacts liés');
+    apply();
+    eq(shown(), ['Historique d’audit', 'Contacts liés'], 'a French edit staged: the item showing its own title is swapped, never the language-pack text');
+    s.revert(contacts.key, FR);
+    apply();
+    eq(shown(), ['Historique d’audit', 'Contacts (FR)'], 'undone: put back');
+    s.set(contacts.key, FR, 'Contacts 2');
+    s.set(audit.key, EN, 'Audit');
+    apply();
+    eq(shown(), ['Historique d’audit', 'Contacts 2'], 'its English title edited: the French page text is still not its own');
+    p.restore();
+    eq(shown(), ['Historique d’audit', 'Contacts (FR)'], 'restored');
+  });
+  test('preview: an emptied form label of a main form shows its column\'s name on the page, in the base language too', () => {
+    const page = (user: Lcid, text: string) => {
+      const s = mainForm();
+      const p = new Preview({ store: s, ctx: { base: EN, user } } as unknown as AppApi, (fn) => fn());
+      const el = Object.assign(new El('label', {}, text), { isConnected: true });
+      return { s, el, apply: () => withPage(new El('div').add(el), () => p.apply([{ key: L1, el }] as unknown as Anchor[])) };
+    };
+    // English: its own label "Full name" emptied shows the column's English name through its column fallback (nothing
+    // stands in for the base language), as the popup's placeholder says.
+    const en = page(EN, 'Full name');
+    en.s.set(L1, EN, '');
+    en.apply();
+    eq([en.el.node.nodeValue, placeholderOf(en.s, en.s.get(L1)!, EN, EN, 'Form label', 'English')], ['Name', 'Shows “Name”']);
+    // The column renamed in the same edits: the name as staged, which the label then follows.
+    en.s.set(COL, EN, 'Account name');
+    en.apply();
+    eq(en.el.node.nodeValue, 'Account name');
+    // French: the column's French name; with none, its English name.
+    const fr = page(FR, 'Nom');
+    fr.s.set(L1, FR, '');
+    fr.apply();
+    eq(fr.el.node.nodeValue, 'Nom V4');
+    fr.s.set(COL, FR, '');
+    fr.apply();
+    eq(fr.el.node.nodeValue, 'Name');
+  });
+  test("preview: spaces alone typed in a label show what it shows emptied (saved, they are a blank), never the page's text: a main form's field label its column's name, a view's French name its English one", () => {
+    for (const [user, text, emptied] of [
+      [FR, 'Nom', 'Nom V4'],
+      [EN, 'Full name', 'Name'],
+    ] as const) {
+      const s = mainForm();
+      const p = new Preview({ store: s, ctx: { base: EN, user } } as unknown as AppApi, (fn) => fn());
+      const el = Object.assign(new El('label', {}, text), { isConnected: true });
+      const apply = () => withPage(new El('div').add(el), () => p.apply([{ key: L1, el }] as unknown as Anchor[]));
+      s.set(L1, user, '   ');
+      apply();
+      eq(el.node.nodeValue, emptied, `spaces, ${user}`);
+      s.set(L1, user, '');
+      apply();
+      eq(el.node.nodeValue, emptied, `emptied, ${user}`);
+      s.set(L1, user, '  Nouveau  ');
+      apply();
+      eq(el.node.nodeValue, 'Nouveau', `a text between spaces, ${user}`);
+    }
+    // A record's label: emptied, its French text is removed and the page shows its English one.
+    const s = new Store();
+    s.add([S('view', 'view|v', 'Name', { [EN]: 'Active accounts', [FR]: 'Comptes actifs' })]);
+    const p = new Preview({ store: s, ctx: { base: EN, user: FR } } as unknown as AppApi, (fn) => fn());
+    const el = Object.assign(new El('span', {}, 'Comptes actifs'), { isConnected: true });
+    s.set('view|v|Name', FR, '   ');
+    withPage(new El('div').add(el), () => p.apply([{ key: 'view|v|Name', el }] as unknown as Anchor[]));
+    eq(el.node.nodeValue, 'Active accounts');
+  });
   test('callout: amber only where the translation is empty and the base text is not (a cell worded like its column is translated)', () => {
     const s = fixture();
     const slot = () => s.get(L2)!;
@@ -652,7 +791,7 @@ export function register(t: Kit): void {
   test('callout: the copies checkbox writes the same text to the copies, never to a read-only or not-loaded one', () => {
     const s = fixture();
     s.add([S('field', 'field|f|c3', 'Label', { [EN]: 'Name' }, { readOnly: 'Managed' }), S('field', 'field|f|c4', 'Label', { [EN]: 'Name' }, { ref: { partial: [EN] } })]);
-    writeAlso(s, [L2, 'field|f|c3|Label', 'field|f|c4|Label', 'nope'], FR, 'Nom 2');
+    writeAlso(s, [L2, 'field|f|c3|Label', 'field|f|c4|Label', 'nope'], FR, 'Nom 2', EN);
     eq([s.value(L2, FR), s.isEdited('field|f|c3|Label'), s.isEdited('field|f|c4|Label')], ['Nom 2', false, false]);
     eq([alsoText(1), alsoText(3)], ['Also change the other copy of this field on this form', 'Also change the 3 other copies of this field on this form']);
   });
@@ -661,11 +800,11 @@ export function register(t: Kit): void {
     const copy = S('field', 'field|f|c3', 'Label', { [EN]: 'Name' }, { ref: { formId: 'f', datafield: 'name', controlId: 'name2', managed: true } });
     s.add([copy]);
     eq(s.get(copy.key)!.readOnly, MANAGED, 'read-only as the store takes it');
-    writeAlso(s, [L2, copy.key], FR, 'Nom 2');
+    writeAlso(s, [L2, copy.key], FR, 'Nom 2', EN);
     eq([s.value(L2, FR), s.isEdited(copy.key)], ['Nom 2', false]);
     // Its slot's reason taken away (a slot made elsewhere): still never staged.
     s.slots.set(copy.key, { ...copy, readOnly: '' });
-    writeAlso(s, [copy.key], FR, 'Nom 3');
+    writeAlso(s, [copy.key], FR, 'Nom 3', EN);
     s.set(copy.key, FR, 'Nom 3');
     eq(s.isEdited(copy.key), false);
   });
@@ -742,27 +881,27 @@ export function register(t: Kit): void {
     }),
   );
 
-  test('callout: in a field popup the form label takes the focus first, whether or not the form has a label of its own; the column name next', () => {
+  test('callout: in a field popup the column name takes the focus first, whether or not the form has a label of its own; the form label next, never the tooltip', () => {
     const s = fixture();
     const blocks = [
-      { key: L1, heading: 'Form label', long: false },
-      { key: TIP, heading: 'Tooltip', long: true },
       { key: COL, heading: 'Column name', long: false },
+      { key: TIP, heading: 'Tooltip', long: true },
+      { key: L1, heading: 'Form label', long: false },
     ];
-    eq(focusKeys(s, blocks), [L1, COL], 'the form has its own label');
+    eq(focusKeys(s, blocks), [COL, L1], 'the form has its own label');
     s.add([{ ...s.get(L1)!, labels: { [EN]: 'Name' } }]);
-    eq(focusKeys(s, blocks), [L1, COL], 'no French label (the page shows the column name in its place): the same');
+    eq(focusKeys(s, blocks), [COL, L1], 'no French label (the page shows the column name in its place): the same');
     s.set(L1, FR, 'Nom du client');
-    eq(focusKeys(s, blocks), [L1, COL], 'one staged: the same');
+    eq(focusKeys(s, blocks), [COL, L1], 'one staged: the same');
     s.revert(L1);
     s.add([{ ...s.get(L1)!, ref: { ...s.get(L1)!.ref, partial: [EN] } }]);
-    eq(focusKeys(s, blocks), [L1, COL], 'its French not read: the same');
-    eq(focusKeys(s, blocks.slice(0, 2)), [], 'no column name block: the first block, as in any other popup');
+    eq(focusKeys(s, blocks), [COL, L1], 'its French not read: the same');
+    eq(focusKeys(s, blocks.slice(1)), [], 'no column name block: the first block, as in any other popup');
     eq(focusKeys(s, [{ key: TIP, heading: 'Tooltip', long: true }]), []);
   });
 
   test(
-    "callout: a field popup shows Form label, Tooltip, then Column name with what it means; the focus goes to the form label in the page's language, to the column name only where the form label is read-only",
+    "callout: a field popup shows Column name, Tooltip, then Form label with what it means; the focus goes to the column name in the page's language, to the form label only where the column name is read-only",
     withDom(() => {
       const doc = document as unknown as { documentElement?: { lang: string } };
       const ctx = { base: EN, user: EN, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }, { lcid: DE, name: 'German', isBase: false }] };
@@ -774,32 +913,28 @@ export function register(t: Kit): void {
       const at = (e: Env) => e.focused()?.getAttribute('data-k');
       const e = popup(fixture(), 'en-US');
       eq(e.el.querySelectorAll('.co-bh').map((x) => x.textContent), [
-        'Form label · this form only, shown instead of the column name',
-        'Tooltip · everywhere',
         'Column name · everywhere: views, search and forms without a form label',
+        'Tooltip · everywhere',
+        'Form label · this form only, shown instead of the column name',
       ]);
-      eq(e.keys(), [`${L1}#1033`, `${L1}#1036`, `${TIP}#1033`, `${TIP}#1036`, `${COL}#1033`, `${COL}#1036`]);
+      eq(e.keys(), [`${COL}#1033`, `${COL}#1036`, `${TIP}#1033`, `${TIP}#1036`, `${L1}#1033`, `${L1}#1036`]);
       eq(e.inp(L1, FR).getAttribute('aria-label'), 'Form label, French');
       ok(e.el.querySelector('.co-also'), 'the copies checkbox stays with the form label');
-      // The form has its own label in the page's language: the form label, the text the page shows, never the column name.
-      eq(at(e), `${L1}#1033`);
-      eq(at(popup(fixture(), 'fr-FR')), `${L1}#1036`);
-      // No French label of its own (the page shows the column's French name in its place): the form label all the same,
-      // its placeholder saying what shows.
+      // The column's name in the page's language, whether or not the form has a label of its own.
+      eq(at(e), `${COL}#1033`);
+      eq(at(popup(fixture(), 'fr-FR')), `${COL}#1036`);
+      // No French label of its own (the page shows the column's French name in its place): the column name all the same;
+      // the form label's placeholder says what shows.
       const noFr = fixture();
       noFr.add([{ ...noFr.get(L1)!, labels: { [EN]: 'Name' } }]);
       const c = popup(noFr, 'fr-FR');
-      eq([at(c), c.inp(L1, FR).placeholder], [`${L1}#1036`, 'Shows “Nom”']);
-      // After Undo changes, the same.
+      eq([at(c), c.inp(L1, FR).placeholder], [`${COL}#1036`, 'Shows “Nom”']);
+      // After Undo changes (typed in the form label), back to the column name.
       c.type(L1, FR, 'Nom du client');
       fire(c.el.querySelector('.co-f .link')!, 'click');
-      eq(at(c), `${L1}#1036`);
-      // The form label not read in French: its English one, which takes typing, not the column name's French one.
-      const labelEn = fixture();
-      labelEn.add([{ ...labelEn.get(L1)!, ref: { ...labelEn.get(L1)!.ref, partial: [EN] } }]);
-      eq(at(popup(labelEn, 'fr-FR')), `${L1}#1033`);
-      // A language the popup doesn't show (German): the form label's first input that takes typing.
-      eq(at(popup(noFr, 'de-DE')), `${L1}#1033`);
+      eq(at(c), `${COL}#1036`);
+      // A language the popup doesn't show (German): the column name's first input that takes typing.
+      eq(at(popup(noFr, 'de-DE')), `${COL}#1033`);
       // The form from a managed solution (its labels read-only) on a column that can be typed in: the column name, in the
       // page's language; the form label has the lock line.
       const mf = fixture();
@@ -808,12 +943,17 @@ export function register(t: Kit): void {
       eq([at(m), m.inp(L1, FR).disabled, m.inp(COL, FR).disabled], [`${COL}#1036`, true, false]);
       eq(m.el.querySelectorAll('.co-ro').map((x) => x.textContent), [MANAGED.replace(/\.$/, '')]);
       eq(at(popup(mf, 'en-US')), `${COL}#1033`);
-      // The column's name read-only (a managed column): the form's own label still, with the lock line on the name.
+      // The column's name read-only (a managed column): the form's own label, the text the page shows, never the
+      // tooltip between them; the lock line on the name.
       const ro = fixture();
       ro.add([{ ...ro.get(L1)!, labels: { [EN]: 'Name' } }, { ...ro.get(COL)!, readOnly: 'Managed and not customizable.' }]);
       const r = popup(ro, 'fr-FR');
-      eq([at(r), r.inp(COL, FR).disabled], [`${L1}#1036`, true]);
+      eq([at(r), r.inp(COL, FR).disabled, r.inp(TIP, FR).disabled], [`${L1}#1036`, true, false]);
       eq(r.el.querySelectorAll('.co-ro').map((x) => x.textContent), ['Managed and not customizable']);
+      // ... and the form label not read in French: its English one, which takes typing.
+      const roEn = fixture();
+      roEn.add([{ ...roEn.get(L1)!, ref: { ...roEn.get(L1)!.ref, partial: [EN] } }, { ...roEn.get(COL)!, readOnly: 'Managed and not customizable.' }]);
+      eq(at(popup(roEn, 'fr-FR')), `${L1}#1033`);
       // Asked for (a list cell of a language): that one wins.
       eq(at(open(noFr, () => describe({ store: noFr, ctx, prefs: { target: FR, shown: [], showNames: false, dock: 'right' } } as unknown as AppApi, 'field|f|c1'), { focusKey: TIP, focusLcid: FR })), `${TIP}#1036`);
     }),
@@ -1037,6 +1177,401 @@ export function register(t: Kit): void {
     }),
   );
 
+  /**
+   * The name field of a main form once the read behind the page's loads is in (Store.setOwn): GetClientMetadata
+   * listed an English label of the cell's own, "Full name", and no French one, where the read filled in the column's
+   * French name, "Nom V4" (LIVE-FINDINGS 103, 114). With `copy`, the field placed a second time, following its column in
+   * both languages.
+   */
+  const following = (copy = false): Store => {
+    const s = mainForm({ [EN]: 'Full name', [FR]: 'Nom V4' });
+    s.add([{ ...s.get(L1)!, ref: { ...MAIN, own: { [EN]: true, [FR]: false } } }]);
+    if (copy) s.add([S('field', 'field|f|c2', 'Label', { [EN]: 'Name', [FR]: 'Nom V4' }, { baseRequired: false, order: 1, ref: { ...MAIN, elId: 'c2', controlId: 'name1', own: { [EN]: false, [FR]: false } } })]);
+    return s;
+  };
+  /** Types `text` at the end of an input one key at a time, as a user does (`put` sets its value and fires 'input'): what it holds after each key. */
+  const keyed = (get: () => FEl, put: (v: string) => void, text: string): string[] => [...text].map((k) => (put(get().value + k), get().value));
+  /** What an input holds after each key of "Nom V4 bis" typed from empty, through the column's French name. */
+  const NOM_V4_BIS = ['N', 'No', 'Nom', 'Nom ', 'Nom V', 'Nom V4', 'Nom V4 ', 'Nom V4 b', 'Nom V4 bi', 'Nom V4 bis'];
+
+  test("form label: it follows its column in a language where GetClientMetadata lists no label of the cell's own and its text as loaded is what a read fills in there, the column's name, else its English name (LIVE-FINDINGS 103, 114); not where it lists one, where the text is another, or where that read isn't known", () => {
+    const s = following();
+    eq([s.follows(L1, EN, EN), s.follows(L1, FR, EN)], [false, true], 'its own English label; French filled in');
+    // No German name for the column: a read fills in its English name.
+    s.add([{ ...s.get(L1)!, labels: { [EN]: 'Full name', [FR]: 'Nom V4', [DE]: 'Name' }, ref: { ...MAIN, own: { [EN]: true, [FR]: false, [DE]: false } } }]);
+    eq(s.follows(L1, DE, EN), true, "the column's English name");
+    // Whatever is typed, it is measured as loaded: a typed text, or the column renamed, changes nothing here.
+    s.set(L1, FR, 'Nom propre');
+    s.set(COL, FR, 'Nom V5');
+    eq(s.follows(L1, FR, EN), true, 'as loaded');
+    s.revert(L1);
+    s.revert(COL);
+    // Changed: a French text of the form's own that isn't published (GetClientMetadata reads the published form), or a
+    // saved one.
+    s.add([{ ...s.get(L1)!, labels: { [EN]: 'Full name', [FR]: 'Nom propre' } }]);
+    eq(s.follows(L1, FR, EN), false, 'another text');
+    s.add([{ ...s.get(L1)!, labels: { [EN]: 'Full name', [FR]: 'Nom V4' } }]);
+    s.set(L1, FR, 'Nom propre');
+    s.commit([{ change: { slot: s.get(L1)!, lcid: FR, before: 'Nom V4', after: 'Nom propre' }, outcome: 'saved' }]);
+    eq(s.follows(L1, FR, EN), false, 'saved since');
+    // Unknown: that language not read, or no read at all; the column's names not loaded; a read-only label.
+    const u = following();
+    u.add([{ ...u.get(L1)!, ref: { ...MAIN, own: { [EN]: true } } }]);
+    eq(u.follows(L1, FR, EN), false, 'French not read');
+    u.add([{ ...u.get(L1)!, ref: MAIN }]);
+    eq(u.follows(L1, FR, EN), false, 'no read');
+    const n = following();
+    n.slots.delete(COL);
+    eq(n.follows(L1, FR, EN), false, "the column's names not loaded");
+    const r = following();
+    r.add([{ ...r.get(L1)!, readOnly: MANAGED }]);
+    eq(r.follows(L1, FR, EN), false, 'read-only');
+  });
+
+  test(
+    "callout: a Form label that follows its column is empty, “Shows” the column's name as its placeholder; one of the form's own shows its text; typing in the empty one is an edit of it, and emptying it again stages nothing, so its column's name is never written there as its stand-in (copies too)",
+    withDom(() => {
+      const e = open(following(), fieldModel({ blocks: FIELD_BLOCKS }));
+      const row = (l: Lcid) => [e.inp(L1, l).value, e.inp(L1, l).placeholder, e.inp(L1, l).parentElement!.className];
+      eq(row(FR), ['', 'Shows “Nom V4”', 'co-v'], 'follows: empty, not missing');
+      eq(row(EN)[0], 'Full name', 'its own');
+      // Typed: an edit of that label, as any.
+      e.type(L1, FR, 'Nom propre');
+      eq([row(FR), e.store.value(L1, FR)], [['Nom propre', 'Shows “Nom V4”', 'co-v is-edit'], 'Nom propre']);
+      // Emptied again, or only spaces: nothing staged, no stand-in; empty again.
+      for (const v of ['', '  ']) {
+        e.type(L1, FR, 'Nom propre');
+        e.type(L1, FR, v);
+        eq([e.store.isEdited(L1, FR), e.store.standIn(L1, FR, EN), row(FR)], [false, undefined, ['', 'Shows “Nom V4”', 'co-v']], JSON.stringify(v));
+      }
+      eq(e.store.changes(), [], 'nothing to save');
+      // Typed key by key through the column's name, where the edit is unstaged (Store.set): the input keeps every key, and
+      // the whole text is staged.
+      eq(keyed(() => e.inp(L1, FR), (v) => e.type(L1, FR, v), 'Nom V4 bis'), NOM_V4_BIS);
+      eq(e.store.value(L1, FR), 'Nom V4 bis');
+      e.type(L1, FR, '');
+      // The column renamed here: the placeholder says the name it then shows.
+      e.type(COL, FR, 'Nom V5');
+      eq(row(FR), ['', 'Shows “Nom V5”', 'co-v']);
+      e.type(COL, FR, 'Nom V4');
+      // Its own English label emptied, French following: the cell keeps no label of its own (model.ts freesAll), so it
+      // follows its column in English too, saved so (its stand-in, `follow`): "Shows" the column's English name.
+      e.type(L1, EN, '');
+      eq([e.store.value(L1, EN), e.store.standIn(L1, EN, EN), row(EN)], ['', { text: 'Name', from: 'column', follow: true }, ['', 'Shows “Name”', 'co-v is-edit']]);
+      // The copies checkbox: both follow their column; typed, then emptied again, neither is staged.
+      const c = open(following(true), fieldModel({ blocks: [{ key: L1, heading: 'Form label', long: false, also: { keys: [L2], on: true } }] }));
+      c.type(L1, FR, 'Nom propre');
+      eq([c.store.value(L1, FR), c.store.value(L2, FR)], ['Nom propre', 'Nom propre']);
+      c.type(L1, FR, '');
+      eq([c.store.isEdited(L1), c.store.isEdited(L2), c.inp(L1, FR).value], [false, false, '']);
+      // A copy with a French label of its own worded as the column's name (one a whole-form save froze, LIVE-FINDINGS 109):
+      // emptied again, it gets that label back too, never its stand-in.
+      const frozen = following(true);
+      frozen.add([{ ...frozen.get(L2)!, ref: { ...frozen.get(L2)!.ref, own: { [EN]: false, [FR]: true } } }]);
+      const f = open(frozen, fieldModel({ blocks: [{ key: L1, heading: 'Form label', long: false, also: { keys: [L2], on: true } }] }));
+      f.type(L1, FR, 'Nom propre');
+      eq(f.store.value(L2, FR), 'Nom propre');
+      f.type(L1, FR, '');
+      eq([f.store.isEdited(L1), f.store.isEdited(L2), f.store.changes()], [false, false, []]);
+    }),
+  );
+
+  test(
+    "editor card: a Form label that follows its column is empty, “Shows” the column's name, in English too; emptying it again after typing stages nothing",
+    withDom(() => {
+      const store = following();
+      store.add([{ ...store.get(L1)!, labels: { [EN]: 'Name', [FR]: 'Nom V4' }, ref: { ...MAIN, own: { [EN]: false, [FR]: false } } }]);
+      const app = {
+        store,
+        ctx: { base: EN, user: EN, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }] },
+        prefs: { target: FR, shown: [], showNames: false, dock: 'right' },
+        root: dom.root,
+        layer: dom.layer,
+        adoptStyles() {},
+        toast() {},
+        status() {},
+      } as unknown as AppApi;
+      app.saver = createSaver(app.ctx, store, {} as AppApi['lang'], () => undefined);
+      const ed = createEditor(app, 'field|f|c1');
+      dom.layer.appendChild(ed.el as unknown as FEl);
+      const el = ed.el as unknown as FEl;
+      const inp = (l: Lcid) => el.querySelectorAll('.ti').find((x) => x.getAttribute('data-k') === `${L1}#${l}`)!;
+      const look = (l: Lcid) => [inp(l).value, inp(l).placeholder, inp(l).parentElement!.parentElement!.dataset.s];
+      eq([look(EN), look(FR)], [['', 'Shows “Name”', ''], ['', 'Shows “Nom V4”', '']]);
+      const typeIn = (l: Lcid, v: string) => {
+        inp(l).value = v;
+        fire(inp(l), 'input');
+      };
+      typeIn(FR, 'Nom propre');
+      eq([look(FR), store.value(L1, FR)], [['Nom propre', 'Shows “Nom V4”', 'edit'], 'Nom propre']);
+      typeIn(FR, '');
+      eq([look(FR), store.isEdited(L1)], [['', 'Shows “Nom V4”', ''], false]);
+      // Typed key by key through the column's name: the input keeps every key, and the whole text is staged.
+      eq(keyed(() => inp(FR), (v) => typeIn(FR, v), 'Nom V4 bis'), NOM_V4_BIS);
+      eq(store.value(L1, FR), 'Nom V4 bis');
+      ed.destroy();
+    }),
+  );
+
+  test(
+    "callout: which labels are their own, read behind the page's loads (Store.setOwn), arrives while the popup is open: a Form label that follows its column turns empty, “Shows” its name; one of its own keeps its text; what is typed stays",
+    withDom(() => {
+      const s = mainForm({ [EN]: 'Full name', [FR]: 'Nom V4' });
+      const e = open(s, fieldModel({ blocks: FIELD_BLOCKS }));
+      const row = (l: Lcid) => [e.inp(L1, l).value, e.inp(L1, l).placeholder];
+      eq([row(EN)[0], row(FR)[0]], ['Full name', 'Nom V4'], 'not known yet: as loaded');
+      s.setOwn(new Map([[L1, { [EN]: true, [FR]: false }]]));
+      eq([row(EN)[0], row(FR)], ['Full name', ['', 'Shows “Nom V4”']]);
+      eq(s.get(L1)!.ref.own, { [EN]: true, [FR]: false });
+      // Typed before it arrives: the text stays.
+      const typed = mainForm({ [EN]: 'Full name', [FR]: 'Nom V4' });
+      const f = open(typed, fieldModel({ blocks: FIELD_BLOCKS }));
+      f.type(L1, FR, 'Nom propre');
+      typed.setOwn(new Map([[L1, { [FR]: false }]]));
+      eq([f.inp(L1, FR).value, typed.value(L1, FR)], ['Nom propre', 'Nom propre']);
+    }),
+  );
+
+  /**
+   * The name field worded as its column in English ("Name") and in French (`fr`, "Nom V4" by default), GetClientMetadata's
+   * answer in English in (`en`: a label of the cell's own there), none in French yet; with `en` undefined, none at all.
+   */
+  const unanswered = (en: boolean | undefined, fr = 'Nom V4'): Store => {
+    const s = mainForm({ [EN]: 'Name', [FR]: fr });
+    s.add([{ ...s.get(L1)!, ref: { ...MAIN, ...(en === undefined ? {} : { own: { [EN]: en } }) } }]);
+    return s;
+  };
+
+  test(
+    "callout: a Form label in a language GetClientMetadata hasn't answered for yet, worded as the column's name there, shows as the user's language does: empty, “Shows” the name, where English follows; its text where English has one of its own; the answer, once in, decides; a text of the form's own never shows empty; typing or emptying it stages by what it shows: nothing where it shows empty, as where its own answer says it follows, else what it did before",
+    withDom(() => {
+      const french = (s: Store) => {
+        const e = open(s, fieldModel({ blocks: FIELD_BLOCKS }));
+        return [e.inp(L1, FR).value, e.inp(L1, FR).placeholder];
+      };
+      eq(french(unanswered(false)), ['', 'Shows “Nom V4”'], 'English follows');
+      eq(french(unanswered(true))[0], 'Nom V4', 'English has its own');
+      eq(french(unanswered(undefined))[0], 'Nom V4', 'nothing answered');
+      eq(french(unanswered(false, 'Nom propre'))[0], 'Nom propre', "a text of the form's own");
+      // Shown so: Store.follows with the user's language, as the inputs show it and stage by it; without it, nothing is known yet.
+      const g = unanswered(false);
+      eq([g.follows(L1, FR, EN, EN), g.follows(L1, FR, EN), g.follows(L1, EN, EN, EN)], [true, false, true]);
+      // The French answer, once in, decides: a label of its own worded as the column's name (LIVE-FINDINGS 109).
+      const s = unanswered(false);
+      const e = open(s, fieldModel({ blocks: FIELD_BLOCKS }));
+      s.setOwn(new Map([[L1, { [FR]: true }]]));
+      eq(e.inp(L1, FR).value, 'Nom V4', 'its own after all');
+      const t = unanswered(true);
+      const f = open(t, fieldModel({ blocks: FIELD_BLOCKS }));
+      t.setOwn(new Map([[L1, { [FR]: false }]]));
+      eq(f.inp(L1, FR).value, '', 'following after all');
+      // What each input stages, typed key by key or emptied: shown empty (English follows), what it stages where French's own
+      // answer says it follows: a blank is nothing; shown with its text (English has its own), what it stages with nothing
+      // answered at all.
+      const follows = (): Store => {
+        const s = mainForm({ [EN]: 'Name', [FR]: 'Nom V4' });
+        s.add([{ ...s.get(L1)!, ref: { ...MAIN, own: { [EN]: false, [FR]: false } } }]);
+        return s;
+      };
+      const staged = (st: Store, vs: string[]) => {
+        const p = open(st, fieldModel({ blocks: FIELD_BLOCKS }));
+        for (const v of vs) p.type(L1, FR, v);
+        return [st.isEdited(L1, FR), st.value(L1, FR), st.standIn(L1, FR, EN)?.text ?? null, st.changes().length];
+      };
+      for (const vs of [[''], ['  '], ['x', ''], ['Nom V4', ''], ['Nom V4 bis', 'Nom V4'], ['Nom propre']]) {
+        eq(staged(unanswered(false), vs), staged(follows(), vs), `shown empty: ${JSON.stringify(vs)}`);
+        eq(staged(unanswered(true), vs), staged(unanswered(undefined), vs), `shown with its text: ${JSON.stringify(vs)}`);
+      }
+      eq([staged(unanswered(false), ['x', '']), staged(unanswered(true), ['x', ''])], [[false, 'Nom V4', null, 0], [true, '', 'Nom V4', 1]], 'typed, then emptied: nothing where it showed empty');
+    }),
+  );
+
+  test(
+    "editor card: a Form label in a language GetClientMetadata hasn't answered for yet, worded as the column's name there, shows as the user's language does: empty, “Shows” the name, where English follows",
+    withDom(() => {
+      const card = (store: Store) => {
+        const app = {
+          store,
+          ctx: { base: EN, user: EN, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }] },
+          prefs: { target: FR, shown: [], showNames: false, dock: 'right' },
+          root: dom.root,
+          layer: dom.layer,
+          adoptStyles() {},
+          toast() {},
+          status() {},
+        } as unknown as AppApi;
+        app.saver = createSaver(app.ctx, store, {} as AppApi['lang'], () => undefined);
+        const ed = createEditor(app, 'field|f|c1');
+        dom.layer.appendChild(ed.el as unknown as FEl);
+        const inp = (ed.el as unknown as FEl).querySelectorAll('.ti').find((x) => x.getAttribute('data-k') === `${L1}#${FR}`)!;
+        const out = [inp.value, inp.placeholder];
+        ed.destroy();
+        return out;
+      };
+      eq(card(unanswered(false)), ['', 'Shows “Nom V4”'], 'English follows');
+      eq(card(unanswered(true))[0], 'Nom V4', 'English has its own');
+    }),
+  );
+
+  test(
+    "callout and editor card: a French user's English Form label shown empty because French follows the column (no English answer from GetClientMetadata yet), typed in then emptied, stages nothing, never an emptied English label (which Dataverse doesn't keep, LIVE-FINDINGS 104), nor on its copy with “Also change the other copies”; an English user's French label the same",
+    withDom(() => {
+      /** The name field placed twice, worded as its column in both languages, `own`: what GetClientMetadata answered so far. */
+      const twice = (own: Record<number, boolean>): Store => {
+        const s = mainForm({ [EN]: 'Name', [FR]: 'Nom V4' });
+        const copy = S('field', 'field|f|c2', 'Label', { [EN]: 'Name', [FR]: 'Nom V4' }, { baseRequired: false, ref: { ...MAIN, elId: 'c2', controlId: 'name1', own } });
+        s.add([{ ...s.get(L1)!, ref: { ...MAIN, own } }, copy]);
+        return s;
+      };
+      const typed = (s: Store, l: Lcid) => [s.isEdited(L1, l), s.isEdited(L2, l), s.changes().length];
+      for (const [user, l, own] of [[FR, EN, { [FR]: false }], [EN, FR, { [EN]: false }]] as const) {
+        const s = twice(own);
+        const e = open(s, fieldModel({}, { keys: [L2], on: true }), { user });
+        eq(e.inp(L1, l).value, '', `shown empty (${l})`);
+        e.type(L1, l, 'x');
+        eq(typed(s, l), [true, true, 2], `typed (${l})`);
+        e.type(L1, l, '');
+        eq([typed(s, l), e.inp(L1, l).value], [[false, false, 0], ''], `emptied: nothing staged (${l})`);
+        // The editor card: the same.
+        const t = twice(own);
+        const app = {
+          store: t,
+          ctx: { base: EN, user, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }] },
+          prefs: { target: FR, shown: [], showNames: false, dock: 'right' },
+          root: dom.root,
+          layer: dom.layer,
+          adoptStyles() {},
+          toast() {},
+          status() {},
+        } as unknown as AppApi;
+        app.saver = createSaver(app.ctx, t, {} as AppApi['lang'], () => undefined);
+        const ed = createEditor(app, 'field|f|c1');
+        dom.layer.appendChild(ed.el as unknown as FEl);
+        const inp = (ed.el as unknown as FEl).querySelectorAll('.ti').find((x) => x.getAttribute('data-k') === `${L1}#${l}`)!;
+        eq(inp.value, '', `the card: shown empty (${l})`);
+        for (const v of ['x', '']) {
+          inp.value = v;
+          fire(inp, 'input');
+        }
+        eq([t.isEdited(L1, l), t.changes().length], [false, 0], `the card: nothing staged (${l})`);
+        ed.destroy();
+      }
+    }),
+  );
+
+  test("preview: a Form label that follows its column shows the column's name as staged while nothing is typed in it, the name typed in any popup (Preview.showing finds the labels that show it); one of the form's own keeps its text; undone, the page is as before", () => {
+    const s = following(true);
+    const label = (text: string) => Object.assign(new El('label', {}, text), { isConnected: true });
+    const page = (user: Lcid, texts: [string, string]) => {
+      const p = new Preview({ store: s, ctx: { base: EN, user } } as unknown as AppApi, (fn) => fn());
+      const [one, two] = texts.map(label);
+      const body = new El('div').add(one, two);
+      const all = [{ key: L1, el: one }, { key: L2, el: two }, { key: TIP, el: label('Primary name') }] as unknown as Anchor[];
+      // As translation mode does on an edit (inspector/mode.ts): the edited label's anchors, and those that show it.
+      const edited = (key: string) => withPage(body, () => p.apply([...all.filter((a) => a.key === key), ...p.showing(key, all)]));
+      return { p, all, edited, shown: () => [one.node.nodeValue, two.node.nodeValue] };
+    };
+    // French: both follow the column.
+    const fr = page(FR, ['Nom V4', 'Nom V4']);
+    eq([fr.p.showing(COL, fr.all).map((a) => a.key), fr.p.showing(L1, fr.all), fr.p.showing(TIP, fr.all)], [[L1, L2], [], []], 'the labels that show the name');
+    s.set(COL, FR, 'Nom V5');
+    fr.edited(COL);
+    eq(fr.shown(), ['Nom V5', 'Nom V5'], 'as typed');
+    s.set(L1, FR, 'Nom propre');
+    fr.edited(L1);
+    eq(fr.shown(), ['Nom propre', 'Nom V5'], 'a text typed in the label is its own');
+    s.revert(L1);
+    fr.edited(L1);
+    s.revert(COL);
+    fr.edited(COL);
+    eq(fr.shown(), ['Nom V4', 'Nom V4'], 'undone');
+    // English: the first has a label of its own, the copy follows the column.
+    const en = page(EN, ['Full name', 'Name']);
+    s.set(COL, EN, 'Account name');
+    en.edited(COL);
+    eq(en.shown(), ['Full name', 'Account name']);
+    s.revert(COL);
+    en.edited(COL);
+    eq(en.shown(), ['Full name', 'Name']);
+  });
+
+  test("preview: on a French page, the French name of a column that Form labels follow typed as spaces alone: they show what they show with it emptied, the column's English name (its stand-in), never their old French text", () => {
+    const s = following(true);
+    const p = new Preview({ store: s, ctx: { base: EN, user: FR } } as unknown as AppApi, (fn) => fn());
+    const [one, two] = ['Nom V4', 'Nom V4'].map((x) => Object.assign(new El('label', {}, x), { isConnected: true }));
+    const all = [{ key: L1, el: one }, { key: L2, el: two }] as unknown as Anchor[];
+    const edited = () => withPage(new El('div').add(one, two), () => p.apply(p.showing(COL, all)));
+    s.set(COL, FR, '   ');
+    edited();
+    eq([one.node.nodeValue, two.node.nodeValue], ['Name', 'Name'], 'spaces');
+    eq(becomes(s, s.get(COL)!, FR, EN), "Becomes “Name”: Dataverse can't remove a translation here, so French gets the English text.", 'what saving writes');
+    s.set(COL, FR, '');
+    edited();
+    eq([one.node.nodeValue, two.node.nodeValue], ['Name', 'Name'], 'emptied');
+    s.set(COL, FR, '  Nom V5 ');
+    edited();
+    eq([one.node.nodeValue, two.node.nodeValue], ['Nom V5', 'Nom V5'], 'a name between spaces');
+  });
+
+  test("preview: a form label the page shows otherwise than loaded (saved, not published yet) shows the page's text again once its edit is undone, and keeps it while another label or its column is edited (it has a text of its own)", () => {
+    const s = mainForm({ [EN]: 'Saved label', [FR]: 'Nom' });
+    const el = Object.assign(new El('label', {}, 'Published label'), { isConnected: true });
+    const body = new El('div').add(el);
+    const p = new Preview({ store: s, ctx: { base: EN, user: EN } } as unknown as AppApi, (fn) => fn());
+    const all = [{ key: L1, el, orig: 'Published label' }] as unknown as Anchor[];
+    const shown = (step: () => void) => (step(), withPage(body, () => p.apply(all)), el.node.nodeValue);
+    eq(shown(() => s.set(L1, EN, 'Draft')), 'Draft', 'staged');
+    eq(shown(() => s.revert(L1)), 'Published label', 'undone');
+    eq(shown(() => s.group(() => s.set(TIP, EN, 'Other'))), 'Published label', 'another label edited');
+    eq(shown(() => s.set(COL, EN, 'Account name')), 'Published label', 'its column renamed');
+  });
+
+  test('preview: on a French page, a field showing its column\'s English name (the column has no French one) shows an English rename of the column at once, with no French edit staged anywhere', () => {
+    const s = new Store();
+    s.add([
+      S('field', 'field|f|c1', 'Label', { [EN]: 'Name', [FR]: 'Name' }, { baseRequired: false, ref: { ...MAIN, own: { [EN]: false, [FR]: false } } }),
+      S('attribute', 'attribute|acc.name', 'DisplayName', { [EN]: 'Name' }, { ref: { entity: 'acc', attribute: 'name' } }),
+    ]);
+    const el = Object.assign(new El('label', {}, 'Name'), { isConnected: true });
+    const body = new El('div').add(el);
+    const p = new Preview({ store: s, ctx: { base: EN, user: FR } } as unknown as AppApi, (fn) => fn());
+    s.set(COL, EN, 'Account name');
+    withPage(body, () => p.apply(p.showing(COL, [{ key: L1, el }] as unknown as Anchor[])));
+    eq(el.node.nodeValue, 'Account name');
+  });
+
+  test("preview: on a French page, a field that follows a column with a French name keeps the page's text (a published one) while only English is edited, its column's or its own: no English text shows there", () => {
+    const s = new Store();
+    s.add([
+      S('field', 'field|f|c1', 'Label', { [EN]: 'Name', [FR]: 'Colonne enregistrée' }, { baseRequired: false, ref: { ...MAIN, own: { [EN]: false, [FR]: false } } }),
+      S('attribute', 'attribute|acc.name', 'DisplayName', { [EN]: 'Name', [FR]: 'Colonne enregistrée' }, { ref: { entity: 'acc', attribute: 'name' } }),
+    ]);
+    const el = Object.assign(new El('label', {}, 'Étiquette publiée'), { isConnected: true });
+    const body = new El('div').add(el);
+    const p = new Preview({ store: s, ctx: { base: EN, user: FR } } as unknown as AppApi, (fn) => fn());
+    const all = [{ key: L1, el, orig: 'Étiquette publiée' }] as unknown as Anchor[];
+    const shown = (step: () => void) => (step(), withPage(body, () => p.apply(all)), el.node.nodeValue);
+    eq(shown(() => s.set(COL, EN, 'Account name')), 'Étiquette publiée', 'its column renamed in English');
+    eq(shown(() => s.set(L1, EN, 'Own name')), 'Étiquette publiée', 'its English label edited');
+    eq(shown(() => s.set(COL, FR, 'Nom du compte')), 'Nom du compte', 'its column renamed in French');
+    eq(shown(() => s.revert(COL)), 'Étiquette publiée', 'undone');
+  });
+
+  test(
+    '“Also change the other copies” and a label that follows its column: typed in, then emptied, its copy gets the edit it had staged before back, never its loaded text',
+    withDom(() => {
+      const own = { [EN]: false, [FR]: false };
+      const s = mainForm({ [EN]: 'Name', [FR]: 'Nom V4' });
+      s.add([{ ...s.get(L1)!, ref: { ...MAIN, own } }, S('field', 'field|f|c2', 'Label', { [EN]: 'Name', [FR]: 'Nom V4' }, { baseRequired: false, ref: { ...MAIN, elId: 'c2', controlId: 'name1', own } })]);
+      s.set(L2, FR, 'Nom (copie)');
+      const e = open(s, fieldModel({}, { keys: [L2], on: true }), { user: FR });
+      e.type(L1, FR, 'x');
+      eq([s.value(L1, FR), s.value(L2, FR)], ['x', 'x'], 'typed');
+      e.type(L1, FR, '');
+      eq([s.isEdited(L1, FR), s.value(L2, FR), s.changes().length], [false, 'Nom (copie)', 1], 'emptied');
+    }),
+  );
+
   test(
     "callout: Microsoft's built-in text: a title and one plain line, no inputs; Done and Esc close it",
     withDom(() => {
@@ -1130,22 +1665,51 @@ export function register(t: Kit): void {
   test(
     'callout: Undo changes shows once something changed and restores the texts as they were when it opened',
     withDom(() => {
-      const s = fixture();
-      s.set(TIP, FR, 'Tapez le nom.'); // staged before
-      const e = open(s, fieldModel());
+      const e = open(fixture(), fieldModel());
+      const s = e.store;
       eq(e.foot(), ['Done']);
       e.type(L1, FR, 'Nom complet');
       e.type(TIP, FR, 'Saisissez le nom.');
       eq(e.foot(), ['Undo changes', 'Done']);
       fire(e.el.querySelector('.co-f .link')!, 'click');
-      eq([s.value(L1, FR), s.isEdited(L1, FR), s.value(TIP, FR)], ['Nom', false, 'Tapez le nom.'], 'the earlier staged tooltip stays');
-      eq([e.inp(L1, FR).value, e.inp(TIP, FR).value], ['Nom', 'Tapez le nom.']);
+      eq([s.value(L1, FR), s.isEdited(L1, FR), s.isEdited(TIP, FR)], ['Nom', false, false]);
+      eq([e.inp(L1, FR).value, e.inp(TIP, FR).value], ['Nom', '']);
       eq([e.foot(), e.closed], [['Done'], 0], 'still open');
       eq(e.focused()?.getAttribute('data-k'), `${L1}#1033`, 'the focus stays in the popup');
       // Typing a text back to what it was is not a change.
       e.type(L1, FR, 'X');
       e.type(L1, FR, 'Nom');
       eq(e.foot(), ['Done']);
+    }),
+  );
+
+  test(
+    'callout: opened again on texts staged before, Undo changes shows at once: it first puts back what was changed in it, then takes back the edits staged before (to the server text, one undo step), and the popup goes on from there; never an edit in a language it does not show',
+    withDom(() => {
+      const s = fixture();
+      s.set(TIP, FR, 'Tapez le nom.'); // staged before, then the popup closed
+      s.set(L1, DE, 'Name (DE)'); // German, not shown in the popup
+      const e = open(s, fieldModel());
+      eq(e.foot(), ['Undo changes', 'Done'], 'a text it shows holds a staged edit');
+      // Typed in it: the first click puts back what it opened with, the earlier staged tooltip kept.
+      e.type(L1, FR, 'Nom complet');
+      fire(e.el.querySelector('.co-f .link')!, 'click');
+      eq([s.isEdited(L1, FR), s.value(TIP, FR), e.inp(TIP, FR).value, e.foot()], [false, 'Tapez le nom.', 'Tapez le nom.', ['Undo changes', 'Done']]);
+      // Nothing changed in it now: the next click takes the staged tooltip back, to the server text.
+      fire(e.el.querySelector('.co-f .link')!, 'click');
+      eq([s.isEdited(TIP, FR), s.value(TIP, FR), e.inp(TIP, FR).value, e.foot(), e.closed], [false, '', '', ['Done'], 0]);
+      eq(s.value(L1, DE), 'Name (DE)', 'German untouched');
+      eq(e.focused()?.getAttribute('data-k'), `${L1}#1033`, 'the focus stays in the popup');
+      // One undo step: Ctrl+Z on the page brings the tooltip's edit back; Undo changes takes it back again.
+      s.undo();
+      eq([s.value(TIP, FR), e.inp(TIP, FR).value, e.foot()], ['Tapez le nom.', 'Tapez le nom.', ['Undo changes', 'Done']]);
+      fire(e.el.querySelector('.co-f .link')!, 'click');
+      eq([s.isEdited(TIP, FR), e.foot()], [false, ['Done']]);
+      // Typing in it and closing it work as before from there: Done keeps the typed text staged.
+      e.type(L1, FR, 'Nom 2');
+      eq(e.foot(), ['Undo changes', 'Done']);
+      fire(e.el.querySelector('.co-f .btn.primary')!, 'click');
+      eq([s.value(L1, FR), e.closed], ['Nom 2', 1]);
     }),
   );
 
@@ -1293,7 +1857,7 @@ export function register(t: Kit): void {
   );
 
   test(
-    'callout: pending choices: "Choices (2) · 1 changed" in green, open by itself; the caret on the form label in a field\'s popup, on the column name in a column\'s, on the first pending choice in a popup without a column name',
+    'callout: pending choices: "Choices (2) · 1 changed" in green, open by itself; the caret on the column name in a field\'s popup and in a column\'s, on the first pending choice in a popup without a column name',
     withDom(() => {
       const s = fixture();
       s.set(O2, FR, 'Grand');
@@ -1301,7 +1865,7 @@ export function register(t: Kit): void {
       const dis = e.el.querySelector('.co-dis')!;
       const note = () => e.el.querySelector('.co-dn')!;
       eq([dis.textContent, dis.getAttribute('aria-expanded'), note().className], ['Choices (2) · 1 changed', 'true', 'co-dn is-edit']);
-      eq(e.focused()?.getAttribute('data-k'), `${L1}#1033`, "a field's popup: the form label, not the changed choice");
+      eq(e.focused()?.getAttribute('data-k'), `${COL}#1033`, "a field's popup: the column name, not the changed choice");
       // Staged here: the note follows at once.
       e.type(O1, FR, 'Petit 2');
       eq(note().textContent, ' · 2 changed');
@@ -1315,7 +1879,7 @@ export function register(t: Kit): void {
       const n = open(fixture(), fieldModel({ choices: { keys: [O1, O2], open: false } }));
       eq([n.el.querySelector('.co-dis')!.textContent, n.el.querySelector('.co-dis')!.getAttribute('aria-expanded'), n.focused()?.getAttribute('data-k')], ['Choices (2)', 'false', `${L1}#1033`]);
       // A column's popup (a view's header): its name, not the changed choice.
-      const hd = open(s, { comp: 'attribute|acc.name', title: 'Name', kind: 'Column', icon: 'field', blocks: [FIELD_BLOCKS[2], FIELD_BLOCKS[1]], choices: { keys: [O1, O2], open: false }, loading: false });
+      const hd = open(s, { comp: 'attribute|acc.name', title: 'Name', kind: 'Column', icon: 'field', blocks: [FIELD_BLOCKS[0], FIELD_BLOCKS[1]], choices: { keys: [O1, O2], open: false }, loading: false });
       eq([hd.focused()?.getAttribute('data-k'), hd.el.querySelector('.co-dis')!.getAttribute('aria-expanded')], [`${COL}#1033`, 'true']);
       // No column name in the popup: the changed choice, the only sign of it.
       const nn = open(s, fieldModel({ choices: { keys: [O1, O2], open: false } }));
@@ -1334,9 +1898,9 @@ export function register(t: Kit): void {
       const e = open(s, fieldModel({ choices: { keys: [O1, O2], open: false } }));
       eq([e.el.querySelector('.co-dis')!.textContent, e.el.querySelector('.co-dn')!.className], ['Choices (2) · 2 not published', 'co-dn is-err']);
       eq(e.focused()?.getAttribute('data-k'), `${O1}#1033`, 'no column name in the popup: the first pending one, in option order');
-      // A field's popup says it the same way, its form label keeps the caret.
+      // A field's popup says it the same way, its column name keeps the caret.
       const fp = open(s, fieldModel({ blocks: FIELD_BLOCKS, choices: { keys: [O1, O2], open: false } }));
-      eq([fp.el.querySelector('.co-dis')!.textContent, fp.focused()?.getAttribute('data-k')], ['Choices (2) · 2 not published', `${L1}#1033`]);
+      eq([fp.el.querySelector('.co-dis')!.textContent, fp.focused()?.getAttribute('data-k')], ['Choices (2) · 2 not published', `${COL}#1033`]);
       // Opened for a choice (the value the field shows, or a grid cell): that one keeps the focus.
       const v = open(s, { comp: 'option|acc.kind|2', title: 'Large', kind: 'Choice', icon: 'choice', blocks: [], choices: { keys: [O1, O2], open: true, focus: O2 }, loading: false }, { focusKey: O2 });
       eq(v.focused()?.getAttribute('data-k'), `${O2}#1033`);
@@ -1382,9 +1946,9 @@ export function register(t: Kit): void {
       const ctx = { base: EN, user: EN, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }] };
       const app = { store: s, ctx, prefs: { target: FR, shown: [], showNames: false, dock: 'right' } } as unknown as AppApi;
       const md = describe(app, 'field|f|c1');
-      eq([md.blocks.map((b) => b.key), md.readOnly], [[L1, TIP, COL], undefined]);
+      eq([md.blocks.map((b) => b.key), md.readOnly], [[COL, TIP, L1], undefined]);
       const e = open(s, md);
-      eq(e.focused()?.getAttribute('data-k'), `${L1}#1033`, "the caret in the form's own label");
+      eq(e.focused()?.getAttribute('data-k'), `${L1}#1033`, "the column's name read-only: the caret in the form's own label");
       eq([e.inp(L1, FR).disabled, e.inp(TIP, FR).disabled, e.inp(COL, FR).disabled], [false, true, true]);
       const why = MANAGED.replace(/\.$/, '');
       eq(e.el.querySelectorAll('.co-ro').map((x) => x.textContent), [why, why]);
@@ -1403,6 +1967,32 @@ export function register(t: Kit): void {
       ok(e2.el.querySelectorAll('.ti').every((x) => x.disabled), 'every input disabled');
       ok(e2.focused() === e2.el, 'nothing to type in, not even the column name: the dialog itself has the focus');
       eq(e2.el.querySelectorAll('.co-ro').map((x) => x.textContent), [why], 'one line');
+    }),
+  );
+
+  test(
+    "callout: where this session allows changes to managed labels (Store.managedEdits), a managed column's name and tooltip its loader set up for that are editable, each with the amber line on what saving does; one still read-only (not customizable) keeps its lock line; off again, read-only with the managed reason",
+    withDom(() => {
+      const s = fixture();
+      const NOT = "This column is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here.";
+      const col = { entity: 'acc', attribute: 'name', managed: true, held: MANAGED };
+      s.add([S('attribute', 'attribute|acc.name', 'DisplayName', { [EN]: 'Name', [FR]: 'Nom' }, { ref: { ...col, lock: '' } }), S('attribute', 'attribute|acc.name', 'Description', { [EN]: 'Type the name.' }, { ref: { ...col, lock: NOT } })]);
+      s.setManagedEdits(true);
+      const ctx = { base: EN, user: EN, langs: [{ lcid: EN, name: 'English', isBase: true }, { lcid: FR, name: 'French', isBase: false }] };
+      const app = { store: s, ctx, prefs: { target: FR, shown: [], showNames: false, dock: 'right' } } as unknown as AppApi;
+      const e = open(s, describe(app, 'field|f|c1'));
+      eq([e.inp(COL, FR).disabled, e.inp(TIP, FR).disabled, e.inp(L1, FR).disabled], [false, true, false]);
+      eq(
+        e.el.querySelectorAll('.co-ro').map((x) => [x.className, x.textContent]),
+        [['co-ro is-warn', MANAGED_OPEN.replace(/\.$/, '')], ['co-ro', NOT.replace(/\.$/, '')]],
+      );
+      e.type(COL, FR, 'Nom 2');
+      eq(s.value(COL, FR), 'Nom 2', 'staged');
+      e.co.destroy();
+      s.revert(COL);
+      s.setManagedEdits(false);
+      const e2 = open(s, describe(app, 'field|f|c1'));
+      eq([e2.inp(COL, FR).disabled, e2.el.querySelectorAll('.co-ro').map((x) => x.textContent)], [true, [MANAGED.replace(/\.$/, ''), MANAGED.replace(/\.$/, '')]]);
     }),
   );
 

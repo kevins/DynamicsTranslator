@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="64" viewBox="0 0 420 64" role="img" aria-label="Get Dynamics Translator: drag its button onto your favourites bar">
+  <title>Get Dynamics Translator: drag its button onto your favourites bar</title>
+  <rect width="420" height="64" rx="10" fill="#0f6cbd"/>
+  <g transform="translate(22 16)" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M4 2h18a2 2 0 0 1 2 2v26l-11-7-11 7V4a2 2 0 0 1 2-2z"/>
+    <path d="M13 8v10M8.5 13.5 13 18l4.5-4.5"/>
+  </g>
+  <text x="66" y="29" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, Helvetica Neue, Arial, sans-serif" font-size="19" font-weight="600" fill="#ffffff">Get Dynamics Translator</text>
+  <text x="66" y="49" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, Helvetica Neue, Arial, sans-serif" font-size="13.5" fill="#dcebfb">Drag its button onto your favourites bar</text>
+</svg>

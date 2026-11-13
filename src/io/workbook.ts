@@ -13,7 +13,7 @@
 
 import type { Ctx } from '../core/context';
 import { isLogicalName } from '../core/http';
-import { KIND_NAMES, MANAGED, PROP_NAMES, isManaged, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
+import { KIND_NAMES, PROP_NAMES, isManaged, managedReadOnly, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
 import type { Store } from '../core/store';
 import { normId } from '../core/xml';
 import type { ImportResult, IoApi, ParsedImport } from '../ui/types';
@@ -302,13 +302,30 @@ function layout(slots: Slot[], langs: Lcid[]): Sheet[] {
 
 // ---- Import ----
 
-/** The header row names our CSV export's Key column (CSV_KEY): it is then called Key, as in any keyed sheet. */
+/** The header row names our CSV export's Key column (CSV_KEY): it is then called Key, as in any keyed sheet, each time (two are two Key columns). */
 function mine(grid: Cell[][]): boolean {
   const head = grid[0] || [];
-  const i = Array.from(head, (h) => str(h).trim().toLowerCase()).indexOf(CSV_KEY.toLowerCase());
-  if (i < 0) return false;
-  head[i] = 'Key';
-  return true;
+  let ours = false;
+  Array.from(head, (h) => str(h).trim().toLowerCase()).forEach((h, i) => {
+    if (h !== CSV_KEY.toLowerCase()) return;
+    head[i] = 'Key';
+    ours = true;
+  });
+  return ours;
+}
+
+/**
+ * The layout of a CSV whose header row has these cells (trimmed, lowercase): -1 ours or another keyed one (a Key
+ * column); else the Easy Translator sheet whose columns it has (the most specific one; legacy "Forms Fields" lack
+ * "Display name" and would otherwise pass for "Dashboards Fields"); -2 neither.
+ */
+function csvLayout(head: string[]): number {
+  if (head.includes(CSV_KEY.toLowerCase()) || head.includes('key')) return -1;
+  let si = -2;
+  SPECS.forEach((sp, i) => {
+    if (sp.c.every((c) => c === 'Display name' || head.includes(c.toLowerCase())) && (si < 0 || sp.c.length > SPECS[si].c.length)) si = i;
+  });
+  return si;
 }
 
 async function parse(file: File): Promise<ParsedImport> {
@@ -340,6 +357,11 @@ async function parse(file: File): Promise<ParsedImport> {
         throw new Error(`${csv ? 'The file' : `Sheet "${sheet}"`} has two columns for language ${l} (${colName(j)} and ${colName(i)}). Keep one of them, then import again.`);
     }
     for (const [, l] of lc) languages.add(l);
+    // Two columns of one name (our CSV's Key beside a Key of its own, too): which one names the label is not known either.
+    for (const c of cols) {
+      const js = head.flatMap((h, i) => (h.toLowerCase() === c.toLowerCase() ? [i] : []));
+      if (js.length > 1) throw new Error(`${csv ? 'The file' : `Sheet "${sheet}"`} has two ${c} columns (${colName(js[0])} and ${colName(js[1])}). Keep one of them, then import again.`);
+    }
     const failed = new Set(errs.map(([r, c]) => `${r}:${c}`));
     // Columns by header text; Easy Translator sheets fall back to the column position (its importer is positional).
     const at = cols.map((c, i) => {
@@ -383,23 +405,25 @@ async function parse(file: File): Promise<ParsedImport> {
   };
 
   if (csv) {
-    // UTF-8 (with or without BOM), UTF-16 ("Unicode Text" from Excel), else ANSI ("CSV (Comma delimited)").
+    // UTF-8 (with or without BOM), UTF-16 ("Unicode Text" from Excel), else ANSI ("CSV (Comma delimited)"). A byte order
+    // mark says which one the file is in: bytes that aren't that encoding are a damaged file, never read as ANSI instead.
+    const bom = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 'utf-8' : '';
     let text: string;
     try {
-      text = new TextDecoder(bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : 'utf-8', { fatal: true }).decode(bytes);
+      text = new TextDecoder(bom || 'utf-8', { fatal: true }).decode(bytes);
     } catch {
+      if (bom) throw new Error('The CSV file is damaged (its text could not be read). Save or export it again, then use the new file.');
       text = new TextDecoder('windows-1252').decode(bytes);
     }
-    const grid = parseCsv(text, false);
+    // The delimiter (parseCsv) is the one under which the header row is in a layout and has a language column (only
+    // such a header stages anything).
+    const grid = parseCsv(text, false, (cells) => {
+      const h = cells.map((c) => c.trim().toLowerCase());
+      return csvLayout(h) !== -2 && h.some((c) => /^\d{4,5}$/.test(c));
+    });
     const head = (grid[0] || []).map((h) => h.trim().toLowerCase());
     const own = mine(grid);
-    // Ours has a Key column; otherwise the Easy Translator sheet whose columns it has (the most specific one;
-    // legacy "Forms Fields" lack "Display name" and would otherwise pass for "Dashboards Fields").
-    let si = own || head.includes('key') ? -1 : -2;
-    if (si === -2)
-      SPECS.forEach((sp, i) => {
-        if (sp.c.every((c) => c === 'Display name' || head.includes(c.toLowerCase())) && (si < 0 || sp.c.length > SPECS[si].c.length)) si = i;
-      });
+    const si = csvLayout(head);
     if (si === -2) throw new Error('This CSV file has no "Key" column and does not match an Easy Translator sheet, so it cannot be imported.');
     // Only our export (its Key header says so) comes from toCsv, which puts an apostrophe before text that starts like a
     // formula. In any other CSV (another tool's, a sheet saved by Excel, or an export of ours from before that header)
@@ -587,8 +611,9 @@ function apply(parsed: ParsedImport, store: Store, inst?: Set<Lcid>): ImportResu
       const guard = r.lit ? diff.filter((l) => unguard(r.values[l]) === store.value(key, l)) : [];
       const put = diff.filter((l) => !guard.includes(l));
       res.unchanged += ok.length - diff.length;
-      // A read-only label (one from a managed solution included, whatever its slot says) is skipped with the reason.
-      const ro = slot.readOnly || (isManaged(slot) ? MANAGED : '');
+      // A read-only label (one from a managed solution included, whatever its slot says, unless this session allows changes to
+      // those and its load said it may be changed) is skipped with the reason.
+      const ro = slot.readOnly || (isManaged(slot) ? managedReadOnly(slot, store.managedEdits) : '');
       if (ro) {
         if (put.length) skip(key, put, `Read-only: ${ro}`);
       } else

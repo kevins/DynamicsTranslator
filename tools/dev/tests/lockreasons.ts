@@ -313,6 +313,99 @@ export function register(t: Kit): void {
     }),
   );
 
+  test("managed metadata where this session allows changes to managed labels (Ctx.managedEdits): editable as loaded where its managed properties allow customizing it, else read-only with that reason (never MANAGED); both reasons on the slot, so the store switches between them as the setting does; the Workbench brings the editable ones without read-only labels asked for", async () => {
+    const col = (n: string, customizable: boolean) => ({ LogicalName: n, MetadataId: ID, AttributeType: 'String', DisplayName: lab(n, `${n} fr`), Description: lab('', ''), IsCustomizable: { Value: customizable }, IsManaged: true, IsCustomAttribute: false, IsRenameable: ren(true, true), IsValidForForm: true });
+    const account = { LogicalName: 'account', MetadataId: ID, DisplayName: lab('Account', 'Compte'), DisplayCollectionName: lab('Accounts', 'Comptes'), Description: lab('', ''), IsCustomizable: { Value: true }, IsManaged: true, IsCustomEntity: false, IsRenameable: ren(true, true), Attributes: [col('name', true), col('fixed', false)] };
+    const http = {
+      get: async (u: string) => {
+        if (u.startsWith("EntityDefinitions(LogicalName='account')?")) return account;
+        throw new Error(`unexpected GET ${u}`);
+      },
+      all: async () => [],
+    };
+    const lo = () => ({ signal: new AbortController().signal, progress() {} });
+    const kinds = new Set<Kind>(['entity', 'attribute']);
+    const ctx = (managedEdits: boolean) => ({ http, user: FR, base: EN, langs: [], managedEdits }) as never;
+    const NOT = notCustomizable({ IsCustomizable: { Value: false } }, 'column', false);
+    const why = (ss: Slot[]) => Object.fromEntries(ss.map((x) => [x.key, x.readOnly === MANAGED ? 'managed' : x.readOnly === NOT ? 'not customizable' : x.readOnly || 'editable']).sort(([a], [b]) => a.localeCompare(b)));
+    const keys = ['entity|account|DisplayName', 'entity|account|DisplayCollectionName', 'entity|account|Description', 'attribute|account.name|DisplayName', 'attribute|account.name|Description', 'attribute|account.fixed|DisplayName', 'attribute|account.fixed|Description'];
+    const off = await loadTables(ctx(false), ['account'], kinds, lo());
+    const all = (f: (k: string) => string) => Object.fromEntries([...keys].sort().map((k) => [k, f(k)]));
+    eq(why(off), all(() => 'managed'), 'off: every one MANAGED, as before');
+    const on = await loadTables(ctx(true), ['account'], kinds, lo());
+    eq(why(on), all((k) => (/fixed/.test(k) ? 'not customizable' : 'editable')), 'on');
+    t.ok(on.every((x) => x.ref.managed === true && x.ref.held === MANAGED && typeof x.ref.lock === 'string'), 'both reasons kept, still managed');
+    // The store, off as at every start: read-only as loaded with the setting off; then on, and off again.
+    const s = new Store();
+    s.add(on.map((x) => ({ ...x, ref: { ...x.ref } })));
+    eq(why([...s.slots.values()]), why(off), 'added while off');
+    let events = 0;
+    s.on((e) => void (e.type === 'slots' && events++));
+    s.setManagedEdits(true);
+    eq([why([...s.slots.values()]), events], [why(on), 1], 'on: one event');
+    s.set('attribute|account.name|DisplayName', FR, 'Nom (essai)');
+    s.set('attribute|account.fixed|DisplayName', FR, 'Fixe (essai)');
+    eq(s.changes().map((c) => [c.slot.key, c.after]), [['attribute|account.name|DisplayName', 'Nom (essai)']], 'staged only where editable');
+    s.setManagedEdits(false);
+    eq(why([...s.slots.values()]), why(off), 'off again');
+    eq(s.changes().length, 1, 'the staged edit stays (refused at publish, with its reason)');
+    // The Workbench's loader: the editable ones without read-only labels asked for.
+    eq((await loadMetadataScope(ctx(true), { entities: ['account'], kinds }, lo())).map((x) => x.key).sort(), keys.filter((k) => !/fixed/.test(k)).sort());
+    eq(await loadMetadataScope(ctx(false), { entities: ['account'], kinds }, lo()), []);
+  });
+
+  test('managed metadata at save where this session allows changes to managed labels: a table, a global choice and its option and a relationship menu label, managed as loaded or as read, go on to be written; one read as not customizable right before the write is refused with that reason, never written', () =>
+    fast(async () => {
+      const sent: string[] = [];
+      let customizable = true;
+      const views: Array<[string, () => unknown]> = [
+        ["EntityDefinitions(LogicalName='account')?", () => ({ LogicalName: 'account', DisplayName: lab('Account', 'Compte'), DisplayCollectionName: lab('Accounts', 'Comptes'), Description: lab('', ''), IsCustomizable: { Value: customizable }, IsRenameable: ren(true, true), IsManaged: true })],
+        ["GlobalOptionSetDefinitions(Name='new_color')", () => ({ MetadataId: ID, Name: 'new_color', DisplayName: lab('Color', 'Couleur'), Description: lab('', ''), IsCustomizable: { Value: customizable }, IsManaged: true, Options: [{ Value: 1, Label: lab('Red', 'Rouge'), Description: lab('', '') }] })],
+        [`RelationshipDefinitions(${ID})/`, () => ({ SchemaName: 'account_contacts', AssociatedMenuConfiguration: { Behavior: 'UseLabel', Label: lab('Contacts', 'Contacts') }, IsCustomizable: { Value: customizable }, IsManaged: true })],
+      ];
+      const http = {
+        get: async (u: string) => {
+          sent.push(`GET ${u.split('?')[0]}`);
+          const v = views.find(([k]) => u.startsWith(k));
+          if (!v) throw new Error(`unexpected GET ${u}`);
+          return selected(u, v[1]());
+        },
+        // The write itself: this test stops there.
+        batch: async () => {
+          sent.push('batch');
+          throw new Error('stopped at the write');
+        },
+        put: async () => void sent.push('PUT'),
+        post: async () => void sent.push('POST'),
+      };
+      const ctx = { http, base: EN, user: FR, orgId: `managed-on-${Math.random()}`, langs: [EN, FR].map((l) => ({ lcid: l, name: String(l), isBase: l === EN })), managedEdits: true };
+      const o = () => ({ signal: new AbortController().signal, publish: new PublishSet(), progress() {}, force: new Set<string>(), lang: null as never, allowPublish: true });
+      const w = (k: string) => metadataWriters.find((x) => x.kinds.includes(k as never))!;
+      const mk = (kind: string, comp: string, prop: string, labels: Record<number, string>, ref: Record<string, unknown>, group = comp): Slot =>
+        ({ ...t.slot(kind, `${comp}|${prop}`, labels), prop, comp, group, ref: { ...ref, managed: true, lock: '', held: MANAGED } }) as Slot;
+      const cases: Array<[Slot, string, string]> = [
+        [mk('entity', 'entity|account', 'Description', {}, { entity: 'account', metadataId: ID, custom: false }), '', 'Entreprise'],
+        [mk('globaloptionset', 'globaloptionset|new_color', 'DisplayName', { [EN]: 'Color', [FR]: 'Couleur' }, { name: 'new_color', metadataId: ID, boolean: false }), 'Couleur', 'Teinte'],
+        [mk('globaloption', 'globaloption|new_color|1', 'Label', { [EN]: 'Red', [FR]: 'Rouge' }, { name: 'new_color', value: 1, optionMetadataId: ID, setId: ID, usedBy: [], boolean: false }, 'globaloption|new_color'), 'Rouge', 'Carmin'],
+        [mk('relationship', 'relationship|account_contacts', 'Label', { [EN]: 'Contacts', [FR]: 'Contacts' }, { schemaName: 'account_contacts', metadataId: ID, type: 'OneToMany', referenced: 'account', referencing: 'contact' }, 'relationship|account_contacts'), 'Contacts', 'Les contacts'],
+      ];
+      for (const [slot, before, after] of cases) {
+        // Read as not customizable right before the write: refused with that reason, nothing written.
+        customizable = false;
+        const m = sent.length;
+        const no = await w(slot.kind).save(ctx as never, [{ slot, lcid: FR, before, after } as Change], o());
+        eq([no.map((x) => x.outcome), /not customizable/.test(no[0]?.message || ''), sent.slice(m).includes('batch')], [['error'], true, false], `${slot.kind}: ${no[0]?.message}`);
+        customizable = true;
+        // Customizable: the write is reached (and stopped there: its error comes back as the save's).
+        const n = sent.length;
+        const r = await w(slot.kind)
+          .save(ctx as never, [{ slot, lcid: FR, before, after } as Change], o())
+          .then((x) => x.map((y) => y.message || y.outcome), (e) => [String((e as Error)?.message)]);
+        t.ok(sent.slice(n).includes('batch') && !r.includes(MANAGED), `${slot.kind}: written ${JSON.stringify([sent.slice(n), r])}`);
+      }
+    }),
+  );
+
   test("import: rows of a managed solution's table and column, loaded through the Workbench's loader as the file's scope asks, are skipped with the managed reason, never as not matched; the row of its unmanaged column is staged", async () => {
     const col = (n: string, managed: boolean) => ({ LogicalName: n, MetadataId: ID, AttributeType: 'String', DisplayName: lab(n, `${n} fr`), Description: lab('', ''), IsCustomizable: { Value: true }, IsManaged: managed, IsCustomAttribute: !managed, IsRenameable: ren(true, true), IsValidForForm: true });
     const account = { LogicalName: 'account', MetadataId: ID, DisplayName: lab('Account', 'Compte'), DisplayCollectionName: lab('Accounts', 'Comptes'), Description: lab('', ''), IsCustomizable: { Value: true }, IsManaged: true, IsCustomEntity: false, IsRenameable: ren(true, true), Attributes: [col('name', true), col('new_tier', false)] };

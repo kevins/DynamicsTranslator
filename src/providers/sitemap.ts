@@ -17,7 +17,7 @@ import type { Ctx } from '../core/context';
 import { DvError, abortError, guid, isAbort, isGuid, mayHaveRun, partError, pause, q, turnedAway, type BatchPart, type PartResult } from '../core/http';
 import { pick } from '../core/labels';
 import { lcidName } from '../core/lcid';
-import { MANAGED, baseNameFirst, isManaged, type Change, type ChangeResult, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
+import { MANAGED, baseNameFirst, managedHeld, managedReadOnly, managedSlot, type Change, type ChangeResult, type Kind, type Lcid, type Prop, type Slot } from '../core/model';
 import { assertOnlyChanged, blank, canon, kid, kids, parseXml, presentLabels, readLabels, removeLabel, serializeXml, upsertLabel } from '../core/xml';
 import { Unsent, olderVersion, settle, type DocOps, type Sent } from './repair';
 import { changeId, check, type Loader, type LoadOptions, type SaveOptions, type Writer } from './types';
@@ -116,7 +116,23 @@ function toSlots(ctx: Ctx, id: string, rec: any, app?: string): Slot[] {
     const title = pick(titles, ctx.user, ctx.base) || el.getAttribute('Title') || (placeholder ? `Unnamed ${NOUN[kind]}` : '') || entity || eid;
     for (const prop of ['Title', 'Description'] as const) {
       const t = prop === 'Title';
-      out.push({
+      // Its reason as an item of an unmanaged sitemap: a managed one's when changes to managed labels are allowed
+      // (Ctx.managedEdits, core/model.ts managedSlot).
+      const lock = dup
+        ? 'This item has no unique Id in the sitemap, so it cannot be edited safely'
+        : sys && (t || !kid(el, 'Descriptions'))
+          ? t
+            ? SYS
+            : SYS_TIP
+          : placeholder && !t && !kid(el, 'Descriptions')
+            ? NAME_FIRST
+            : t && legacy
+              ? 'Uses a single-language title attribute; set the title in the app designer first, then translate it here'
+              : t && plural
+                ? "Shows the table's plural name — translate the table instead"
+                : '';
+      const held = managed && !(sys && !dup && (t || !kid(el, 'Descriptions'))) ? MANAGED : lock;
+      const s: Slot = {
         key: `${comp}|${prop}`,
         kind,
         prop,
@@ -127,22 +143,7 @@ function toSlots(ctx: Ctx, id: string, rec: any, app?: string): Slot[] {
         path,
         sub: eid,
         labels: t ? titles : presentLabels(labels(el, prop)),
-        readOnly:
-          managed && !(sys && !dup && (t || !kid(el, 'Descriptions')))
-            ? MANAGED
-            : dup
-              ? 'This item has no unique Id in the sitemap, so it cannot be edited safely'
-              : sys && (t || !kid(el, 'Descriptions'))
-                ? t
-                  ? SYS
-                  : SYS_TIP
-                : placeholder && !t && !kid(el, 'Descriptions')
-                  ? NAME_FIRST
-                  : t && legacy
-                    ? 'Uses a single-language title attribute; set the title in the app designer first, then translate it here'
-                    : t && plural
-                      ? "Shows the table's plural name — translate the table instead"
-                      : '',
+        readOnly: held,
         baseRequired: t,
         max: 0,
         order: out.length,
@@ -159,7 +160,8 @@ function toSlots(ctx: Ctx, id: string, rec: any, app?: string): Slot[] {
           unnamed: !named || undefined,
           placeholder: placeholder || undefined,
         },
-      });
+      };
+      out.push(managed ? managedSlot(s, ctx.managedEdits, lock, held) : s);
     }
     return title;
   };
@@ -424,8 +426,9 @@ async function write(ctx: Ctx, id: string, changes: Change[], o: SaveOptions): P
     const rec = await read(ctx, id, o.signal);
     if (!rec) return changes.map((c) => fail(c, GONE));
     // From a managed solution as read right before the write (one that slipped through as editable): never written, so
-    // no unmanaged layer is ever put on it, and no item of it is ever named.
-    if (rec.ismanaged === true) return changes.map((c) => fail(c, MANAGED));
+    // no unmanaged layer is ever put on it, and no item of it is ever named, unless this session allows changes to managed
+    // labels (Ctx.managedEdits).
+    if (rec.ismanaged === true && !ctx.managedEdits) return changes.map((c) => fail(c, MANAGED));
     const base: MapDoc = { xml: rec.sitemapxml || '', doc: parseXml(rec.sitemapxml || '', 'sitemap'), etag: rec['@odata.etag'] || '', ver: rec.versionnumber };
     const out: ChangeResult[] = [];
     let todo: Change[] = [];
@@ -514,7 +517,7 @@ export const sitemapWriter: Writer = {
     const id: string = changes[0].slot.ref.sitemapId;
     const res = new Map<Change, ChangeResult>();
     // Loaded from a managed sitemap: refused before anything is read (write() checks again on its read).
-    for (const c of changes) if (isManaged(c.slot)) res.set(c, fail(c, MANAGED));
+    for (const c of changes) if (managedHeld(c.slot, ctx.managedEdits)) res.set(c, fail(c, managedReadOnly(c.slot, ctx.managedEdits)));
     const asked = changes.filter((c) => !res.has(c));
     if (!asked.length) return changes.map((c) => res.get(c)!);
     o.progress(`Saving sitemap ${changes[0].slot.path[0] || ''}`.trim());

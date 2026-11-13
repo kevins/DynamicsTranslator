@@ -34,8 +34,15 @@
 .pill.is-n{padding:0}
 .pill.is-error{background:#c4314b}
 .ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px "Segoe UI","Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px rgba(0,0,0,.25)}
+/* Selecting labels for an export (mode.ts select): a selected label, or one a box being drawn covers, is filled blue
+   with a check where its pencil goes; no other pencil shows meanwhile. The box is a thin blue frame. */
+.g.is-pk{--c:#0f6cbd;--r:rgba(15,108,189,.3)}
+.g.is-pk>i{border:2px solid #0f6cbd;outline:0;background:rgba(15,108,189,.3)}
+.is-sel .g:not(.is-pk) .pn{display:none}
+.g.is-pk .pn{display:block;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 10.5l3.2 3.2L15 7' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>")}
+.lasso{position:absolute;left:0;top:0;box-sizing:border-box;border:1px solid #0f6cbd;background:rgba(15,108,189,.12)}
 .is-alt .L{opacity:.25}
-.is-alt .pn,.is-alt .pill,.is-alt .ptip{display:none}
+.is-alt .pn,.is-alt .pill,.is-alt .ptip,.is-alt .g.is-pk .pn{display:none}
 @keyframes dxt-fl{from{box-shadow:0 0 0 10px transparent}}
 @keyframes dxt-pl{from{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}
 @media (prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}

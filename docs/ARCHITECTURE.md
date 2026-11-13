@@ -7,7 +7,7 @@ model-driven apps. Two ways to work, one engine:
   click one to edit it in every language right there. Covers form fields (and the sub-fields of address and name
   columns), tabs, sections, header fields, sub-grids, quick views (their title and the fields of their form), the
   timeline's heading (its Name from the form designer, one text for every language, else Dynamics' own: grey, its popup
-  saying which and offering the timeline's label saved on the form), related-menu
+  saying which, with no input), related-menu
   items (and the tab of the view one opened), choice values (each value of a
   multi-select), Yes/No labels, the business process flow (stages + steps, and the open stage flyout's title),
   command bar buttons (modern and classic; the table's name in Microsoft's New, Add Existing and Export), the app
@@ -33,7 +33,10 @@ Both write through the same safe save pipeline (review → save → verify → p
    every language of the edited label as read right before (finding 2), and `UpdateStateValue` sends the complete
    label too (§4.1). Metadata takes no If-Match, so such a write sends back the old text of a language someone else
    saved between that read and the write: the reads inside the write's own `$batch` show it, and it is written back
-   or said (principle 2, §4.1).
+   or said (principle 2, §4.1). A main form's write posts a column's cell only with the languages the save changes
+   there, and without labels where it changes none: every read fills in the column's name where a cell has no label of
+   its own, which posted back Dataverse would store as the form's own label (LIVE-FINDINGS 103, 104). After each such
+   write, a check (`nothingElse`) makes sure nothing it left out moved, and writes back what Dataverse dropped (§4.3).
 2. **Never clobber concurrent edits.** Every writer re-reads the server value right before writing
    and reports a **conflict** (not an overwrite) when it differs from what the user started from. Form and
    sitemap XML are written with `If-Match: <published etag>`, which only catches a publish in between
@@ -137,7 +140,8 @@ src/
     metadata.ts           tables, columns, choices, global choices, Yes/No, status, relationships
     records.ts            localizable columns: views, charts, form & dashboard names, apps, BPF names,
                           modern commands, environment variables, custom APIs
-    formxml.ts            form + dashboard tab/section/field/header/footer/nav labels
+    formxml.ts            form + dashboard tab/section/field/header/footer/nav labels (main forms: only what changes,
+                          SPARSE; Publish again's repair of a label a publish left out, writeAgain)
     sitemap.ts            sitemap areas/groups/subareas (+ app → sitemap lookup)
     bpf.ts                BPF stage + step labels (workflow xaml + clientdata)
     repair.ts             someone else's save during a form / sitemap / process write: probe, put back (§4)
@@ -237,7 +241,7 @@ All GUIDs lower-case without braces (`guid()` / `normId()`). Entity and attribut
 | globaloption | `{ name, value, optionMetadataId, usedBy: string[] /* 'entity.attr' */, managed /* its global choice's */ }` |
 | relationship | `{ schemaName, metadataId, type: 'OneToMany' \| 'ManyToMany', side?: 1 \| 2, entity1?, entity2?, referenced?, referencing?, managed }` |
 | view, chart, form, dashboard, app, bpf, command, envvar, customapi | `{ id, table /* record table, e.g. 'savedquery' */, entitySet, column /* e.g. 'name' */, entity /* related table or '' */, type? /* querytype / form type / location */, managed /* the record's ismanaged */ }` |
-| tab, section, field, navitem, dtab, dsection, dfield | `{ formId, elId, formType, area: 'body' \| 'header' \| 'footer' \| 'nav', tabName?, sectionName?, controlId?, datafield?, classid?, quickForms? /* a quick view control's form ids (lower case) */, managed /* the form's or dashboard's ismanaged */, partial? /* not known in every language: the languages in labels are the ones read */, unread? /* per language not read: why its read failed */, unreadable? /* why no read can bring the others (PUB_ONLY, §4.3) */ }` |
+| tab, section, field, navitem, dtab, dsection, dfield | `{ formId, elId, formType, area: 'body' \| 'header' \| 'footer' \| 'nav', tabName?, sectionName?, controlId?, datafield?, classid?, quickForms? /* a quick view control's form ids (lower case) */, managed /* the form's or dashboard's ismanaged */, sparse? /* a column's own cell in a zone SPARSE lists for the form's type (a main form's body or header), on an unmanaged form read from its unpublished definition: a save posts it only with what it changes (LIVE-FINDINGS 104), and which of its labels are the form's own can be known (model.ts follows, 114) */, labelKey? /* the cell's `labelid` when it has one (the translator never gives one; a solution import may carry one, LIVE-FINDINGS 105, 110): its labels are stored, exported and served under it (104, 106) */, partial? /* not known in every language: the languages in labels are the ones read */, unread? /* per language not read: why its read failed */, unreadable? /* why no read can bring the others (PUB_ONLY, §4.3) */ }` |
 | area, group, subarea | `{ sitemapId, id, areaId?, groupId?, entity? /* SubArea Entity attr */, plural? /* it shows that table's plural name (§4.4) */, resource? /* its ResourceId's last segment */, unnamed? /* no Titles */, placeholder? /* the app designer's placeholder: nameable here (§4.4) */, managed /* the sitemap's ismanaged */ }` |
 | stage, step | `{ workflowId, labelId, attribute? /* step's field */, stageId?, primary /* the process's table */, managed, stored? /* languages filled from the names Dynamics keeps (§4.5) */, unread? /* languages of those not read */ }` |
 | ribbon | `{ entity /* '_app' for the application ribbon */, locLabelId, managed }` |
@@ -292,10 +296,12 @@ remove one:
   boolean, state, status): `MergeLabels: false` with the language left out keeps it (even after publish),
   and `''` is stored and shown to that language's users as a **blank** label (findings 31, 32); an empty cell of
   a translation import removes nothing either (finding 67). Form and dashboard tab, section and **field** (cell)
-  labels: a form update without the label, or with it empty, keeps it in any UI language (finding 37; dashboard cells
-  assumed the same). **Classic ribbon** titles: an import keeps titles it doesn't carry or leaves empty (findings 39,
-  69). BPF stage and step labels (model.ts `stays`, `canClear` given the language): once Dynamics has stored a stage or
-  step translation, removing its `StepLabel` leaves it showing (LIVE-FINDINGS 83).
+  labels: a form update without the label, or with it empty, keeps it in any UI language (findings 37, 104; dashboard
+  cells assumed the same). So such a label emptied in the base language (form labels are never base-required: the saver
+  only warns, "Clears the English text.") is posted empty, Dataverse keeps it, and the change fails: "Dataverse did not
+  keep this label. Reload the form to see what is saved." **Classic ribbon** titles: an import keeps titles it doesn't
+  carry or leaves empty (findings 39, 69). BPF stage and step labels (model.ts `stays`, `canClear` given the language):
+  once Dynamics has stored a stage or step translation, removing its `StepLabel` leaves it showing (LIVE-FINDINGS 83).
 * **The stand-in** (model.ts `standIn`). Where Dataverse can't remove it, an emptied translation is written as its
   stand-in: the text that language shows where the label has no translation of its own, so the page looks as it
   would without one, which is what emptying it asks for. Earlier builds refused such a change, which left the old
@@ -495,7 +501,10 @@ does the following:
     save again."
   * The remaining pairs are built on the probe's document, only those pairs. The writer's safety check runs:
     assertOnlyChanged skipping exactly those entries; for processes, splice + sanity. The result is written in the same
-    kind of batch with the new read's published etag.
+    kind of batch with the new read's published etag. On a main form (`SPARSE`), the repair posts the column cells it
+    changes as the first write did (`DocOps.build(base, todo, theirs)`), and their text of a label we both changed,
+    `theirs`, explicitly: posted without it, the cell would keep our text (LIVE-FINDINGS 104). A text of theirs that is
+    one of the column's names is never posted (it is a name filled in anew, 103, 108).
   * The result is "saved" only when that write's probe is the new read and its read-back is the probe's document
     outside our pairs, with our pairs as asked. Another save landing just before the repair is put back too, on the
     newest document. Because its author may have built on our first PATCH, the result is then the "may have replaced
@@ -512,7 +521,17 @@ does the following:
   * Comparisons are always between two reads. "Same document": equal text or equal `canon()`. "Alike outside our
     pairs": forms and sitemaps use `canon()` skipping exactly our entries (the element's label or Title in that
     language, plus a container holding nothing else). Processes use the xaml outside our StepLabel tags byte for byte,
-    plus clientdata with sorted keys and without our entries.
+    plus clientdata with sorted keys and without our entries. On a main form, `same` and `alike` also skip what a sparse
+    write doesn't post (the labels of the column cells it leaves out), so a column's name filled in anew between the
+    read and the probe (a rename landing, LIVE-FINDINGS 103) is no one's save.
+  * The check after the write (formxml.ts `nothingElse`, on a main form, after the first write, after our own write
+    and once settled): every label the PATCH left out must read back as the probe had it (104). One that doesn't, with
+    nothing else to explain it, was dropped by Dataverse: it is written back at once, from a new read and settled like
+    any other write, and the save says so (`droppedBack`, a notice). Never written back: a language whose filled-in
+    name this save changes (a rename), a text that is one of the column's names, a cell whose key someone else moved,
+    and a text someone else saved there, which is said (`droppedLeft`, a warning) with the texts lost, as is any label
+    that could not be put back. The write-back posts the pass's own changes of column cells again and is checked the
+    same way, but only said: nothing is written back twice.
   * What no read can show: a save landing between the probe and the PATCH inside the batch, and, for processes, one
     Dataverse applies while the ~9 s PATCH runs. No 3-way merge: when two other makers save one after the other around
     our write, one of their changes can be lost; that is the "may have replaced their change" error, never "saved".
@@ -692,10 +711,14 @@ friendlyname/description. processstage.stagename is **not** localizable (BPF sta
   - **tab and section labels** (also header/footer section names) live in a per-language store keyed by
     element id (ExportTranslation lists them as `displayname` rows). Reads return only the caller's
     language; inline labels in other languages are dropped on write.
-  - **cell (field) labels** of cells bound to a column (`datafieldname`), and of sub-grids, are stored **inline for
-    every language**: `RetrieveUnpublished` returns all languages regardless of the caller's language, and writing a
-    1036 cell label while the UI is 1033 persisted. → those labels need **no language switch** for reading or writing
-    (fast path).
+  - **cell (field) labels** of cells bound to a column (`datafieldname`), and of sub-grids, come **with every
+    language**: `RetrieveUnpublished` returns all languages regardless of the caller's language, and writing a 1036
+    cell label while the UI is 1033 persisted. → those labels need **no language switch** for reading or writing (fast
+    path). A column cell's labels are stored **per label key** (its `labelid`, else its id; LIVE-FINDINGS 104), and
+    every read fills in the column's current name (its latest unpublished rename included) where it has no label of
+    its own, with no marker (103). A key with any stored label stores every language posted to it, so a cell posted back as
+    read keeps the filled-in names as labels of its own (104, 109); a key with none stores only the texts that differ
+    from the column's name. A label left out of a PATCH, or posted empty, is kept (37, 104).
   - **the other cells** (a control bound to no column: a timeline, a web resource, an iframe and most others; checked
     on all 1,248 forms of a test environment, LIVE-FINDINGS 102) behave like tabs and sections: a read returns their
     label in the caller's language only (else the base language's, flagged as such), and their language L is written
@@ -705,7 +728,9 @@ friendlyname/description. processstage.stagename is **not** localizable (BPF sta
 * Therefore for **tabs, sections and cells bound to no column** (sub-grids aside: the per-language labels): read
   language L's labels from XML retrieved while the UI language is L, and write language L's labels while the UI
   language is L. Cells bound to a column, sub-grids and nav items: read all languages from one RetrieveUnpublished
-  (any UI language) and write all their languages in one PATCH without switching (but in the same document flow:
+  (any UI language) and write them in one PATCH without switching: on a main form's body and header (`SPARSE`) a
+  column's cell carries only the languages the save changes, and no labels where it changes none (104); everywhere else
+  every language as read (but in the same document flow:
   when a form has both per-language and every-language changes, write the every-language ones in the user's own
   language pass). Every form XML request goes through LangSession
   (`o.lang.hold(h => h.batch(L, parts))`), also in the user's own language: a batch in another language L is
@@ -790,23 +815,33 @@ friendlyname/description. processstage.stagename is **not** localizable (BPF sta
   Slot `ref`: `{ formId, elId, tag, controlId, datafield, area: 'body'|'header'|'footer'|'nav' }`.
   Field slot title = cell label in the user's language, else attribute display name; `sub` = control id.
 * Write (per form, per language L, inside the form's hold): one batch `[RetrieveUnpublished, GET systemforms(id)
-  (published etag)]` in L → conflict check against `before` (the store's remembered base) → DOM edit: `upsertLabel(…{container:'labels', item:'label', lcidAttr:'languagecode',
-  textAttr:'description', lcid:L})` (nav items: `Titles/Title LCID/Text`) → `assertOnlyChanged(skip = exactly the
-  edited label/language pairs: that element's label or Title in that language, and a label container of it holding
-  nothing else)` → one batch `[RetrieveUnpublished ($select=formxml,versionnumber) (the probe), PATCH systemforms(id)
-  with If-Match: <published etag>, RetrieveUnpublished]` in L → on 412 redo once → a probe that is not the form just
-  read is someone else's save, which the PATCH replaced: put back by `providers/repair.ts` (§4, "Someone else's save in
-  the middle of a whole-document write") → otherwise verify the read-back (only a probe and a read-back proven to be in
-  L count). The published etag only catches a publish in between (LIVE-FINDINGS 47): the fresh read right before the
-  write is the guard against edits made since the user loaded the label. The probe compares the whole form XML, so a
-  column write in the same save that moves the versionnumber is no false alarm; its `versionnumber` tells a probe that
-  lags behind the read (§4). LangSession sends every batch with continue-on-error (a switch back must run), so a probe
-  that fails does not stop the PATCH. That save is never plain "saved" (§4). A repair in another language runs inside
-  the same `h.window` as its pass. Not verified live yet: the whole-form probe on a real form save.
-  Another language's pass holds the switch window across its read and its write (`LangHold.window`), so no
-  `quiet()` option write runs in between; a write batch turned away unrun starts the pass again from a new read
-  after 2, 4 and 8 s.
-  Publish `<entity>` (forms) or `<dashboard>` (dashboards, type 0/10).
+  (published etag)]` in L → conflict check against `before` (the store's remembered base) → DOM edit:
+  `upsertLabel(…{container:'labels', item:'label', lcidAttr:'languagecode', textAttr:'description', lcid:L})` (nav
+  items: `Titles/Title LCID/Text`) → `assertOnlyChanged(skip = exactly the edited label/language pairs: that element's
+  label or Title in that language, and a label container of it holding nothing else)` → on a main form (`SPARSE`), the
+  plan per column cell (`build`): an untouched cell goes out without `<labels>`, an edited one with only the languages
+  it edits; every other element as read; `assertSent` then checks the document about to be posted in three parts:
+  outside the column cells it is the read with only our edits (`assertOnlyChanged`), each column cell carries exactly
+  what its plan says, and nothing posted is a column's name on a cell's behalf (`postable`) → one batch
+  `[RetrieveUnpublished ($select=formxml,versionnumber) (the probe), PATCH systemforms(id) with
+  If-Match: <published etag>, RetrieveUnpublished]` in L → on 412 redo once → a probe that is not the form just read is
+  someone else's save, which the PATCH replaced: put back by `providers/repair.ts` (§4, "Someone else's save in the
+  middle of a whole-document write") → otherwise verify the read-back (only a probe and a read-back proven to be in L
+  count). The published etag only catches a publish in between (LIVE-FINDINGS 47): the fresh read right before the write
+  is the guard against edits made since the user loaded the label. The probe compares the whole form XML; its
+  `versionnumber` tells a probe that lags behind the read (§4). A column rename in the same save is no false alarm on a
+  main form, because `same` and `alike` skip what the write doesn't post (the labels a rename fills in anew, 103), and a
+  form that posts some cells as read waits for the rename (§4.7 step 2). Earlier builds said a column write in the same
+  save was no false alarm because it only moves the versionnumber: that was wrong for renames, whose new name the probe
+  shows filled in. An edit of a field label that showed its column's name, in a save that renames that column, also
+  takes the new name as no conflict (`Change.alsoBefore`, set by the saver; providers/types.ts `check`): once the
+  rename lands, a fresh read shows it there, filled in (103), and `state` counts it as the label as it was.
+  LangSession sends every batch with continue-on-error (a switch back must run), so a probe that fails does not
+  stop the PATCH. That save is never plain "saved" (§4). A repair in another language runs inside the same `h.window` as
+  its pass. Not verified live yet: the whole-form probe on a real form save. Another language's pass holds the switch
+  window across its read and its write (`LangHold.window`), so no `quiet()` option write runs in between; a write batch
+  turned away unrun starts the pass again from a new read after 2, 4 and 8 s. Publish `<entity>` (forms) or
+  `<dashboard>` (dashboards, type 0/10).
 * Dashboards (type 0/10, objecttypecode `none`) use kinds dtab/dsection/dfield.
 * **The form decides for all its labels** (`loadFormXml`): a form or dashboard from a managed solution (its own
   `ismanaged`) makes every tab, section, cell, header and footer field and navigation item of it read-only with
@@ -938,13 +973,44 @@ friendlyname/description. processstage.stagename is **not** localizable (BPF sta
      records or xml one runs once those three lanes have ended, a doc or ribbon one after the other jobs of its
      sequence, each through `gate`, which holds back each stand-in whose text wasn't saved (`ready()`) and writes the
      rest of the job. A stand-in made of a text another pass of its own group writes (`Writer.pass`) is a job of its
-     own, run in a third round (`later`), after its group's job, through the same `gate`.
+     own, run in a third round (`later`), after its group's job, through the same `gate`. A form that posts some cells
+     as read (a type or zone outside `SPARSE`, a quick view control) and shows a column this run renames waits in the
+     `after` round too (`waitsForRename`): its read could show the old name filled in, which posted as read Dataverse
+     would store (LIVE-FINDINGS 103, 104, 108). A main form that posts a renamed column's cells only where it changes
+     them needs no wait and goes on beside the metadata lane (44): its write never posts the name a read fills in.
   3. Unknown/thrown errors → every change of that group gets outcome 'error' with a friendly message.
   4. Publish once, when anything was saved or found already saved ('unchanged': possibly an earlier write
      whose answer was lost; its writer added it to the publish set), the Publish dialog counting and checking
      both: `PublishXml` with everything collected (order: entities, ribbons, dashboards,
      optionsets, sitemaps, appmodules). Retry customization-lock errors (5 s, 10 s, 20 s, 40 s). If an
-     `<appmodules>` element is rejected, retry without it. Never PublishAll.
+     `<appmodules>` element is rejected, retry without it. Never PublishAll. It runs under `lang.quiet()`, as do the
+     Publish dialog's **Publish again** and Recent publishes › **Publish** (review.ts `publishAgain`): a switch window
+     open (the page's loads, the read behind them, another tab's) is waited for, and none starts while it runs (Stop
+     ends the wait). The process update below needs the exclusive window, so it runs after it, never inside it; the
+     classic ribbon writer publishes its own scope from its lane, which is not under quiet() (§4.3). Publish again
+     writes first, around that publish, the field labels the Checking step found missing from the published form while
+     its versions agree (LIVE-FINDINGS 117; `SaverApi.writeAgain` → `Writer.again`, formxml.ts `writeAgain`): per form,
+     in the writer's hold, each label's text with `MARK` after it (U+200B, a zero-width space no one sees; a pass of the
+     user's language like a save's: fresh read, published etag, probe, read-back, settle, nothingElse), the publish, the
+     text as it is, the publish again; never over a text someone else saved since (a conflict, left to their save).
+     The column names and tooltips found not served as saved (118) go the same way through the column writer
+     (metadata.ts `againAttribute`), each write under `lang.quiet()` as the saver runs every metadata job (LIVE-FINDINGS
+     62). No `MARK` is left untold, nor behind where Dataverse lets the repair take it away (formxml.ts `rewrite`): once
+     a first write may have stored one, whatever its result (all but a conflict and a change skipped, which wrote
+     nothing), the text is written as it is with a signal that never aborts, also when Stop is pressed or the publish
+     between fails, and again from a fresh read after each of `BACK_WAITS` (5, 10, 20, 40 s) while Dataverse doesn't
+     take it (busy, a read lagging behind, a PATCH refused twice on the marked text); one it never takes is an error,
+     never a conflict, which Publish again repairs (its first write finds the marked text as asked). Where a publish
+     served MARK, or may have, the texts as they are are published the same way (`unmark`, sent again after each of
+     `UNMARK_WAITS`, 10 and 30 s, while turned away or not known to have got through): after a Stop, after a publish
+     turned away past publishXml's waits or not known to have got through, after a publish that took all but the apps
+     (`PartialPublishError`), and after a first publish that may have got through (no error once `unmark` does). The
+     error is told after it; a label whose first write was neither saved nor found as asked keeps that write's result,
+     unless its text written back may still hold MARK (that error). What the repair's writes tell reaches the dialog
+     also when it fails (`publishAgain`'s `told`).
+     Nothing is committed or journaled, and `writeAgain` refuses while a save runs, as a save refuses while it runs.
+     After a publish the user started, the Checking step runs this repair once by itself, before it says anything
+     (§5.3, `checkRepaired`).
      Then each business process flow whose name was written (`PublishSet.processes`, added by records.ts for a
      `bpf` Name; never for its description or its stage and step labels) is updated once (`publish.ts
      rebuildProcess`, LIVE-FINDINGS 83): the app is served a compiled copy of the process that keeps the old name
@@ -1198,43 +1264,72 @@ language the page is shown in (as the popup, §5.4), else the first editable inp
 In translation mode it is only the fallback when a popup can't be built; the popup (§5.4) is the editor there.
 
 ### 5.3 Publish dialog (ui/review.ts) and refresh (ui/refresh.ts)
-One dialog for the bar's "Review and publish", Ctrl+S and the Workbench's Save and Publish: "Publish N
-changes", rows grouped per component text ("title · what · where"; where is the label's place as the user sees it
-(`whereOf`): a form label's "Account (Main form) › Summary › Details", a navigation item's "App › Area › Group", a process
-step's "Process › Stage", a choice's "Table › Column", a global choice option's choice, the table of a column, view,
-chart, form, process, command, relationship or classic button; what a form cell's own label is called is "Form label",
-the field popup's word (`WORD.field`), and `(everywhere)` follows Tooltip and Column name, as the field popup says; a
-merged entry "Form · N places (tabs)" for the same edit of every copy of a field), one line per changed
-language with a word diff and Undo. The rows are one renderer from plain data (`changeGroup`: title, what, where,
-language, before, after, tone, last column, notes; each header a heading), shared by the Publish dialog, Recent publishes
-and its Undo. Blocking problems (base blank, too long, read-only, an emptied translation without a stand-in, with the
-saver's reason) are red on the row and skipped (they stay staged); open conflicts are skipped until Keep mine /
-Use theirs. An emptied translation Dataverse can't remove shows the stand-in Publish writes (`planPublish` →
-`Plan.written`, from `asWritten`: `SaverApi.prepare` of the changes Publish sends, open conflicts left out, so a
-stand-in is never made of a staged text that isn't published with it) as its after text, with a quiet note
-(`standInTag`): "English text: Dataverse can't remove a translation" or "The column's French name: Dataverse can't
-remove a translation"; one that is the text already: "Already the English text: nothing changes". An emptied
-metadata description goes to "(empty)" with the note "Saved empty: French users see no tooltip." (`emptyNote`; its old
-side "Shows “…”" or "(no translation)" where the language had no label at all, `ChangeRow.blankBefore`). The result's
-rows show it the same way, as Try again would write it. A row whose server text a reload changed since it was edited
-(`Store.moved`: each edit keeps the server text it was made on as its base, which is `Change.before`) says "Changed on
-the server since you edited it": publishing it stops at a conflict, never overwrites. The saver's warnings are amber lines on their rows,
-and its general notes show once under the subtitle (§4.7 step 1). Other unpublished work on the tables is one sentence
-next to Publish, which waits for that check, and what the publish covers a second line beside it (`scopeText`, §4.7). Cancel / **Publish** (Ctrl+Enter). Then steps in the
-same dialog: Saving N changes (x of N), Publishing <names>, Checking (forms really published), and in
-translation mode Refreshing the page. Success in translation mode: "Done. Refreshing the page…" and
-`app.refreshPage()`; in the Workbench "Done. Published N changes." with Refresh page / Close. Failures: red
-rows with the saver's message, Try again (failed rows only), Publish again (saved, publish failed), Refresh
-anyway, Close; never an automatic refresh after a problem. A form the Checking step can't read (a failed read, or no
-`versionnumber`) is never taken for published (`unpublishedForms` → `{left, unread}`). The dialog shows "Published, but
-not checked" and "Couldn't check whether Main form is published. Publish again to publish it and check again.", offers
-Publish again, and journals the save as not published. Recent publishes › Publish does the same, with Try again. The
-check covers forms only: other components rely on the saver's read-back and PublishXml's answer. Rows found already on
-the server that no write of this translator may have put there (`ChangeResult.found`) are counted apart in the Done
-line, as their publish's Undo leaves them alone (§4.7 step 5).
-"Recent publishes" (history: this user's publishes in this environment and browser, 90 days): one row per publish (time,
-label count and titles, Not published / Undone badges, Publish, Undo; a publish that only named sitemap items has no Undo,
-and a line under its row says why, §4). Its time and titles are a disclosure button (in an h4, `aria-expanded`, `aria-controls`) that opens in place, built on first open, what the publish changed in the Publish
+One dialog for the bar's "Review and publish", Ctrl+S and the Workbench's Save and Publish: "Publish N changes", rows
+grouped per component text ("title · what · where"; where is the label's place as the user sees it (`whereOf`): a form
+label's "Account (Main form) › Summary › Details", a navigation item's "App › Area › Group", a process step's "Process ›
+Stage", a choice's "Table › Column", a global choice option's choice, the table of a column, view, chart, form, process,
+command, relationship or classic button; what a form cell's own label is called is "Form label", the field popup's word
+(`WORD.field`), and `(everywhere)` follows Tooltip and Column name, as the field popup says; a merged entry "Form · N
+places (tabs)" for the same edit of every copy of a field), one line per changed language with a word diff and Undo. The
+rows are one renderer from plain data (`changeGroup`: title, what, where, language, before, after, tone, last column,
+notes; each header a heading), shared by the Publish dialog, Recent publishes and its Undo. Blocking problems (base
+blank, too long, read-only, an emptied translation without a stand-in, with the saver's reason) are red on the row and
+skipped (they stay staged); open conflicts are skipped until Keep mine / Use theirs. An emptied translation Dataverse
+can't remove shows the stand-in Publish writes (`planPublish` → `Plan.written`, from `asWritten`: `SaverApi.prepare` of
+the changes Publish sends, open conflicts left out, so a stand-in is never made of a staged text that isn't published
+with it) as its after text, with a quiet note (`standInTag`): "English text: Dataverse can't remove a translation" or
+"The column's French name: Dataverse can't remove a translation"; one that is the text already: "Already the English
+text: nothing changes". An emptied metadata description goes to "(empty)" with the note "Saved empty: French users see
+no tooltip." (`emptyNote`; its old side "Shows “…”" or "(no translation)" where the language had no label at all,
+`ChangeRow.blankBefore`). The result's rows show it the same way, as Try again would write it.
+A row whose server text a reload changed since it was edited (`Store.moved`: each edit keeps the server text it was
+made on as its base, which is `Change.before`) says "Changed on the server since you edited it": publishing it stops at
+a conflict, never overwrites. The saver's warnings are amber lines on their rows, and its general notes show once under
+the subtitle (§4.7 step 1). Other unpublished work on the tables is one sentence next to Publish, which waits for that
+check, and what the publish covers a second line beside it (`scopeText`, §4.7). Cancel / **Publish** (Ctrl+Enter). Then
+steps in the same dialog: Saving N changes (x of N), Publishing <names>, Checking (forms really published), and in
+translation mode Refreshing the page. Success in translation mode: "Done. Refreshing the page…" and `app.refreshPage()`;
+in the Workbench "Done. Published N changes." with Refresh page / Close. Failures: red rows with the saver's message,
+Try again (failed rows only), Publish again (saved, not published), Refresh anyway, Close; never an automatic refresh
+after a problem. A form the Checking step can't read (a failed read, or no `versionnumber`) is never taken for published
+(`unpublishedForms` → `{left, unread, missing, published}`). The dialog shows "Published, but not checked" and
+"Couldn't check whether Main form is published. Publish again to publish it and check again.", offers Publish again, and
+journals the save as not published. Recent publishes › Publish does the same, with Try again. The check reads the
+published form with its definition in the same request (`$select=formxml,versionnumber`, in the user's language,
+LIVE-FINDINGS 52), both reads of a form under `lang.quiet()`: one answered inside a switch window of the translator,
+this tab's or another's, would carry that window's language only. With the versions equal, a field label of a column's cell saved in the user's language that it
+doesn't show as the save left it (the text written) leaves the form unpublished and is named for Publish again
+(`missing`, the dialog's `S.stuck`; LIVE-FINDINGS 117), also after a save that found it as asked and published nothing.
+Labels of other languages can't be read without a switch: their forms are judged by the versions alone, and so is a
+label Publish again left to someone else's save (`theirs`). Recent publishes › Publish finds such labels first, by the
+same check, so that its publish writes them again too. Once the check confirms a form the save wrote while it had no
+other change (`SaveReport.forms`: the form writer's first read found it not pending, and no one else's save or a
+dropped label met its writes), every change of the save on it went through, and the save started from the version its
+labels were loaded at, the answers of which field labels are its own are kept for the version its publish made
+(`keepOwnLabels` → formxml.ts `carryOwnLabels`), so the page that loads next reads none of them (§5.4, a main form's
+field label that follows its column). The check also reads, beside the forms, each column whose name or tooltip the
+save wrote, once (metadata.ts `columnLabels`, strong, every language): one not served as the save left it
+(`showsWritten`) leaves its table unpublished ("Account (table)") and is named for Publish again, which writes it again
+through the column writer (`againAttribute`, the same `MARK` steps, a read still showing the text the save replaced
+being no conflict, `Change.alsoBefore`; `SaverApi.writeAgain` takes each writer in turn; LIVE-FINDINGS 118). After a
+publish the user started (Publish, Try again), what the check finds not published or not served as saved is repaired
+once, at once, before anything is said (`checkRepaired`): Publish again's repair (§4.7 step 4: the labels found missing
+written again with `MARK` after them, around a publish of the forms and columns the save wrote; a form left unpublished
+by its versions alone is just published again), the Publishing step running again while the Checking step waits, then
+the check again. Only what is still not published after that leaves its form or table "Saved, but not published", with
+Publish again. Publish again is that repair itself, so its own check only says what it finds. Recent publishes ›
+Publish runs the same repair once after its own publish. From the end of the save to the end of the check and its
+repair, the dialog keeps `Store.busy` set ("Publishing"), as Publish again and Recent publishes › Publish do around
+their publish and check: no other save starts meanwhile, and the page's read of which field labels are the form's own
+(§5.4) opens no switch window before it is over. A label someone else saved over since is theirs, never
+written over. After a repair, `keepOwnLabels` is skipped: the labels it wrote again aren't the save's alone, so the page
+reads those answers again. Other components rely on the saver's read-back and PublishXml's answer. Rows found already
+on the server that no write of this translator may have put there (`ChangeResult.found`) are counted apart in the Done
+line, as their publish's Undo leaves them alone
+(§4.7 step 5). "Recent publishes" (history: this user's publishes in this environment and browser, 90 days): one row per
+publish (time, label count and titles, Not published / Undone badges, Publish, Undo; a publish that only named sitemap
+items has no Undo, and a line under its row says why, §4). Its time and titles are a disclosure button (in an h4,
+`aria-expanded`, `aria-controls`) that opens in place, built on first open, what the publish changed in the Publish
 dialog's rows (`entryGroups`: one group per label under the title and place the dialog showed, kept in the journal as
 `HistoryItem.title` and `where`; the copies of a field as one group with their places; an entry journaled before places
 were kept, or kept without them for its size (§4.7 step 5), shows title and what only). **Undo** asks first ("Undo this
@@ -1247,61 +1342,59 @@ back); for a translation the publish added that Dataverse can't remove, current 
 note as in the Publish dialog (`UndoRow.standIn`, §4 "Clearing a translation"); a description stored empty before the
 publish, current text → "(empty)" with "Saved empty: French users see no tooltip." (`UndoRow.empty`); "Already as
 before" (also where the stand-in is there already; never for a description the publish saved empty where it had no
-translation, which goes to its stand-in); "Changed since this publish: not undone unless you choose Undo anyway"
-(amber, an Undo anyway checkbox, unticked); "Stays: Dataverse can't remove it, and its English text is empty" (only
-for such a translation without a stand-in, with why); "Stays: naming a group can't be undone" (`namings`, §4; never
-read); a read-only refusal; "Not loaded here…" (its component isn't loaded) or, for a label whose stand-in is made of
-texts that aren't loaded, what to load ("Its column's names aren't loaded here: load its table's columns, then undo
-again"); or "Couldn't read its current text (…). The undo checks it again before writing" (also a label gone from its
-form, sitemap, process or choice, or a metadata read still behind). The labels changed since come first; one sentence
-counts the states ("1 translation this publish added gets the English text in its place: Dataverse can't remove it.",
-in the words of `standInsSaid`; "1 label can't be undone until the texts put in its place are loaded."); the
-others'-work sentence and the publish scope sit next to the button. Nothing is written before **Undo N changes** (N:
-labels to undo, a stand-in's among them, unread ones and those chosen; disabled at 0); when every label is already as
-before or stays it reads **Mark as undone**, which writes no label but publishes like any undo (a label found already
-as asked may be an earlier write not yet published, §4.7 step 4). Cancel leaves everything. Undo's safety is
-unchanged: each label is written only where the server still holds the text the publish wrote, and a label someone
-changed since is a conflict, left as it is; one chosen with Undo anyway is measured against the text just read
-instead, so a text changed again after that read is still a conflict, never overwritten. The result shows each label's
-outcome in the same rows (Undone; Already as before; Changed since this publish, so it was left as it is; Stays:
-Dataverse can't remove it, with why; the saver's message), a stand-in written shown as the text written with its quiet
-note, Fix on conflicts and failures, a one-line count, Try again, Redo, Refresh page. A held-back label (its stand-in
-waits for a text to be loaded) is neither "stays" nor counted for **Mark as undone**, and the publish stays undoable
-(§4).
-`refreshPage()`: asks when changes are still staged and when the record has unsaved changes or may have
-(core/context.ts `recordDirty`, below), tears the app down, shows "Refreshing the page…", restores the user's language
-(waiting at most 3 s for it; the switch window is not held through the reload, so a switch another tab starts then, or
-one a closed tab left in doubt that may still run after those 3 s, can boot the page in that language until the next
-refresh), stores `dxt:verify:<orgId>` (what was published), purges and reloads. The next start checks the page shows
-it (app.ts `verifyAfterLoad`) and speaks only when it doesn't: "N changes aren't showing yet" with Refresh again
-(refresh.ts `notShowing`); a page that shows every change says nothing, as the page itself shows them. The purge
-(`purge()`, finding 82; every step guarded and raced against a timeout, the reload always happens): the service
-worker's commands (`postMessage({name})`: PurgeUserContextGcmCacheEntry, PurgeUserSettingsCollectionDataCacheEntry,
-PurgeGcmCache, PurgeDataCache, PurgeMainAspxCache; to the controller, else the registration's active worker), every
-CacheStorage cache except the code caches (`CDN_Resources`, `clientsdk`, `WebResources`, `sw-feature-status`;
-`mainaspx` goes), `clearState` to the `uci-state-persistence` SharedWorker, the localStorage keys `uci-state*`,
-`Form:*`, `ActualControls/*` and `UCI_RESOURCE_STRINGS` (never `dxt:*`), the metadata stores of the IndexedDB named by
-the origin (usercontext, entitymetadata, attributemetadata, applicationmetadata, metadataversionstamp, navigationdata,
-userpersonalization, `temp*`; never offline records, never the database: one that doesn't exist is not created),
-sessionStorage. The reload (`reloadFresh()`) loads the same main.aspx URL with
+translation, which goes to its stand-in); "Changed since this publish: not undone unless you choose Undo anyway" (amber,
+an Undo anyway checkbox, unticked); "Stays: Dataverse can't remove it, and its English text is empty" (only for such a
+translation without a stand-in, with why); "Stays: naming a group can't be undone" (`namings`, §4; never read); a
+read-only refusal; "Not loaded here…" (its component isn't loaded) or, for a label whose stand-in is made of texts that
+aren't loaded, what to load ("Its column's names aren't loaded here: load its table's columns, then undo again"); or
+"Couldn't read its current text (…). The undo checks it again before writing" (also a label gone from its form, sitemap,
+process or choice, or a metadata read still behind). The labels changed since come first; one sentence counts the states
+("1 translation this publish added gets the English text in its place: Dataverse can't remove it.", in the words of
+`standInsSaid`; "1 label can't be undone until the texts put in its place are loaded."); the others'-work sentence and
+the publish scope sit next to the button. Nothing is written before **Undo N changes** (N: labels to undo, a stand-in's
+among them, unread ones and those chosen; disabled at 0); when every label is already as before or stays it reads **Mark
+as undone**, which writes no label but publishes like any undo (a label found already as asked may be an earlier write
+not yet published, §4.7 step 4). Cancel leaves everything. Undo's safety is unchanged: each label is written only where
+the server still holds the text the publish wrote, and a label someone changed since is a conflict, left as it is; one
+chosen with Undo anyway is measured against the text just read instead, so a text changed again after that read is still
+a conflict, never overwritten. The result shows each label's outcome in the same rows (Undone; Already as before;
+Changed since this publish, so it was left as it is; Stays: Dataverse can't remove it, with why; the saver's message), a
+stand-in written shown as the text written with its quiet note, Fix on conflicts and failures, a one-line count, Try
+again, Redo, Refresh page. A held-back label (its stand-in waits for a text to be loaded) is neither "stays" nor counted
+for **Mark as undone**, and the publish stays undoable (§4). `refreshPage()`: asks when changes are still staged and
+when the record has unsaved changes or may have (core/context.ts `recordDirty`, below), tears the app down, shows
+"Refreshing the page…", restores the user's language (waiting for it as long as a switch of the translator runs whose
+answer isn't lost, `switching`, since a reload in the middle of it makes the next start wait until it can no longer run,
+and at most 3 s otherwise, `RESTORE_WAIT`; the switch window is not held through the reload, so a switch another tab
+starts then, or one left in doubt that may still run after those 3 s, can boot the page in that language until the next
+refresh), stores `dxt:verify:<orgId>` (what was published), purges and
+reloads. The next start checks the page shows it (app.ts `verifyAfterLoad`) and speaks only when it doesn't: "N changes
+aren't showing yet" with Refresh again (refresh.ts `notShowing`); a page that shows every change says nothing, as the
+page itself shows them. The purge (`purge()`, finding 82; every step guarded and raced against a timeout, the reload
+always happens): the service worker's commands (`postMessage({name})`: PurgeUserContextGcmCacheEntry,
+PurgeUserSettingsCollectionDataCacheEntry, PurgeGcmCache, PurgeDataCache, PurgeMainAspxCache; to the controller, else
+the registration's active worker), every CacheStorage cache except the code caches (`CDN_Resources`, `clientsdk`,
+`WebResources`, `sw-feature-status`; `mainaspx` goes), `clearState` to the `uci-state-persistence` SharedWorker, the
+localStorage keys `uci-state*`, `Form:*`, `ActualControls/*` and `UCI_RESOURCE_STRINGS` (never `dxt:*`), the metadata
+stores of the IndexedDB named by the origin (usercontext, entitymetadata, attributemetadata, applicationmetadata,
+metadataversionstamp, navigationdata, userpersonalization, `temp*`; never offline records, never the database: one that
+doesn't exist is not created), sessionStorage. The reload (`reloadFresh()`) loads the same main.aspx URL with
 `flags=FCB.PersistReduxStore=false,FCB.PersistReduxStoreV2=false` merged into its flags, so it boots from the server
-instead of a persisted state.
-**Unsaved changes on the record** (core/context.ts `recordDirty`): yes or no from the form's own
-`Xrm.Page.data.getIsDirty()`, else from its entity's (`data.entity.getIsDirty()`, the documented formContext call);
-no on a page without a record (no client API, a page context of another page type, no form data or form data without
-a record: a list, a dashboard); unknown (null) where there is a record but neither answers yes or no (the call throws,
-answers something else, or doesn't exist). The refresh asks on yes ("This record has unsaved changes. Refresh anyway
-and lose them?") and on unknown ("This record may have unsaved changes. …"): the reload would lose whatever the record
-holds unsaved. The Xrm it asks is `ctx.xrm`, read live through `findXrm`: this window's, else a same-origin frame's; a
-frame of another site (an embedded page) can't be looked into and is skipped, never the end of the search.
-**Show Dynamics in <language>** (bar ⋯ and Workbench More, every provisioned language but the one on screen: that
-is `<html lang>`, not `ctx.user`, which after a change made elsewhere already says the new one, finding 78): refused
-while a save runs, the language is switched for a moment, or a switch whose answer was lost may still run (§4.3); the
-same questions as the refresh; then
-`LangSession.adoptLanguage` (under the language lock and the exclusive switch window) runs core/uilang
-`setUiLanguage` (PATCH `uilanguageid` + `helplanguageid`, the locale untouched; read back with `Consistency:
-Strong` until it shows) and makes it the session's own language, dropping the repair marker, so nothing switches
-the user back; then the refresh. A reload still on the page after 8 s (`STAYED`: "Leave site?" answered Stay)
+instead of a persisted state. **Unsaved changes on the record** (core/context.ts `recordDirty`): yes or no from the
+form's own `Xrm.Page.data.getIsDirty()`, else from its entity's (`data.entity.getIsDirty()`, the documented formContext
+call); no on a page without a record (no client API, a page context of another page type, no form data or form data
+without a record: a list, a dashboard); unknown (null) where there is a record but neither answers yes or no (the call
+throws, answers something else, or doesn't exist). The refresh asks on yes ("This record has unsaved changes. Refresh
+anyway and lose them?") and on unknown ("This record may have unsaved changes. …"): the reload would lose whatever the
+record holds unsaved. The Xrm it asks is `ctx.xrm`, read live through `findXrm`: this window's, else a same-origin
+frame's; a frame of another site (an embedded page) can't be looked into and is skipped, never the end of the search.
+**Show Dynamics in <language>** (bar ⋯ and Workbench More, every provisioned language but the one on screen: that is
+`<html lang>`, not `ctx.user`, which after a change made elsewhere already says the new one, finding 78): refused while
+a save runs, the language is switched for a moment, or a switch whose answer was lost may still run (§4.3); the same
+questions as the refresh; then `LangSession.adoptLanguage` (under the language lock and the exclusive switch window)
+runs core/uilang `setUiLanguage` (PATCH `uilanguageid` + `helplanguageid`, the locale untouched; read back with
+`Consistency: Strong` until it shows) and makes it the session's own language, dropping the repair marker, so nothing
+switches the user back; then the refresh. A reload still on the page after 8 s (`STAYED`: "Leave site?" answered Stay)
 drops its note.
 
 ### 5.4 Translation mode v3 (inspector/*, ui/callout.ts, ui/bar.ts)
@@ -1467,31 +1560,34 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
   popup for the previous page's table. On a page that didn't change it opens as before. And on a list page, a grid
   whose `data-lp-id` names another table than the page's (the next page's grid, drawn before the index follows) maps
   none of its headers or cells to the page's table.
-* **Popup** (ui/callout.ts, content from inspector/describe.ts): a kind word and the title; one block per text (Form
-  label, Tooltip, Column name, Label, Name, Plural name…) with one plain input per shown language, the base language
+* **Popup** (ui/callout.ts, content from inspector/describe.ts): a kind word and the title; one block per text (Column
+  name, Tooltip, Form label, Label, Name, Plural name…) with one plain input per shown language, the base language
   first, then the target. It opens with the caret at the end of its first text's input in the language the page is
   shown in (`<html lang>`, else the user's Dynamics language: core/uilang.ts `shownLanguage`), not the target: on an
   English page the English text, on a French one the French text. Where that input is disabled or not shown (that
   language not loaded), the caret goes to that text's first input that takes typing, else the first input that takes
   typing. The first text is the first block that takes typing: the clicked text's, except in a field's popup, whose
-  Form label it is (below). A label or language passed in by what opened the popup (a choice value, Fix:
+  Column name it is (below). A label or language passed in by what opened the popup (a choice value, Fix:
   `focusKey`, `focusLcid`) wins; a choice list without a column for that language falls back to the target's. A pending
   choice takes the caret only in a popup without a column's name: in a field's or a column header's the Choices list
   still opens by itself, and the caret goes to the first text (a column header's: its name). Tab order is the inputs'
   order. The clicked text's block comes first, except in a field's popup.
-  - A **field** (a column's form cell) shows Form label (its form cell) + Tooltip (the column Description, finding
-    43) + Column name (the column's DisplayName), always in that order, whichever text was clicked (describe.ts
-    `field`; `clickedFirst` keeps it). Each heading is followed by where it applies (describe.ts `FIELD_NOTES`): "this
-    form only, shown instead of the column name" (a quick view form's cell: "this quick view (on every form that shows
-    it), instead of the column name"), "everywhere", "everywhere: views, search and forms without a form label". A
-    form label is the form's own text, often a copy of the column's name that the form designer saved when the field
-    was added; it does not follow a later change to the column's name. So the Column name changes views, search and
-    the forms without a label of their own, and what a form shows changes with its Form label.
-  - It always opens on the Form label, the text the page shows, whether or not the form has a label of its own (while
-    it is empty, its placeholder `Shows “<column name>”` says what the page shows instead, below); the Column name
-    takes the caret only where the Form label can't be typed in (read-only: a form from a managed solution, with an
-    unmanaged column on it). Earlier builds opened on the Form label only where the form had one in the page's
-    language (`clickedKeys`), or always on the Column name. The rule, `focusKeys` (focusInitial then takes each key's
+  - A **field** (a column's form cell) shows Column name (the column's DisplayName) + Tooltip (the column Description,
+    finding 43) + Form label (its form cell), always in that order, whichever text was clicked (describe.ts `field`;
+    `clickedFirst` keeps it). Each heading is followed by where it applies (describe.ts `FIELD_NOTES`): "everywhere:
+    views, search and forms without a form label", "everywhere", "this form only, shown instead of the column name" (a
+    quick view form's cell: "this quick view (on every form that shows it), instead of the column name"). A
+    form label is the form's own text; it does not follow a later change to the column's name. A field added in the
+    form designer has none and follows the column, but any later save of the form (in the designer, or by translator
+    1.0.0) stores the column's name as its label in each language it has none in, when it has one in another
+    (LIVE-FINDINGS 103, 109). So the Column name changes views, search and the forms without a label of their own, and
+    what a form shows changes with its Form label.
+  - It always opens on the Column name, whether or not the form has a label of its own, also on a form from a managed
+    solution (its labels read-only); the Form label, the text the page shows, takes the caret only where the Column
+    name can't be typed in (read-only: a managed column's, or one that can't be renamed), never the Tooltip between
+    them. 1.0.0 opened on the Form label, and on the Column name only where the Form label was read-only (a form from
+    a managed solution); earlier builds opened on the Form label only where the form had one in the page's language
+    (`clickedKeys`), or always on the Column name. The rule, `focusKeys` (focusInitial then takes each key's
     input in the page's language, else its first one that takes typing; a disabled input is never one):
 
     ```ts
@@ -1501,7 +1597,7 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
         const s = store.get(b.key);
         if (s?.kind !== 'field' || s.prop !== 'Label') continue;
         const ck = fallbackKey(s);
-        return ck && blocks.some((x) => x.key === ck) ? [s.key, ck] : [];
+        return ck && blocks.some((x) => x.key === ck) ? [ck, s.key] : [];
       }
       return [];
     }
@@ -1542,9 +1638,49 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
   disabled and its reason on a line with a lock, at the top of the popup when nothing in it can be edited (a managed
   column's field on a managed form: every input locked, `MANAGED` at the top); the placeholder says what users of that
   language see now (`Shows “X”`; for a cell the column's name in that language, else its base-language name, finding
-  42: callout.ts `shows`); a metadata description's says "No French tooltip" ("No French description", `noneText`)
-  only where its users see none (stored empty, emptied here, or no base text either), and a missing one "Shows “…”"
-  with the base text. A translation emptied where Dataverse can't remove it has no placeholder (what the page
+  42: callout.ts `shows`). A main form's field label that follows its column in a language is empty there while
+  nothing is typed in it, with that placeholder (`Store.follows`, model.ts `follows`): GetClientMetadata lists no
+  label of the cell's own there (`ref.own`), and its text as loaded is the column's name a read fills in (model.ts
+  `fillsIn`, findings 103, 114); a label of the form's own shows its text. The answer comes, in this order, from the
+  page's own copy (finding 115: UCI reads the part of it that holds the form's labels to draw the form, and its service
+  worker keeps it; providers/formxml.ts `pageOwnLabels` looks for it while the page's form is read, so it never makes
+  that read longer: newest `gcm_<n>` cache first, a form part that isn't a KeepOnly one, per language the newest copy
+  whose custom controls' resource files name that language alone; `knownOwnLabels` takes one of the version loaded whose
+  texts agree with the loaded ones, a label it lists as a cell's own being the cell's text there and a cell it lists none
+  for having the column's name a read fills in (`fillsIn`, by the column's names in the store: an answer once lacked the
+  form's own labels, finding 113), and keeps it as that language's answer), from the answer kept in localStorage per
+  form and language with the published version it describes (those of the 100 forms of the org written last,
+  `OWN_FORMS`, `pruneOwn`), and from a read; each only for a form loaded at that version (`ref.formVersion`, the version
+  the load read). A form whose load's quick read in another language finds another published version (a change not
+  published yet, which may be a cell's text worded as its column's name) gets none: no answer is taken, read or kept
+  for it, and its labels show as loaded until it is published; an answer of another version than its cells' is neither
+  taken nor kept. What is known as the form's labels are stored is set on them before
+  (a popup is right from its first frame); a copy found later, or one the column's names weren't in yet to check, is set
+  once the labels are stored and the page's table is in (`Store.setOwn`; until then no label shows as following its
+  column anyway). The read (`loadOwnLabels`; the labels part as the page asks for it, `MetadataSubtype` Main with its
+  Exclude list, ~0.1 MB on the test form and ~1 MB on a large one, where the whole answer is 1.3 and 8.7 MB) runs once
+  the page's loads are done (pageload.ts `ownLabels`), never in a load's switch window, and only for a language with no
+  answer for that version where some label's text is the column's name (`Store.fillsIn`): in the user's language
+  without a switch, then each other language in a switch window of its own, every form in one batch, each read in a
+  hold of its own (a load that starts in between gets the lock first), and each answer is set on the labels as it comes
+  in. A load that starts meanwhile stops the read before its batch is sent and it runs again once no load runs; a window
+  already sent is never aborted, so that load waits for it and its answer is kept. The read waits while a save or a
+  publish runs (`Store.busy`, which the Publish dialog keeps set through the Checking step and its repair, §5.3), and
+  one that starts stops it the same way: its form label writes need the language lock, and its publish no switch
+  window. After a publish of the translator's own, the answers kept for the version the save started from are kept for
+  the new one, as the save left the cells (§5.3, `keepOwnLabels`): a typed text its own, and
+  one worded as its column's name only on a key that held a label (the form writer's record of what it posted,
+  `SaveOptions.forms` `CellOwn`, LIVE-FINDINGS 104), so the page that loads next reads nothing; a language where that
+  isn't known is read again. Until a language's answer is in, a
+  label there worded as the column's name shows as the user's language does for that field (`follows` given the user's
+  language: empty where it follows there), as most fields follow their column in every language or in none, and so it
+  does in a language whose read failed, until a later load reads it; every label while nothing is known shows as before.
+  Display only: emptying such an input again stages nothing (ui/editor.ts `typedText`, given the user's language as the
+  input is, so a label shown as the user's language stages as shown; the copies checkbox too, `writeAlso`), so its
+  column's name is never written there as its stand-in. A metadata
+  description's placeholder says "No French tooltip" ("No French description", `noneText`) only where its users see none
+  (stored empty, emptied here, or no base text either), and a missing one "Shows “…”" with the base text. A translation
+  emptied where Dataverse can't remove it has no placeholder (what the page
   shows now may not be what it becomes: a stage name Dynamics keeps); a muted line under its input with an info icon
   (`becomes`, `.co-m.is-note`) says what saving writes in its place, "Becomes “Start date”: Dataverse can't remove a
   translation here, so French gets the English text." (a field: "…gets the column's French name."; one that is that
@@ -1731,7 +1867,14 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
     not, the find would be cancelled as "another page"), and the flyout restore.
   - The user's own language shows staged text in place (preview.ts); an emptied translation Dataverse can't remove
     shows its stand-in (`Store.standIn`), what saving writes, and a field label without a text in that language whose
-    column has no name there either shows the column's base-language name.
+    column has no name there either shows the column's base-language name. A field label that shows its column's name
+    (missing, emptied, or following it: `Store.follows`) shows that name as staged while the *Column name* is typed
+    (`Preview.showing`). Besides the texts the store has for a form's own label (a field's, a tab's, a section's), the
+    preview swaps the text its node showed when the scanner found it (`Anchor.orig`, read through `Preview.textOf`): the
+    page may show another text than the one loaded, such as a form label saved and not published yet, which the page
+    shows as published. Any other label's found text may be none of its own (a related menu item's language-pack text,
+    or its relationship's while the relationships aren't loaded): never swapped. Only that label's own nodes are
+    swapped, as before.
 * **Mapping safety** (inspector/scan.ts): every anchor resolves to one slot key. Form fields resolve to the
   exact cell copy through the form API (finding 41); a column stands in only when the loaded form has no
   cell for it. Grid headers and choice values on lists and sub-grids (Power Apps grid
@@ -1770,9 +1913,9 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
     `builtin|timeline|<the cell's comp>|Label` (scan.ts `TIMELINE_HEADING`, `isHeading`). It is grey (mode.ts
     `anchorLook`), nothing is previewed on it (the key is no slot's), the list finds the cell there (`showing` lets
     the heading stand for its cell), and a change made in its popup is this page's. The popup says which heading it
-    is (`TIMELINE_NAME_NOTE` for a Name, `TIMELINE_NOTE` for Dynamics' own) and offers the cell's label, a *Form label*
-    saved on the form but not shown, whose empty input says *No French form label* (describe.ts `field`,
-    `Block.hidden`). Nothing else in a timeline is its label (the field and control rules skip timeline cells).
+    is (`TIMELINE_NAME_NOTE` for a Name, `TIMELINE_NOTE` for Dynamics' own), with no input: the cell's label is saved
+    on the form but never shown, so it is translated in the Workbench (describe.ts `field`). Nothing else in a timeline
+    is its label (the field and control rules skip timeline cells).
   - A subarea that shows its table's plural name (`ref.plural`, §4.4) maps to `entity|<table>|DisplayCollectionName`
     only where the entry's text is one of that name's texts (any language), read on demand: no mark while it loads.
     Once that read failed, or where the entry shows any other text, the entry stays on its own read-only subarea slot

@@ -2,11 +2,12 @@
 // texts of one component (a field's form label, tooltip and column name, a column's name, its choices…) with one
 // plain input per shown language, the base language first. Every keystroke is staged in the store: nothing is
 // saved here, the bar's "Review and publish" saves and publishes every staged change at once. Done, Enter, Esc and
-// a click outside close it and keep the text; "Undo changes" puts back what the texts were when it opened. It
+// a click outside close it and keep the text; "Undo changes" puts back what the texts were when it opened, then takes
+// back what they held staged then. It
 // never writes to Dataverse and never touches the Dynamics DOM: it lives in the app layer of our shadow root.
 
 import { isRtl, lcidName, lcidTag } from '../core/lcid';
-import { canClear, isManaged, keepsEmpty, namesFirst, noneText, noStandIn, savedEmptyText, savesEmpty, stays, type Lcid, type Slot } from '../core/model';
+import { canClear, isManaged, keepsEmpty, MANAGED_OPEN, managedHeld, namesFirst, noneText, noStandIn, savedEmptyText, savesEmpty, stays, type Lcid, type Slot } from '../core/model';
 import type { Store } from '../core/store';
 import { shownLanguage } from '../core/uilang';
 import { columnOf } from '../inspector/column';
@@ -15,7 +16,7 @@ import { choiceNote, choicesNote } from '../inspector/pill';
 import type { Block, CalloutModel, OpenCallout } from '../inspector/types';
 import css from './callout.css';
 import { h, icon, put, rafThrottle } from './dom';
-import { becomesText, langName, notLoaded } from './editor';
+import { becomesText, langName, notLoaded, typedText } from './editor';
 import { whenEmpty } from './undo';
 import { active, btn, ibtn, link, modalOpen, pushLayer, spinner, tooltip } from './widgets';
 
@@ -57,10 +58,11 @@ export interface Snap {
   /** The pending edit then; undefined when there was none. */
   pending: string | undefined;
   /**
-   * That edit's base (Store.before): the server text it was made on. Undo brings the edit back measured against
-   * it, so a reload that brought another maker's text meanwhile is still a conflict at save, never overwritten.
+   * That edit's base (Store.base): the server text it was made on, null where its language had no label at all then.
+   * Undo brings the edit back measured against it, so a reload that brought another maker's text meanwhile (a '' stored
+   * where there was none, too) is still a conflict at save, never overwritten.
    */
-  base?: string;
+  base?: string | null;
 }
 
 /** Records every cell of `keys` × `langs` that is not recorded yet (a cell shown later keeps its first state). */
@@ -72,7 +74,7 @@ export function snapshot(store: Store, keys: Iterable<string>, langs: Lcid[], in
       const id = cellId(key, lcid);
       if (into.has(id)) continue;
       const pending = e?.has(lcid) ? e.get(lcid) : undefined;
-      into.set(id, { key, lcid, value: store.value(key, lcid), pending, base: pending === undefined ? undefined : store.before(key, lcid) });
+      into.set(id, { key, lcid, value: store.value(key, lcid), pending, base: pending === undefined ? undefined : store.base(key, lcid) });
     }
   }
   return into;
@@ -85,7 +87,7 @@ export function snapshot(store: Store, keys: Iterable<string>, langs: Lcid[], in
 export function restore(store: Store, snaps: Iterable<Snap>): number {
   let n = 0;
   const now = (s: Snap) => store.edits.get(s.key)?.get(s.lcid);
-  const based = (s: Snap) => s.base === undefined || store.before(s.key, s.lcid) === s.base;
+  const based = (s: Snap) => s.base === undefined || store.base(s.key, s.lcid) === s.base;
   store.group(() => {
     for (const s of snaps) {
       const was = now(s);
@@ -157,17 +159,17 @@ export const fallbackKey = (s: Slot, store?: Pick<Store, 'get'>): string => {
 };
 
 /**
- * The blocks that take the focus first, best first, in a form field's popup (Form label, Tooltip, Column name: a
- * column's form cell, inspector/describe.ts): the form's label, the text the page shows (or shows the column's name in
- * its place while empty), then the column's name, which takes it only where the form's label can't be typed in
- * (read-only: a managed form's). [] in any other popup, whose first block takes it.
+ * The blocks that take the focus first, best first, in a form field's popup (Column name, Tooltip, Form label: a
+ * column's form cell, inspector/describe.ts): the column's name, then the form's label, the text the page shows, which
+ * takes it where the column's name can't be typed in (read-only: a managed column's, or one that can't be renamed),
+ * never the tooltip in between. [] in any other popup, whose first block takes it.
  */
 export function focusKeys(store: Pick<Store, 'get'>, blocks: readonly Block[]): string[] {
   for (const b of blocks) {
     const s = store.get(b.key);
     if (s?.kind !== 'field' || s.prop !== 'Label') continue;
     const ck = fallbackKey(s);
-    return ck && blocks.some((x) => x.key === ck) ? [s.key, ck] : [];
+    return ck && blocks.some((x) => x.key === ck) ? [ck, s.key] : [];
   }
   return [];
 }
@@ -200,14 +202,16 @@ export function shows(store: Store, s: Slot, l: Lcid, base: Lcid): string {
  * where its users see none: stored empty, or emptied here and saved so (Store.emptyOnPurpose), or with no base text
  * either; a missing one shows the base text to them, which it says.
  */
-export function placeholderOf(store: Store, s: Slot, l: Lcid, base: Lcid, heading: string, lang: string, page = '', hidden = false): string {
-  if (l !== base && !s.readOnly && store.standIn(s.key, l, base)?.text) return '';
+export function placeholderOf(store: Store, s: Slot, l: Lcid, base: Lcid, heading: string, lang: string, page = ''): string {
+  const x = s.readOnly ? undefined : store.standIn(s.key, l, base);
+  // Emptied, the field's last label of its own: it follows its column, as an empty one that does shows it.
+  if (x?.follow) return `Shows “${x.text.trim()}”`;
+  if (l !== base && x?.text) return '';
   if (l !== base && keepsEmpty(s)) {
     const v = store.emptyOnPurpose(s.key, l, base) ? '' : shows(store, s, l, base);
     return v ? `Shows “${v}”` : noneText(s, lang);
   }
-  // A label the page never shows (Block.hidden): nothing shows in its place either.
-  if (hidden || /tooltip|description|hint/i.test(heading)) return `No ${lang} ${heading.trim().toLowerCase()}`;
+  if (/tooltip|description|hint/i.test(heading)) return `No ${lang} ${heading.trim().toLowerCase()}`;
   const v = page.trim() || shows(store, s, l, base);
   return v ? `Shows “${v}”` : '';
 }
@@ -265,17 +269,19 @@ export function becomes(store: Store, s: Slot, l: Lcid, base: Lcid, lang = lcidN
   // so nothing would be saved.
   if (store.isEdited(s.key, l) && store.emptyOnPurpose(s.key, l, base)) return store.original(s.key, l).trim() ? savedEmptyText(s, lang) : '';
   const x = store.standIn(s.key, l, base);
-  return x?.text ? becomesText(s, l, base, x) : '';
+  return x?.text && !x.follow ? becomesText(s, l, base, x) : '';
 }
 
 /**
  * "Also change the other copies": the same text for the field's other copies (never a read-only or not-loaded one, nor
- * one of a form from a managed solution).
+ * one of a form from a managed solution), as typed in each (ui/editor.ts typedText: a blank one leaves a copy that follows
+ * its column as it is, by the user's language `user` where its own isn't answered yet); `null` gives each copy its loaded
+ * text back.
  */
-export function writeAlso(store: Store, keys: readonly string[], l: Lcid, text: string): void {
+export function writeAlso(store: Store, keys: readonly string[], l: Lcid, text: string | null, base: Lcid, user?: Lcid): void {
   for (const k of keys) {
     const s = store.get(k);
-    if (s && !s.readOnly && !isManaged(s) && !notLoaded(s, l)) store.set(k, l, text);
+    if (s && !s.readOnly && !managedHeld(s, store.managedEdits) && !notLoaded(s, l)) store.set(k, l, text === null ? store.original(k, l) : typedText(store, k, l, base, text, user));
   }
 }
 
@@ -497,13 +503,20 @@ export const openCallout: OpenCallout = (app, host) => {
   const byKey = (id: string) => inputs().find((x) => x.getAttribute('data-k') === id);
 
   // ---- typing ----
-  /** Stages a keystroke; with the duplicates checkbox ticked, the copies get the same text (one store event). */
+  /**
+   * Stages a keystroke; with the duplicates checkbox ticked, the copies get the same text (one store event). A blank one
+   * where the label follows its column changes nothing (ui/editor.ts typedText), so neither does it change a copy: each
+   * goes back to how it was when the popup opened (restore, as unticking does), its own staged edit included, where a
+   * blank would put its stand-in in place of a text of its own (model.ts standIn).
+   */
   function type(s: Slot, l: Lcid, b: Block | null, v: string): void {
     const copies = b?.also && st.also.get(b.key) ? b.also.keys : null;
-    if (!copies) return store.set(s.key, l, v);
+    const t = typedText(store, s.key, l, base, v, ctx.user);
+    if (!copies) return store.set(s.key, l, t);
     store.group(() => {
-      store.set(s.key, l, v);
-      writeAlso(store, copies, l, v);
+      store.set(s.key, l, t);
+      if (t === v) writeAlso(store, copies, l, v, base, ctx.user);
+      else restore(store, copies.flatMap((k) => snaps.get(cellId(k, l)) ?? []));
     });
   }
   /** Ticked: the copies take the texts changed here since the popup opened; unticked: they go back to how they were. */
@@ -516,7 +529,7 @@ export const openCallout: OpenCallout = (app, host) => {
     store.group(() => {
       for (const l of langs()) {
         const sn = snaps.get(cellId(b.key, l));
-        if (sn && changedHere(store, sn)) writeAlso(store, keys, l, store.value(b.key, l));
+        if (sn && changedHere(store, sn)) writeAlso(store, keys, l, store.value(b.key, l), base, ctx.user);
       }
     });
   }
@@ -549,13 +562,17 @@ export const openCallout: OpenCallout = (app, host) => {
     const v = h('div', { class: 'co-v' }, inp, msg);
     let said = '\u0000';
     const update = () => {
-      const val = store.value(s.key, l);
+      // A form label that follows its column (Store.follows) is empty while nothing is typed in it, its placeholder what
+      // shows in its place (the column's name), as right after emptying it; in a language not known yet, as the user's
+      // language does. Its loaded text typed there stays (Store.set drops an edit back to the server text): a longer text
+      // typed key by key goes through it, and on from it.
+      const val = !store.isEdited(s.key, l) && store.follows(s.key, l, base, ctx.user) && inp.value !== store.original(s.key, l) ? '' : store.value(s.key, l);
       if (inp.value !== val) {
         inp.value = val;
         grow(inp);
       }
       const page = l === ctx.user ? o.block?.pageText : '';
-      inp.placeholder = unread ? 'Not loaded yet' : o.choice || s.readOnly ? '' : placeholderOf(store, s, l, base, o.block?.heading || 'Label', n, page, !!o.block?.hidden);
+      inp.placeholder = unread ? 'Not loaded yet' : o.choice || s.readOnly ? '' : placeholderOf(store, s, l, base, o.block?.heading || 'Label', n, page);
       const p = problem(store, s, l, base);
       // An emptied translation Dataverse can't remove: what saving writes in its place, in a muted line (and no
       // placeholder, placeholderOf: what the page shows now may not be what it becomes, a stage name Dynamics keeps); a
@@ -590,8 +607,9 @@ export const openCallout: OpenCallout = (app, host) => {
     return c;
   }
 
-  /** One muted line: why a text can't be changed. */
-  const roLine = (reason: string): HTMLElement => h('div', { class: 'co-ro' }, icon('lock', 12), h('span', null, reason.trim().replace(/[.\s]+$/, '')));
+  /** One muted line: why a text can't be changed; amber (`warn`): what changing it does (MANAGED_OPEN). */
+  const roLine = (reason: string, warn = false): HTMLElement =>
+    h('div', { class: warn ? 'co-ro is-warn' : 'co-ro' }, icon(warn ? 'warn' : 'lock', 12), h('span', null, reason.trim().replace(/[.\s]+$/, '')));
 
   function block(b: Block): HTMLElement | null {
     const s = store.get(b.key);
@@ -604,6 +622,8 @@ export const openCallout: OpenCallout = (app, host) => {
     return h('section', { class: 'co-blk', role: 'group', 'aria-labelledby': hid },
       h('div', { class: 'co-bh', id: hid }, b.heading, b.note ? h('span', { class: 'co-bn' }, ` · ${b.note}`) : null),
       s.readOnly && !model.readOnly ? roLine(s.readOnly) : null,
+      // A managed solution's label this session may change (Ctx.managedEdits): what saving it does.
+      !s.readOnly && isManaged(s) ? roLine(MANAGED_OPEN, true) : null,
       rows,
       b.also?.keys.length && !s.readOnly ? alsoBox(b) : null,
     );
@@ -710,13 +730,21 @@ export const openCallout: OpenCallout = (app, host) => {
     reposition();
   }
 
+  /**
+   * The texts of this popup, in the languages it shows, that hold a staged edit: in a popup opened again on texts
+   * staged before, "Undo changes" takes those back too once nothing was changed in it.
+   */
+  function staged(): Snap[] {
+    const ls = langs();
+    return [...snaps.values()].filter((s) => ls.includes(s.lcid) && store.isEdited(s.key, s.lcid));
+  }
   function updateFoot(): void {
     if (dead) return;
-    const changed = changedCells(store, snaps.values()).length > 0;
-    if (undoB.hidden === changed) {
+    const can = changedCells(store, snaps.values()).length > 0 || staged().length > 0;
+    if (undoB.hidden === can) {
       // The link is going away under the focus: the focus stays in the popup.
-      if (!changed && active(el) === undoB) doneB.focus();
-      undoB.hidden = !changed;
+      if (!can && active(el) === undoB) doneB.focus();
+      undoB.hidden = !can;
       later();
     }
   }
@@ -770,7 +798,7 @@ export const openCallout: OpenCallout = (app, host) => {
    * column's: Choices opens by itself there all the same, the caret goes to the first text), else the first text's input in
    * the language the page is shown in (the text the user was reading: `<html lang>`, else their Dynamics language),
    * else that text's first input that takes typing, else the first input that takes typing. The first text is the first
-   * block that takes typing; in a form field's popup, the form's label, else (read-only) the column's name
+   * block that takes typing; in a form field's popup, the column's name, else (read-only) the form's label
    * (focusKeys). The caret goes to the end of its text.
    */
   function focusInitial(): void {
@@ -827,10 +855,21 @@ export const openCallout: OpenCallout = (app, host) => {
       later();
     }
   }
-  /** "Undo changes": every text back to what it was when the popup opened. */
+  /**
+   * "Undo changes": every text back to what it was when the popup opened. Once nothing was changed in it, the edits its
+   * texts held then (staged before it opened) are taken back, to the text on the server, in one undo step: the popup goes
+   * on from there, as if it had opened on them.
+   */
   function undo(): void {
     if (dead) return;
-    restore(store, snaps.values());
+    if (changedCells(store, snaps.values()).length) restore(store, snaps.values());
+    else {
+      const back = staged();
+      store.group(() => back.forEach((s) => store.revert(s.key, s.lcid)));
+      for (const s of back) snaps.delete(cellId(s.key, s.lcid));
+      snapshot(store, keysOf(model), all, snaps);
+      updateFoot(); // the store's event came before the new snapshot
+    }
     announce('Changes undone.');
     focusInitial();
   }

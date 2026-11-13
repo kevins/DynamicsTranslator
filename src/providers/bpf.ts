@@ -26,7 +26,7 @@ import { DvError, abortError, guid, isAbort, isGuid, mayHaveRun, partError, paus
 import { pick } from '../core/labels';
 import { LangSession } from '../core/langsession';
 import { lcidName } from '../core/lcid';
-import { MANAGED, canClear, cantClearText, isManaged, keeps, type Change, type ChangeResult, type Labels, type Lcid, type Slot } from '../core/model';
+import { MANAGED, canClear, cantClearText, keeps, managedHeld, managedReadOnly, managedSlot, type Change, type ChangeResult, type Labels, type Lcid, type Slot } from '../core/model';
 import { blank, presentLabels, xmlAttr } from '../core/xml';
 import { Unsent, olderVersion, settle, type DocOps, type Sent } from './repair';
 import { changeId, check, type LoadOptions, type Loader, type ProcessPage, type SaveOptions, type Writer } from './types';
@@ -56,9 +56,17 @@ interface Doc {
   etag: string;
   /** The row's versionnumber: a read showing a lower one than an earlier read lags behind it (providers/repair.ts). */
   ver?: unknown;
-  /** The process is from a managed solution (workflow.ismanaged): its labels are never written. */
+  /**
+   * The process is from a managed solution (workflow.ismanaged): its labels are never written, unless this session allows
+   * changes to managed labels (Ctx.managedEdits) and its managed properties allow customizing it (`locked` '').
+   */
   managed: boolean;
+  /** Why its labels stay read-only where changes to managed labels are allowed: not customizable ('' = they don't). */
+  locked: string;
 }
+/** A managed process's labels, where changes to managed labels are allowed, as its managed properties say (Doc.locked). */
+const notCustomizable = (w: any): string =>
+  w?.iscustomizable?.Value === false ? "This business process flow is marked as not customizable (its “Allow customizations” managed property is off), so its labels can't be changed here." : '';
 interface Item {
   kind: 'stage' | 'step';
   id: string;
@@ -148,7 +156,7 @@ function parse(w: any): Doc {
     for (const k in v) visit(v[k]);
   };
   visit(cd);
-  return { xaml, cdText, cd, x, c, etag: w['@odata.etag'], ver: w.versionnumber, managed: w.ismanaged === true };
+  return { xaml, cdText, cd, x, c, etag: w['@odata.etag'], ver: w.versionnumber, managed: w.ismanaged === true, locked: notCustomizable(w) };
 }
 
 /** Stages and steps in tree order. A step's ControlStep child names its column. */
@@ -182,8 +190,11 @@ export async function loadBpfLabels(ctx: Ctx, workflowId: string, o: LoadOptions
   }
   const name = String(w.name || 'Business process flow');
   // A process from a managed solution is read-only whatever its managed properties allow: a translation would be an
-  // unmanaged layer on top of it (workflows are "top wins"). Managed properties only bind managed layers.
+  // unmanaged layer on top of it (workflows are "top wins"), unless this session allows changes to managed labels
+  // (Ctx.managedEdits): then as its managed properties say (core/model.ts managedSlot). Managed properties only bind
+  // managed layers.
   const readOnly = d.managed ? MANAGED : '';
+  const own = (s: Slot): Slot => (d.managed ? managedSlot(s, ctx.managedEdits, d.locked, MANAGED) : s);
   const stageTitles = new Map<string, string>();
   const out = new Map<string, Slot>();
   for (const n of items) {
@@ -192,26 +203,30 @@ export async function loadBpfLabels(ctx: Ctx, workflowId: string, o: LoadOptions
     const labels = presentLabels(cur(d, n.id)); // a label stored as '' counts as missing
     const title = pick(labels, ctx.user, ctx.base) || n.display || n.field || `Untitled ${n.kind}`;
     if (n.kind === 'stage') stageTitles.set(n.id, title);
-    out.set(comp, {
-      key: `${comp}|Label`,
-      kind: n.kind,
-      prop: 'Label',
-      entity: n.entity,
+    out.set(
       comp,
-      group: `bpfxaml|${id}`,
-      title,
-      path: n.kind === 'step' && stageTitles.has(n.stage) ? [name, stageTitles.get(n.stage)!] : [name],
-      sub: n.field || (n.entity !== primary ? n.entity : ''),
-      labels,
-      readOnly,
-      baseRequired: true,
-      // Stage names become processstage.stagename (100); 500 is the translation file limit.
-      max: n.kind === 'stage' ? 100 : 500,
-      order: out.size,
-      // managed: the process is from a managed solution, so its labels are read-only (never an unmanaged layer on it).
-      // primary: the process's table, whose records GetClientMetadata answers for (loadBpfStored).
-      ref: { workflowId: id, labelId: n.id, attribute: n.field, stageId: n.stage || undefined, primary, managed: d.managed },
-    });
+      own({
+        key: `${comp}|Label`,
+        kind: n.kind,
+        prop: 'Label',
+        entity: n.entity,
+        comp,
+        group: `bpfxaml|${id}`,
+        title,
+        path: n.kind === 'step' && stageTitles.has(n.stage) ? [name, stageTitles.get(n.stage)!] : [name],
+        sub: n.field || (n.entity !== primary ? n.entity : ''),
+        labels,
+        readOnly,
+        baseRequired: true,
+        // Stage names become processstage.stagename (100); 500 is the translation file limit.
+        max: n.kind === 'stage' ? 100 : 500,
+        order: out.size,
+        // managed: the process is from a managed solution, so its labels are read-only (never an unmanaged layer on it,
+        // unless this session allows that). primary: the process's table, whose records GetClientMetadata answers for
+        // (loadBpfStored).
+        ref: { workflowId: id, labelId: n.id, attribute: n.field, stageId: n.stage || undefined, primary, managed: d.managed },
+      }),
+    );
   }
   return [...out.values()];
 }
@@ -386,7 +401,7 @@ export const loadBpfScope: Loader = async (ctx, scope, o) => {
     .filter(
       (w) =>
         w.businessprocesstype !== 1 && // task flows have pages, not stages
-        (scope.includeReadOnly || w.ismanaged !== true) && // read-only: from a managed solution
+        (scope.includeReadOnly || w.ismanaged !== true || (!!ctx.managedEdits && !notCustomizable(w))) && // read-only: from a managed solution
         (ents.has(w.primaryentity) || inSolution?.has(guid(w.workflowid))),
     )
     .map((w) => guid(w.workflowid));
@@ -658,8 +673,9 @@ async function pass(ctx: Ctx, id: string, changes: Change[], o: SaveOptions, ret
     const d = await read(o.signal);
     if (d.cdText && !d.cd) throw new Error('The process definition returned by Dataverse could not be read.');
     // From a managed solution as read right before the write (one that slipped through as editable): never written, so
-    // no unmanaged layer is ever put on it.
-    if (d.managed) return [changes.map((c): ChangeResult => ({ change: c, outcome: 'error', message: MANAGED })), []];
+    // no unmanaged layer is ever put on it, unless this session allows changes to managed labels (Ctx.managedEdits) and its
+    // managed properties allow customizing it.
+    if (d.managed && (!ctx.managedEdits || d.locked)) return [changes.map((c): ChangeResult => ({ change: c, outcome: 'error', message: ctx.managedEdits ? d.locked : MANAGED })), []];
     const out: ChangeResult[] = [];
     const todo: Change[] = [];
     const rm = new Set<Change>();
@@ -746,7 +762,7 @@ export const bpfWriter: Writer = {
     const rest: Change[] = [];
     // A label of a process loaded from a managed solution is refused before anything is read (pass() checks again).
     for (const c of changes)
-      if (isManaged(c.slot)) out.push({ change: c, outcome: 'error', message: MANAGED });
+      if (managedHeld(c.slot, ctx.managedEdits)) out.push({ change: c, outcome: 'error', message: managedReadOnly(c.slot, ctx.managedEdits) });
       else if (clears(ctx, c) && !canClear(c.slot, c.lcid)) out.push({ change: c, outcome: 'error', message: cantClearText(c.slot, c.lcid) });
       else rest.push(c);
     if (!rest.length) return out;

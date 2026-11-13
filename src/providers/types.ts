@@ -34,6 +34,28 @@ export interface SaveOptions {
    * that finds such a change already as asked has found someone else's text, never this write (core/saver.ts `tried`).
    */
   ran?: Set<string>;
+  /**
+   * A column's names as this save knows them, per language: the store's as loaded and as this save writes them
+   * (core/model.ts columnNames), undefined while the column's names aren't loaded; `renamed`: the languages where this
+   * save changes the name a form read fills in (its own there, else the base language's). The form writer never posts
+   * one of them on someone else's behalf (a field another maker added, their text of a label both changed at once, a
+   * label Dataverse dropped): read, it is the column's name filled in (LIVE-FINDINGS 103), and posted it would be stored
+   * as a label of the form's own (104).
+   */
+  column?(entity: string, attr: string): { names: Record<number, string[]>; renamed: readonly Lcid[] } | undefined;
+  /**
+   * Tells the user something after the save (SaveReport), once per writer call (the form writer's is one form, so two
+   * forms of the same name each keep their message): a 'notice' for labels Dataverse dropped that the save wrote back, or
+   * for a temporary solution the classic command writer could not delete, a 'warning' for labels it could not put back or
+   * when that write-back may have replaced a save someone else made at the same moment (providers/formxml.ts nothingElse).
+   */
+  warn?(message: string, level: 'warning' | 'notice'): void;
+  /**
+   * What the form writer knew of each form this save wrote, by form id (SaveReport.forms): the Publish dialog keeps the
+   * answers of which of its field labels are its own for the version its publish makes from them (ui/review.ts
+   * keepOwnLabels, LIVE-FINDINGS 114).
+   */
+  forms?: Map<string, FormWrite>;
   /** UI-language switcher for the 'xml' lane. */
   lang: LangSession;
   /**
@@ -41,6 +63,34 @@ export interface SaveOptions {
    * (classic ribbon: exports contain only the published ribbon) must refuse instead.
    */
   allowPublish: boolean;
+}
+
+/**
+ * What a save left of a main form column cell's labels of their own, as the form writer posted them (LIVE-FINDINGS 104):
+ * its label key (`key`), and per language it posted whether its label is the form's own there now: true, 'name' for a
+ * text worded as its column's name, which the key stores only where it held a label before, and null where it isn't
+ * known (its column's names not loaded, or renamed by the same save there, so the name the key compared it with isn't
+ * known).
+ */
+export interface CellOwn {
+  key: string;
+  own: Record<number, true | 'name' | null>;
+}
+
+/** What the form writer knew of a form it wrote in a save (SaveOptions.forms), from that save's first write of it. */
+export interface FormWrite {
+  /**
+   * The form had another change than this save's: its unpublished versionnumber differed from its published one at the
+   * read before that write, or someone else's save landed while it wrote (providers/repair.ts settle), or Dataverse
+   * dropped a label it left out (providers/formxml.ts nothingElse).
+   */
+  pending: boolean;
+  /** Its published versionnumber at that read. */
+  version: string;
+  /** A write of it was sent that ran, or may have: from then on its reads show this save's own change. */
+  sent: boolean;
+  /** What that write left of each column cell it posted with a change, by comp (main forms, providers/formxml.ts SPARSE). */
+  cells: Map<string, CellOwn>;
 }
 
 export interface ReadOptions {
@@ -66,7 +116,8 @@ export interface Writer {
    *  2. for each change, compare the server value with `change.before`. If it differs and is not
    *     already `change.after`, and the change id is not in `force`, return outcome 'conflict'
    *     with `server` set, and do not write that language;
-   *  3. write only the languages that changed, never re-sending other languages;
+   *  3. write only the languages that changed, never re-sending other languages (a form: a column's cell posted
+   *     without the labels the save doesn't change, providers/formxml.ts; the rest of the document as read);
    *  4. verify by reading back, and report 'error' for anything that did not stick;
    *  5. add what needs publishing to `o.publish`: after a write, also one that may have run although it failed,
    *     and for a change found 'unchanged' that may not be published yet (an earlier write whose answer was lost);
@@ -81,6 +132,12 @@ export interface Writer {
    * a stand-in made of a text another pass writes is written after it, once that text is saved (core/saver.ts).
    */
   pass?(ctx: Ctx, change: Change): string;
+  /**
+   * Publish again's repair of saved labels a publish didn't take (the form writer, LIVE-FINDINGS 117; the column writer,
+   * 118): writes the texts `changes` saved again, as save() writes, calling `publish` after its writes (given a signal, it
+   * publishes with that one in place of the run's); never a save of new texts. Each label's result.
+   */
+  again?(ctx: Ctx, changes: Change[], o: SaveOptions, publish: (signal?: AbortSignal) => Promise<void>): Promise<ChangeResult[]>;
 }
 
 /** What the workbench asks loaders for. */
@@ -139,6 +196,23 @@ export interface FormRef {
   type: number;
 }
 
+/**
+ * A copy of a main form's GetClientMetadata answer that the page keeps (providers/formxml.ts pageOwnLabels): the labels
+ * of the form's own in one language, as the answer to the page's own read of the form lists them.
+ */
+export interface OwnCopy {
+  /** The form it holds. */
+  form: string;
+  /** The language it is in, as its resource files prove it. */
+  l: Lcid;
+  /** The published form's versionnumber it describes. */
+  v: string;
+  /** The label keys it lists a label of the cell's own for. */
+  k: string[];
+  /** Those labels' texts, by label key. */
+  t: Record<string, string>;
+}
+
 /** A classic ribbon control in the composed ribbon (label attributes hold tokens like `$LocLabels:Id`). */
 export interface RibbonControl {
   id: string;
@@ -187,7 +261,33 @@ export interface ProvidersApi {
   /** Modern commands by appaction.name (button data-id), best match for the app/table. */
   findCommands(ctx: Ctx, names: string[], appId: string, entity: string, signal?: AbortSignal): Promise<CommandInfo[]>;
   /** Form / dashboard XML labels for the given languages (non-user languages need o.lang). */
-  loadFormXml(ctx: Ctx, forms: FormRef[], langs: Lcid[], o: LoadOptions): Promise<Slot[]>;
+  loadFormXml(ctx: Ctx, forms: FormRef[], langs: Lcid[], o: LoadOptions, kinds?: ReadonlySet<Kind>): Promise<Slot[]>;
+  /**
+   * The copies of a main form's GetClientMetadata answer that the page keeps, in each language it has one in (the user's
+   * as the form shows): looked for while the form is read, nothing sent. Never fails: none found is none.
+   */
+  pageOwnLabels(ctx: Ctx, formId: string, entity?: string): Promise<OwnCopy[]>;
+  /**
+   * Per slot key and language, what is known without a request of whether a main form's field label (a loadFormXml
+   * `ref.sparse` slot) has a text of its own there: the answers kept for its form's version, and the page's copies
+   * (pageOwnLabels) whose texts agree with the loaded ones, which are kept as answers; a cell a copy lists no label of its
+   * own for must have the text a read `fills` in there.
+   */
+  knownOwnLabels(ctx: Ctx, cells: Slot[], copies?: OwnCopy[], fills?: (s: Slot, l: Lcid) => boolean): Map<string, Record<number, boolean>>;
+  /**
+   * Per slot key and language, whether a main form's field label (a loadFormXml `ref.sparse` slot) has a text of its
+   * own there, as GetClientMetadata lists it (`ref.own`, core/model.ts follows): read in the user's language, then in
+   * each other language in a switch window of its own, kept in the browser per published form version; a language is
+   * read only while no answer is kept for that version and some label there is `undecided` (its text is the column's
+   * name). `known` gets what is known before each window.
+   */
+  loadOwnLabels(ctx: Ctx, cells: Slot[], signal: AbortSignal, known?: (own: Map<string, Record<number, boolean>>) => void, undecided?: (s: Slot, l: Lcid) => boolean): Promise<Map<string, Record<number, boolean>>>;
+  /**
+   * Keeps the answers loadOwnLabels keeps for a main form at the published version `from` for the version `to` that a
+   * publish of the translator's own made of it, changed as the save before it left its cells (`cells`): a reload then
+   * reads none of them again.
+   */
+  carryOwnLabels(ctx: Ctx, formId: string, from: string, to: string, cells: readonly CellOwn[]): void;
   /** Form reference by id (type, table, name). */
   getForm(ctx: Ctx, formId: string, signal?: AbortSignal): Promise<FormRef | null>;
   /** The fetch XML of a system or personal view ('' when it has none or is gone). */
@@ -212,9 +312,12 @@ export interface ProvidersApi {
 /** Id used for force/conflict bookkeeping. */
 export const changeId = (c: Change): string => `${c.slot.key}#${c.lcid}`;
 
+/** A conflict's message: the server text is neither the one the change was made on nor one that is no conflict either (Change.alsoBefore). */
+export const CHANGED = 'Someone changed this label after you loaded it.';
+
 /** Helper for writers: classify one change against the current server value. */
 export function check(c: Change, server: string, force: Set<string>): ChangeResult | null {
   if (server === c.after) return { change: c, outcome: 'unchanged' };
-  if (server !== c.before && !force.has(changeId(c))) return { change: c, outcome: 'conflict', server, message: 'Someone changed this label after you loaded it.' };
+  if (server !== c.before && server !== c.alsoBefore && !force.has(changeId(c))) return { change: c, outcome: 'conflict', server, message: CHANGED };
   return null; // ok to write
 }

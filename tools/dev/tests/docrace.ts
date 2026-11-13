@@ -3,14 +3,16 @@
 // conflict keeping their text, a probe that fails never followed by a write where the batch can stop, and never a plain
 // "saved" without a probe to prove nothing was replaced. The sitemap and process writers run on the real Http over a
 // fake fetch whose $batch runs its parts in order and, without continue-on-error, stops at the first failing one
-// (LIVE-FINDINGS 49); the form writer on a fake LangSession hold. register() is called by tools/dev/unit.ts.
+// (LIVE-FINDINGS 49); the form writer on the fake form of formlabels.ts. register() is called by tools/dev/unit.ts.
 import { Http } from '../../../src/core/http';
-import { PublishSet, type Change, type ChangeResult, type Lcid, type Slot } from '../../../src/core/model';
+import { droppedBack, PublishSet, type Change, type ChangeResult, type Lcid, type Slot } from '../../../src/core/model';
+import { kid, normId, parseXml, readLabels } from '../../../src/core/xml';
 import { bpfWriter, loadBpfLabels, withStored } from '../../../src/providers/bpf';
 import { formXmlWriter } from '../../../src/providers/formxml';
 import { RACE_THEIRS } from '../../../src/providers/repair';
 import { sitemapWriter } from '../../../src/providers/sitemap';
 import type { SaveOptions } from '../../../src/providers/types';
+import { addTab, cellOf, formFake, FORM, kinds, loaded, moveKey, MOVED, relabel, told, type FormFake } from './formlabels';
 import type { Kit } from './kit';
 import { fast } from './lang';
 
@@ -20,7 +22,6 @@ const ORIGIN = 'https://org.test';
 const API = `${ORIGIN}/api/data/v9.2/`;
 const SM = '0b6f1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d';
 const WF = '9a6faaaa-0000-4000-8000-0000000000b1';
-const FORM = '5e07410a-0000-4000-8000-000000000071';
 const LANGS = [
   { lcid: EN, name: 'English', isBase: true },
   { lcid: FR, name: 'French', isBase: false },
@@ -263,82 +264,35 @@ function bpfServer() {
   return { P, f, set, labels, ctx, load };
 }
 
-// ---- a form on a fake LangSession hold (no switching) ----
+// ---- a form on the fake of formlabels.ts (a LangSession hold that never switches) ----
 
 const LABEL = (l: Lcid, t: string) => `<label description="${t}" languagecode="${l}" />`;
 const cellXml = (id: string, ctl: string, en: string, fr: string) => `<row><cell id="{${id}}"><labels>${LABEL(EN, en)}${fr ? LABEL(FR, fr) : ''}</labels><control id="${ctl}" datafieldname="${ctl}" /></cell></row>`;
+/** The name field has a label of its own in both languages; the email field in English only, its French follows its column. */
 const formXml = () =>
   `<form><tabs><tab id="{a1}" name="general"><labels>${LABEL(EN, 'General')}</labels><columns><column width="100%"><sections><section id="{b1}" name="details"><labels>${LABEL(EN, 'Details')}</labels>` +
-  `<rows>${cellXml('c1', 'name', 'Name', 'Nom')}${cellXml('c2', 'emailaddress1', 'Email', 'Courriel')}</rows></section></sections></column></columns></tab></tabs></form>`;
+  `<rows>${cellXml('c1', 'name', 'Name', 'Nom')}${cellXml('c2', 'emailaddress1', 'Email', '')}</rows></section></sections></column></columns></tab></tabs></form>`;
 
 /**
- * A form whose PATCH replaces the whole unpublished definition (If-Match checked against the published row, LIVE-FINDINGS
- * 22). A batch runs its parts in order and always goes on after a failed one (LangSession sends continue-on-error).
- * `at` and `probe` as in web(); `stale`: an older copy the next write batch's probe answers with (a read that lags).
- * `ver` is the unpublished versionnumber, raised by every save.
+ * The form on formFake: a column cell's labels kept per label key, a read filling in the column's name where the key
+ * holds none (LIVE-FINDINGS 103, 104); If-Match checked against the published row (22). A batch runs its parts in order
+ * and always goes on after a failed one (LangSession sends continue-on-error). `at` and `probe` as in web(); `stale`: an
+ * older copy the next write batch's probe answers with (a read that lags). `ver` is the unpublished versionnumber,
+ * raised by every save; `writes` counts the PATCHes that ran; `F.xml = …` is someone else's save of the whole form.
  */
 function formServer() {
-  const F = {
-    xml: formXml(),
-    ver: 7,
-    etag: 'W/"100"',
-    batches: [] as string[][],
-    writes: 0,
-    at: {} as Record<string, (() => void) | undefined>,
-    probe: undefined as undefined | number,
-    stale: undefined as undefined | { xml: string; ver: number },
-  };
-  const fire = (k: string) => {
-    const f = F.at[k];
-    F.at[k] = undefined;
-    f?.();
-  };
-  type Part = { method: string; url: string; headers?: Record<string, string>; body?: unknown };
-  const exec = (p: Part) => {
-    if (p.method === 'GET' && p.url.startsWith(`systemforms(${FORM})/Microsoft.Dynamics.CRM.RetrieveUnpublished()`)) return { ok: true, status: 200, data: { formxml: F.xml, versionnumber: F.ver }, headers: {} };
-    if (p.method === 'GET' && p.url.startsWith(`systemforms(${FORM})?`)) return { ok: true, status: 200, data: { formid: FORM, versionnumber: 7, '@odata.etag': F.etag }, headers: {} };
-    if (p.method === 'PATCH' && p.url === `systemforms(${FORM})`) {
-      if (p.headers?.['If-Match'] !== F.etag) return { ok: false, status: 412, data: null, error: 'The version of the existing record does not match.', headers: {} };
-      F.xml = (p.body as { formxml: string }).formxml;
-      F.ver++;
-      F.writes++;
-      return { ok: true, status: 204, data: null, headers: {} };
-    }
-    return { ok: false, status: 404, data: null, error: 'Resource not found for the segment.', headers: {} };
-  };
-  const h = {
-    async batch(_l: Lcid, parts: Part[]) {
-      await new Promise((r) => setTimeout(r, 0));
-      F.batches.push(parts.map((p) => `${p.method} ${p.url.split('?')[0]}`));
-      const writes = parts.some((p) => p.method === 'PATCH');
-      if (writes) fire('batch');
-      const results = parts.map((p, i) => {
-        if (writes && p.method === 'PATCH') fire('patch');
-        if (writes && i === 0 && F.probe !== undefined) {
-          const status = F.probe;
-          F.probe = undefined;
-          return { ok: false, status, data: null, error: 'The probe failed.', headers: {} };
-        }
-        if (writes && i === 0 && F.stale) {
-          const old = F.stale;
-          F.stale = undefined;
-          return { ok: true, status: 200, data: { formxml: old.xml, versionnumber: old.ver }, headers: {} };
-        }
-        const r = exec(p);
-        if (writes && p.method === 'PATCH') fire('back');
-        return r;
-      });
-      return { inLang: true, results };
-    },
-    window: <T>(fn: () => Promise<T>) => fn(),
-  };
+  const f = formFake(formXml(), { cols: { name: { [EN]: 'Name', [FR]: 'Nom' }, emailaddress1: { [EN]: 'Email', [FR]: 'Courriel' } } });
+  const F = Object.defineProperties(f.F, {
+    ver: { get: () => f.F.v, set: (v: number) => void (f.F.v = v) },
+    writes: { get: () => f.F.patches.length },
+  }) as FormFake & { ver: number; readonly writes: number };
   /** Another maker saves the form in the designer: a tab added and the email field's French label changed. */
-  const theirs = (n = '') => () => {
-    F.xml = F.xml.replace('</tabs>', `<tab id="{a9${n}}" name="theirs${n}"><labels>${LABEL(EN, 'Theirs' + n)}</labels></tab></tabs>`).replace(/(<cell id="\{c2\}"><labels>.*?languagecode="1033"\s*\/>)(<label [^>]*\/>)/, `$1${LABEL(FR, 'Adresse courriel' + n)}`);
-    F.ver++;
-  };
-  const lang = { hold: <T>(fn: (x: typeof h) => Promise<T>) => fn(h), run: <T>(_l: Lcid, fn: () => Promise<T>) => fn(), quiet: <T>(fn: () => Promise<T>) => fn(), restore: async () => {} };
-  return { F, theirs, lang, ctx: ctxOf(null) };
+  const theirs = (n = '') => () =>
+    f.designerSave((d) => {
+      addTab(d, `a9${n}`, `theirs${n}`, 'Theirs' + n);
+      relabel(d, 'c2', FR, 'Adresse courriel' + n);
+    });
+  return { F, theirs, lang: f.lang, ctx: f.ctx, label: f.label, own: f.own, key: f.key, rename: f.rename, designerSave: f.designerSave };
 }
 
 const fieldSlot = (): Slot => ({
@@ -358,8 +312,10 @@ const fieldSlot = (): Slot => ({
   order: 0,
   ref: { formId: FORM, elId: 'c1', formType: 2, area: 'body', tag: 'cell', controlId: 'name', datafield: 'name' },
 });
-/** A cell's French label in a form XML. */
-const cellFr = (xml: string, id: string) => new RegExp(`<cell id="\\{${id}\\}"><labels>.*?<label description="([^"]*)" languagecode="1036"\\s*/>`).exec(xml)?.[1];
+/** The tab's English label in a form XML. */
+const tabEn = (xml: string) => /<tab id="\{a1\}"[^>]*><labels><label description="([^"]*)" languagecode="1033"/.exec(xml)?.[1];
+/** A cell's labels in a form XML. */
+const labelsOf = (xml: string, id: string) => readLabels(cellOf(parseXml(xml), id)!, 'labels', 'label', 'languagecode', 'description');
 
 export function register(t: Kit): void {
   // ---- sitemaps ----
@@ -461,39 +417,93 @@ export function register(t: Kit): void {
 
   // ---- forms ----
 
-  t.test('doc race: a form saved by someone else between the read and the write (a tab added, another field\'s French changed) is put back with ours on it, from a new read', async () => {
-    const { F, theirs, lang, ctx } = formServer();
-    F.at.batch = theirs();
+  t.test("doc race: a form saved by someone else between the read and the write (a tab added, the first tab's English label and another field's French changed): the tab and the tab's label are put back with ours on it, from a new read; the field's French was never erased", async () => {
+    const { F, theirs, lang, ctx, label } = formServer();
+    F.at.batch = () => {
+      theirs()();
+      F.xml = F.xml.replace(LABEL(EN, 'General'), LABEL(EN, 'General (theirs)'));
+    };
     const o = opts(lang);
     const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], o);
     t.eq(outcomes(res), [['saved', '']]);
-    t.eq([cellFr(F.xml, 'c1'), cellFr(F.xml, 'c2'), F.xml.includes('name="theirs"')], ['Nom complet', 'Adresse courriel', true], F.xml);
+    t.eq(!!kid(cellOf(parseXml(F.patches[0]), 'c2')!, 'labels'), false, 'our PATCH posted no label of the email field');
+    // The tab's label goes out as read on every write (it is no column's cell): our PATCH put back the one it read.
+    t.eq([tabEn(F.patches[0]), tabEn(F.xml)], ['General', 'General (theirs)'], 'their tab label, which our PATCH replaced, put back');
+    t.eq([label('c1')[FR], label('c2')[FR], F.xml.includes('name="theirs"')], ['Nom complet', 'Adresse courriel', true], F.xml);
     t.eq(F.batches.map((b) => (b.some((p) => p.startsWith('PATCH')) ? 'write' : 'read')), ['read', 'write', 'read', 'write']);
     t.eq([...o.publish.entities], ['account']);
   });
 
-  t.test('doc race: a form label someone else changed in the same language at the same moment keeps their text, and ours is a conflict showing it', async () => {
-    const { F, theirs, lang, ctx } = formServer();
+  t.test("doc race: someone else's edit of another field's label between the read and the PATCH is never erased nor repaired: one write batch, saved", async () => {
+    const { F, lang, ctx, label, designerSave } = formServer();
+    F.at.batch = () => designerSave((d) => relabel(d, 'c2', FR, 'Adresse courriel'));
+    const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
+    t.eq(outcomes(res), [['saved', '']]);
+    t.eq([label('c1')[FR], label('c2')[FR], F.writes, kinds(F.batches)], ['Nom complet', 'Adresse courriel', 1, ['read', 'write']], F.xml);
+  });
+
+  t.test('doc race: a column renamed between the read and the PATCH is no race on a main form: one write batch, saved, nothing frozen', async () => {
+    const { F, lang, ctx, label, own, rename } = formServer();
+    F.at.batch = () => rename('emailaddress1', FR, 'Courriel 2');
+    const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
+    t.eq(outcomes(res), [['saved', '']]);
+    t.eq([F.writes, kinds(F.batches), own('c2')], [1, ['read', 'write'], { [EN]: 'Email' }], 'no repair storing the new name');
+    rename('emailaddress1', FR, 'Courriel 3');
+    t.eq(label('c2')[FR], 'Courriel 3', 'the email field still follows its column');
+  });
+
+  t.test("doc race: on a main form a label the write leaves out never tells a race (LIVE-FINDINGS 104): another field's French changed between the read and the probe is no race, though someone else saves right after the PATCH (one write batch, their tab kept); our field's English changed after the PATCH never stops the repair of an earlier save (their tab put back, their English kept)", async () => {
+    // Their French of the email field before our probe, then their tab right after our PATCH: nothing to repair, and no
+    // repair built on the probe erases their tab.
+    {
+      const { F, lang, ctx, label, designerSave } = formServer();
+      F.at.batch = () => designerSave((d) => relabel(d, 'c2', FR, 'Adresse courriel'));
+      F.at.back = () => designerSave((d) => addTab(d, 'a2', 'later', 'Later'));
+      const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
+      t.eq(outcomes(res), [['saved', '']]);
+      t.eq([kinds(F.batches), F.xml.includes('name="later"'), label('c1')[FR], label('c2')[FR]], [['read', 'write'], true, 'Nom complet', 'Adresse courriel'], F.xml);
+    }
+    // Their tab before our probe (erased by our PATCH), then their English of the name field, a label our PATCH leaves out,
+    // before the repair's read: outside that label the form is still the one our PATCH left, so the repair goes out.
+    {
+      const { F, theirs, lang, ctx, label, designerSave } = formServer();
+      F.at.batch = theirs();
+      F.at.back = () => void (F.at.read = () => designerSave((d) => relabel(d, 'c1', EN, 'Name 3')));
+      const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
+      t.eq(outcomes(res), [['saved', '']]);
+      t.eq([label('c1'), F.xml.includes('name="theirs"'), F.writes], [{ [EN]: 'Name 3', [FR]: 'Nom complet' }, true, 2], F.xml);
+    }
+  });
+
+  t.test('doc race: a label someone else changed in the same language at the same moment is put back by posting their text (repair.ts theirs), ours a conflict showing it', async () => {
+    const { F, theirs, lang, ctx, label } = formServer();
     F.at.batch = () => {
       theirs()();
       F.xml = F.xml.replace('description="Nom"', 'description="Nom (eux)"');
     };
-    const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
+    const x = told();
+    const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], { ...opts(lang), column: loaded, warn: x.warn });
     t.eq(res.map((r) => [r.outcome, r.server, r.message]), [['conflict', 'Nom (eux)', RACE_THEIRS]]);
-    t.eq([cellFr(F.xml, 'c1'), cellFr(F.xml, 'c2'), F.xml.includes('name="theirs"')], ['Nom (eux)', 'Adresse courriel', true], F.xml);
+    t.eq([label('c1')[FR], label('c2')[FR], F.xml.includes('name="theirs"')], ['Nom (eux)', 'Adresse courriel', true], F.xml);
+    // Our first PATCH overwrote their French on the same key; the repair posts theirs explicitly (a write that leaves a
+    // label out keeps whatever is stored, LIVE-FINDINGS 104).
+    t.eq([F.writes, /<cell id="\{c1\}"><labels><label description="Nom \(eux\)" languagecode="1036"\s*\/><\/labels>/.test(F.patches[1])], [2, true], F.patches[1]);
+    // The check after the write knows the clashed label as one our first PATCH posted (the repair's build records nothing
+    // for it): the conflict says it, nothing else does.
+    t.eq(x.said, []);
   });
 
   t.test('doc race: a form probe that fails (the batch goes on, as every language batch must): never plain saved; "can\'t be ruled out" when the read-back is the read with the edit; nothing written back', async () => {
-    const { F, lang, ctx } = formServer();
+    const { F, lang, ctx, label } = formServer();
     F.probe = 500;
     const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
     t.eq(res[0].outcome, 'error');
     t.ok(UNSEEN.test(res[0].message || ''), res[0].message);
-    t.eq([F.writes, cellFr(F.xml, 'c1')], [1, 'Nom complet']);
+    t.eq([F.writes, label('c1')[FR]], [1, 'Nom complet']);
   });
 
   t.test('doc race: another form save landing before the repair is put back too, on the newest form; as the first may be lost with it, it is said, never "saved"', async () => {
-    const { F, theirs, lang, ctx } = formServer();
+    const { F, theirs, lang, ctx, label } = formServer();
     F.at.batch = () => {
       theirs()();
       // The next one lands right before the repair's write (built on the form our first PATCH left).
@@ -502,7 +512,18 @@ export function register(t: Kit): void {
     const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
     t.eq(res[0].outcome, 'error');
     t.ok(RACED.test(res[0].message || ''), res[0].message);
-    t.eq([cellFr(F.xml, 'c1'), F.xml.includes('name="theirs2"'), F.writes], ['Nom complet', true, 3], F.xml);
+    t.eq([label('c1')[FR], F.xml.includes('name="theirs2"'), F.writes], ['Nom complet', true, 3], F.xml);
+  });
+
+  t.test("doc race: someone else gives the cell a new label key without its English between the read and the PATCH (LIVE-FINDINGS 105): our edit is posted on their key, and their change stands", async () => {
+    const { F, lang, ctx, label, own, key, rename, designerSave } = formServer();
+    F.at.batch = () => designerSave((d) => moveKey(d, 'c1', EN));
+    const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], { ...opts(lang), column: loaded });
+    t.eq(outcomes(res), [['saved', '']]);
+    t.eq([F.writes, normId(cellOf(parseXml(F.patches[1]), 'c1')!.getAttribute('labelid')), labelsOf(F.patches[1], 'c1')], [2, MOVED, { [FR]: 'Nom complet' }], 'the repair: our French on their key');
+    t.eq([key('c1'), own('c1')], [MOVED, { [FR]: 'Nom complet' }]);
+    rename('name', EN, 'Name 2');
+    t.eq(label('c1'), { [EN]: 'Name 2', [FR]: 'Nom complet' }, 'their change stands: English follows its column');
   });
 
   // ---- processes ----
@@ -588,20 +609,44 @@ export function register(t: Kit): void {
   // ---- a probe older than the read (a read that lags, LIVE-FINDINGS 66) is nobody's save ----
 
   t.test('doc race: a form probe older than the read (lower versionnumber: a read that lags) is never written back: a translation saved just before stays, nothing more is written, never plain saved', async () => {
-    const { F, lang, ctx } = formServer();
+    const { F, lang, ctx, label } = formServer();
     const old = { xml: F.xml, ver: F.ver };
-    // A save just made (the user's own, a moment ago): the email field's French.
-    F.xml = F.xml.replace('description="Courriel"', 'description="Courriel 2"');
-    F.ver++;
+    // A save just made (the user's own, a moment ago): the tab's English label, which every write posts as read.
+    F.xml = F.xml.replace(LABEL(EN, 'General'), LABEL(EN, 'General 2'));
     F.stale = old;
     const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
     t.eq(res[0].outcome, 'error');
     t.ok(UNSEEN.test(res[0].message || ''), res[0].message);
-    t.eq([cellFr(F.xml, 'c2'), cellFr(F.xml, 'c1'), F.writes], ['Courriel 2', 'Nom complet', 1], F.xml);
+    t.eq([tabEn(F.xml), label('c1')[FR], F.writes], ['General 2', 'Nom complet', 1], F.xml);
   });
 
-  t.test('doc race: a repair whose own probe is older than the read it was built from is never built on: their change stays, said, never plain saved', async () => {
-    const { F, theirs, lang, ctx } = formServer();
+  t.test('doc race: the check runs on the first write batch of a race too, and never on a probe older than the read: a translation saved just before stays, no false notice', async () => {
+    // Someone else's save lands before the PATCH, and Dataverse drops the email field's labels the PATCH left out: the
+    // race is repaired, and their French, which the probe had, is written back (it reads back as the column's name).
+    const a = formServer();
+    a.F.at.batch = a.theirs();
+    a.F.violate = new Set(['c2']);
+    const x = told();
+    const res = await formXmlWriter.save(a.ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], { ...opts(a.lang), column: loaded, warn: x.warn });
+    t.eq(outcomes(res), [['saved', '']]);
+    t.eq(x.said, [['notice', droppedBack('Main', 1)]]);
+    t.eq([a.label('c1')[FR], a.label('c2')[FR], a.F.xml.includes('name="theirs"'), a.F.writes], ['Nom complet', 'Adresse courriel', true, 3], a.F.xml);
+    // The user's own French of the email field saved a moment ago, and a probe that lags behind it: however like the read
+    // it looks, it is not the form the PATCH replaced, so a save made in between can't be ruled out (never plain saved),
+    // and nothing is checked against it (no notice, no write-back).
+    const b = formServer();
+    const old = { xml: b.F.xml, ver: b.F.ver };
+    b.designerSave((d) => relabel(d, 'c2', FR, 'Courriel 2'));
+    b.F.stale = old;
+    const y = told();
+    const r = await formXmlWriter.save(b.ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], { ...opts(b.lang), warn: y.warn });
+    t.eq(r[0].outcome, 'error');
+    t.ok(UNSEEN.test(r[0].message || ''), r[0].message);
+    t.eq([y.said, b.label('c2')[FR], b.label('c1')[FR], b.F.writes], [[], 'Courriel 2', 'Nom complet', 1], b.F.xml);
+  });
+
+  t.test('doc race: a repair whose own probe is older than the read it was built from is never built on: their change stays, said, never plain saved, even when that probe shows the very form the read did', async () => {
+    const { F, theirs, lang, ctx, label } = formServer();
     const old = { xml: F.xml, ver: F.ver };
     F.at.batch = theirs();
     // The repair's probe lags: it answers with the form as it was before their save.
@@ -609,7 +654,16 @@ export function register(t: Kit): void {
     const res = await formXmlWriter.save(ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(lang));
     t.eq(res[0].outcome, 'error');
     t.ok(UNSEEN.test(res[0].message || ''), res[0].message);
-    t.eq([cellFr(F.xml, 'c1'), cellFr(F.xml, 'c2'), F.xml.includes('name="theirs"'), F.writes], ['Nom complet', 'Adresse courriel', true, 2], F.xml);
+    t.eq([label('c1')[FR], label('c2')[FR], F.xml.includes('name="theirs"'), F.writes], ['Nom complet', 'Adresse courriel', true, 2], F.xml);
+    // The repair's probe answers with the form its read got, at a lower versionnumber: a copy that lags is no proof of
+    // what that PATCH replaced.
+    const b = formServer();
+    b.F.at.batch = b.theirs();
+    b.F.at.back = () => void (b.F.at.read = () => void (b.F.stale = { xml: b.F.xml, ver: b.F.ver - 1 }));
+    const r = await formXmlWriter.save(b.ctx, [ch(fieldSlot(), FR, 'Nom', 'Nom complet')], opts(b.lang));
+    t.eq(r[0].outcome, 'error');
+    t.ok(UNSEEN.test(r[0].message || ''), r[0].message);
+    t.eq([b.label('c1')[FR], b.F.xml.includes('name="theirs"'), b.F.writes], ['Nom complet', true, 2], b.F.xml);
   });
 
   t.test('doc race: a sitemap probe older than the read (a read that lags) is never written back: a title saved just before stays', async () => {

@@ -39,8 +39,10 @@ export interface Anchor {
   /** The label's own text node: the mark hugs its line boxes (falls back to a Range over `el`'s contents). */
   text?: Text;
   /**
-   * What `text` showed when the label was found, never a staged text the preview swapped in (Preview.textOf): a
-   * related menu item's popup tells what the page shows by it.
+   * What `text` showed when the label was found, never a staged text the preview swapped in (Preview.textOf), on every
+   * anchor with a text of its own (no `part`): the preview swaps that text too, whatever the store loaded (a form label the
+   * page shows as published while another text is saved and not published yet), and a related menu item's popup tells
+   * what the page shows by it.
    */
   orig?: string;
   /**
@@ -123,6 +125,23 @@ export interface OverlayHooks {
   ours(): Node[];
   /** Alt pressed or released: while it is held the page works as usual. */
   alt?(held: boolean): void;
+  /** A box dragged over the page while selecting (OverlayApi.selection) was let go: the labels it covered. */
+  boxed?(as: Anchor[]): void;
+}
+
+/** What the overlay asks while labels are being selected for an export (PageMode.select). */
+export interface SelectionLook {
+  /** The label is selected: its mark shows so (a check badge). */
+  has(a: Anchor): boolean;
+  /** The label can be selected: a box dragged over it marks it as it goes. */
+  can(a: Anchor): boolean;
+}
+
+/** A label selected for an export: its component, the slot of the text clicked, and the page it was on (PageMode.title). */
+export interface Selected {
+  comp: string;
+  key: string;
+  page: string;
 }
 
 export interface OverlayApi {
@@ -152,6 +171,11 @@ export interface OverlayApi {
   pause(on: boolean): void;
   /** Re-measures for the next `n` frames. */
   invalidate(n?: number): void;
+  /**
+   * Selecting labels for an export (null: not): selected marks show a check, and a box dragged over the page (from a
+   * press anywhere but our own UI, without Alt) selects the labels it covers once let go (OverlayHooks.boxed).
+   */
+  selection(s: SelectionLook | null): void;
 }
 
 // ---- Page mode (inspector/mode.ts: createPageMode) ----
@@ -215,6 +239,19 @@ export interface PageMode {
   /** e.g. "Case · Main form", '' when unknown. */
   title(): string;
   flash(comp: string): void;
+  /**
+   * "Select labels to export": on, a click on a label (or a box dragged over labels) selects it instead of opening its
+   * popup. The selection is kept across pages until `clear` (Cancel); a download ends the mode and keeps it.
+   */
+  select(on: boolean, clear?: boolean): void;
+  /** Selection mode is on. */
+  selecting(): boolean;
+  /** Selects every label on the page that can be (Select all). */
+  selectAll(): void;
+  /** What is selected, each component once, in the order selected. */
+  selection(): readonly Selected[];
+  /** Opens the download dialog for the selection (inspector/selection.ts). */
+  download(): void;
   on(fn: (what: 'items' | 'page' | 'alt' | 'loading') => void): () => void;
 }
 
@@ -244,11 +281,6 @@ export interface Block {
    * that language's input.
    */
   pageText?: string;
-  /**
-   * A label the page never shows (the timeline's, LIVE-FINDINGS 101): an empty input says it has none, not what shows
-   * in its place.
-   */
-  hidden?: true;
 }
 
 export interface CalloutModel {
@@ -345,6 +377,8 @@ export interface BarHooks {
   publish(): void;
   /** Opens "Recent publishes" (history with Undo). */
   history(): void;
+  /** "Select labels to export": closes "All labels" and starts selection mode (PageMode.select). */
+  select(): void;
 }
 
 export interface BarApi {
