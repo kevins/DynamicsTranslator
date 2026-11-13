@@ -517,6 +517,19 @@ export function fieldIn(f: FormCells, api: CtlApi | null, ctl: string, at: Place
   return found === 1 ? only : undefined;
 }
 
+/**
+ * The form cell a control's title in its own action bar names by the control id in its id: the only cell of the form
+ * with that id, else one of the copies a form holds under one id (two timelines, both `notescontrol`), which Dynamics
+ * names `<id>`, `<id>1`… in form order (LIVE-FINDINGS 41, 101). A copy is found as a field's is without a form API
+ * (fieldIn; the form API doesn't know the timeline), and must be where the page shows the title, by its section and
+ * tab, as far as the DOM tells.
+ */
+function titleCell(f: FormCells, ctl: string, at: Place): Slot | undefined {
+  const own = f.fields.get(ctl) || [];
+  if (own.length === 1) return own[0];
+  return own.length || /\d$/.test(ctl) ? fieldIn(f, null, ctl, at, true) : undefined;
+}
+
 /** Column of a page form control, used when the form has no label for it. */
 function column(x: PageIndex, ctl: string): Slot | undefined {
   let a = '';
@@ -1436,8 +1449,9 @@ const RULES: Rule[] = [
     },
   ],
   // A control's title in its own action bar (`action_bar_header_title<control id>`). The id in the title's own id names
-  // its form cell: the only cell of its form with that control id, and one that shows no column (a field's label is its
-  // container's). The form API doesn't know the timeline (getControl('notescontrol') is null).
+  // its form cell (titleCell: the only cell of its form with that control id, else the copy the id names), one that
+  // shows no column (a field's label is its container's). The form API doesn't know the timeline
+  // (getControl('notescontrol') is null).
   // * The timeline's heading is its Name from the form designer (one text for every language), else Dynamics' own
   //   ("Timeline", "Chronologie" in French), whatever its cell's label says (LIVE-FINDINGS 90, 101): its cell's mark,
   //   grey, as text that can't be translated here (TIMELINE_HEADING), once that cell is known.
@@ -1457,8 +1471,8 @@ const RULES: Rule[] = [
         const box = closestDeep(el, FIELD_ID);
         if (!box || !wrongForm(x, box, ctl)) f = x;
       }
-      const cells = f?.fields.get(ctl) || [];
-      const s = cells.length === 1 && !columnOf(cells[0]) ? cells[0] : undefined;
+      const c = f ? titleCell(f, ctl, placeOf(el)) : undefined;
+      const s = c && !columnOf(c) ? c : undefined;
       if (s && isTimeline(s)) {
         const t = shown(sc, el, null, 6, true);
         const a = t && A(x, el, s, { text: t[1] });

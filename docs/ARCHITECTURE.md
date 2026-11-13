@@ -1904,8 +1904,10 @@ staged; one "Review and publish" saves, publishes and refreshes. Contracts: `ins
     city, a full name's first and last name) maps to `attribute|<table>.<column>` DisplayName (it is no form cell, and
     Dynamics labels it with that column's name on every form; LIVE-FINDINGS 90): only when its label shows one of that
     column's texts and, where a form API knows the control, binds it to that column. A control's title in its own
-    action bar (`action_bar_header_title<control id>`) maps to the only cell of its form with that control id that
-    shows no column (the form API doesn't know the timeline), where its text is one of the cell's labels. The
+    action bar (`action_bar_header_title<control id>`) maps to the cell of its form with that control id (the only
+    one, else the copy the id names, `<id>`, `<id>1`… in form order as for a field's copies, which must be in the
+    section and tab around the title: scan.ts `titleCell`) that shows no column (the form API doesn't know the
+    timeline), where its text is one of the cell's labels. The
     timeline's heading there is its Name from the form designer (the control's `UClientUniqueName` parameter, kept on
     its slot as `ref.uniqueName`), the same text in every language, as Dynamics keeps one Name for all languages; else
     Dynamics' own ("Timeline", "Chronologie" in French); never its cell's label (LIVE-FINDINGS 101). Neither can be

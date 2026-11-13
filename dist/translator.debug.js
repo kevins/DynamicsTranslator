@@ -6748,6 +6748,11 @@
     }
     return found === 1 ? only : void 0;
   }
+  function titleCell(f, ctl, at) {
+    const own2 = f.fields.get(ctl) || [];
+    if (own2.length === 1) return own2[0];
+    return own2.length || /\d$/.test(ctl) ? fieldIn(f, null, ctl, at, true) : void 0;
+  }
   function column(x, ctl) {
     let a = "";
     try {
@@ -7322,8 +7327,9 @@
       }
     ],
     // A control's title in its own action bar (`action_bar_header_title<control id>`). The id in the title's own id names
-    // its form cell: the only cell of its form with that control id, and one that shows no column (a field's label is its
-    // container's). The form API doesn't know the timeline (getControl('notescontrol') is null).
+    // its form cell (titleCell: the only cell of its form with that control id, else the copy the id names), one that
+    // shows no column (a field's label is its container's). The form API doesn't know the timeline
+    // (getControl('notescontrol') is null).
     // * The timeline's heading is its Name from the form designer (one text for every language), else Dynamics' own
     //   ("Timeline", "Chronologie" in French), whatever its cell's label says (LIVE-FINDINGS 90, 101): its cell's mark,
     //   grey, as text that can't be translated here (TIMELINE_HEADING), once that cell is known.
@@ -7343,8 +7349,8 @@
           const box = closestDeep(el, FIELD_ID);
           if (!box || !wrongForm(x, box, ctl)) f = x;
         }
-        const cells = f?.fields.get(ctl) || [];
-        const s = cells.length === 1 && !columnOf(cells[0]) ? cells[0] : void 0;
+        const c = f ? titleCell(f, ctl, placeOf(el)) : void 0;
+        const s = c && !columnOf(c) ? c : void 0;
         if (s && isTimeline(s)) {
           const t2 = shown(sc, el, null, 6, true);
           const a = t2 && A(x, el, s, { text: t2[1] });
@@ -8697,7 +8703,7 @@
   };
 
   // src/inspector/overlay.css
-  var overlay_default = `:host{all:initial}[hidden]{display:none!important}.W{position:fixed;inset:0;overflow:hidden;pointer-events:none}.L{position:absolute;inset:0}.g{display:contents;--c:#0f6cbd;--f:rgba(15,108,189,.1);--b:rgba(15,108,189,.55);--s:dashed;--r:rgba(15,108,189,.3)}.g.is-missing{--c:#c48a00;--f:rgba(255,185,0,.22);--b:#c48a00;--r:rgba(196,138,0,.3)}.g.is-edited{--c:#107c10;--f:rgba(34,197,94,.28);--b:#107c10;--s:solid;--r:rgba(16,124,16,.3)}.g.is-error{--c:#c4314b;--f:rgba(196,49,75,.14);--b:#c4314b;--s:solid;--r:rgba(196,49,75,.3)}.g.is-builtin,.g.is-ro{--c:#616161;--f:rgba(97,97,97,.08);--b:#8a8a8a;--s:dotted;--r:rgba(97,97,97,.25)}.is-builtin .pn,.is-ro .pn{display:none}.g>i{position:absolute;left:0;top:0;box-sizing:border-box;border:1px var(--s) var(--b);border-radius:4px;background:var(--f);box-shadow:0 0 0 1px #ffffff73;pointer-events:none}.g.is-edited>i{outline:1px solid var(--b);box-shadow:0 0 0 2px #ffffff73}.g.is-error>i{outline:1px solid var(--b);outline-offset:1px}.g.is-fl>i{border:2px solid var(--c);outline:0;box-shadow:0 0 0 3px var(--r);animation:dxt-fl .25s ease-out}.g.is-hv>i,.g.is-act>i{border:2px solid var(--c);outline:0}.g.is-pl>i{border:2px solid var(--c);outline:0;animation:dxt-pl .6s ease-out 3}.pn{position:absolute;left:0;top:0;z-index:1;box-sizing:border-box;border-radius:50%;background:var(--c) center/10px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M12.5 4.5l3 3L7 16H4v-3l8.5-8.5Z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/></svg>");box-shadow:0 0 0 1px #fff,0 1px 3px #0000004d;pointer-events:none}.pill{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 6px;border-radius:8px;background:#107c10;color:#fff;font:600 11px/16px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;text-align:center;box-shadow:0 0 0 1px #ffffffb3,0 1px 2px #0003;-webkit-user-select:none;user-select:none}.pill.is-n{padding:0}.pill.is-error{background:#c4314b}.ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px #00000040}.g.is-pk{--c:#0f6cbd;--r:rgba(15,108,189,.3)}.g.is-pk>i{border:2px solid #0f6cbd;outline:0;background:#0f6cbd4d}.is-sel .g:not(.is-pk) .pn{display:none}.g.is-pk .pn{display:block;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 10.5l3.2 3.2L15 7' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>")}.lasso{position:absolute;left:0;top:0;box-sizing:border-box;border:1px solid #0f6cbd;background:#0f6cbd1f}.is-alt .L{opacity:.25}.is-alt .pn,.is-alt .pill,.is-alt .ptip,.is-alt .g.is-pk .pn{display:none}@keyframes dxt-fl{0%{box-shadow:0 0 0 10px transparent}}@keyframes dxt-pl{0%{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}@media(prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}@media(forced-colors:active){.g>i,.pn{forced-color-adjust:none}.g>i{background:none;box-shadow:none;border-color:Highlight}.g.is-edited>i{outline-color:Highlight;box-shadow:none}.is-missing>i,.g.is-error>i{border-color:LinkText;outline-color:LinkText}.g.is-fl>i,.g.is-hv>i,.g.is-act>i,.g.is-pl>i{border-color:Highlight;box-shadow:none}.g.is-pl>i{animation:none}.pn{background-color:Highlight;box-shadow:none}.pill{forced-color-adjust:none;background:Highlight;color:HighlightText;box-shadow:none}.pill.is-error{background:LinkText;color:Canvas}.ptip{forced-color-adjust:none;background:Canvas;color:CanvasText;border:1px solid CanvasText;box-shadow:none}}`;
+  var overlay_default = `:host{all:initial}[hidden]{display:none!important}.W{position:fixed;inset:0;overflow:hidden;pointer-events:none}.L{position:absolute;inset:0}.g{display:contents;--c:#0f6cbd;--f:rgba(15,108,189,.1);--b:rgba(15,108,189,.55);--s:dashed;--r:rgba(15,108,189,.3)}.g.is-missing{--c:#c48a00;--f:rgba(255,185,0,.22);--b:#c48a00;--r:rgba(196,138,0,.3)}.g.is-edited{--c:#107c10;--f:rgba(34,197,94,.28);--b:#107c10;--s:solid;--r:rgba(16,124,16,.3)}.g.is-error{--c:#c4314b;--f:rgba(196,49,75,.14);--b:#c4314b;--s:solid;--r:rgba(196,49,75,.3)}.g.is-builtin,.g.is-ro{--c:#616161;--f:rgba(97,97,97,.08);--b:#8a8a8a;--s:dotted;--r:rgba(97,97,97,.25)}.is-builtin .pn,.is-ro .pn{display:none}.g>i{position:absolute;left:0;top:0;box-sizing:border-box;border:1px var(--s) var(--b);border-radius:4px;background:var(--f);box-shadow:0 0 0 1px #ffffff73;pointer-events:none}.g.is-edited>i{outline:1px solid var(--b);box-shadow:0 0 0 2px #ffffff73}.g.is-error>i{outline:1px solid var(--b);outline-offset:1px}.g.is-fl>i{border:2px solid var(--c);outline:0;box-shadow:0 0 0 3px var(--r);animation:dxt-fl .25s ease-out}.g.is-hv>i,.g.is-act>i{border:2px solid var(--c);outline:0}.g.is-pl>i{border:2px solid var(--c);outline:0;animation:dxt-pl .6s ease-out 3}.pn{position:absolute;left:0;top:0;z-index:1;box-sizing:border-box;border-radius:50%;background:var(--c) center/10px no-repeat url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M12.5 4.5l3 3L7 16H4v-3l8.5-8.5Z' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linejoin='round'/></svg>");box-shadow:0 0 0 1px #fff,0 1px 3px #0000004d;pointer-events:none}.pill{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 6px;border-radius:8px;background:#107c10;color:#fff;font:600 11px/16px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;text-align:center;box-shadow:0 0 0 1px #ffffffb3,0 1px 2px #0003;-webkit-user-select:none;user-select:none}.pill.is-n{padding:0}.pill.is-error{background:#c4314b}.ptip{position:absolute;left:0;top:0;box-sizing:border-box;padding:0 8px;border-radius:4px;background:#242424;color:#fff;font:400 12px/20px Segoe UI,"Segoe UI Web (West European)",-apple-system,BlinkMacSystemFont,Roboto,Helvetica Neue,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 6px #00000040}.g.is-pk{--c:#0f6cbd;--r:rgba(15,108,189,.3)}.g.is-pk>i{border:2px solid #0f6cbd;outline:0;background:#0f6cbd4d}.is-sel .g:not(.is-pk) .pn{display:none}.g.is-pk .pn{display:block;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 10.5l3.2 3.2L15 7' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>")}.lasso{position:absolute;left:0;top:0;box-sizing:border-box;border:1px solid #0f6cbd;background:#0f6cbd1f}.lasso.is-un{border-color:#c50f1f;background:#c50f1f1a}.is-alt .L{opacity:.25}.is-alt .pn,.is-alt .pill,.is-alt .ptip,.is-alt .g.is-pk .pn{display:none}@keyframes dxt-fl{0%{box-shadow:0 0 0 10px transparent}}@keyframes dxt-pl{0%{box-shadow:0 0 0 0 var(--c)}to{box-shadow:0 0 0 12px transparent}}@media(prefers-reduced-motion:reduce){.g.is-fl>i{animation:none}.g.is-pl>i{animation:none;box-shadow:0 0 0 3px var(--r)}}@media(forced-colors:active){.g>i,.pn{forced-color-adjust:none}.g>i{background:none;box-shadow:none;border-color:Highlight}.g.is-edited>i{outline-color:Highlight;box-shadow:none}.is-missing>i,.g.is-error>i{border-color:LinkText;outline-color:LinkText}.g.is-fl>i,.g.is-hv>i,.g.is-act>i,.g.is-pl>i{border-color:Highlight;box-shadow:none}.g.is-pl>i{animation:none}.pn{background-color:Highlight;box-shadow:none}.pill{forced-color-adjust:none;background:Highlight;color:HighlightText;box-shadow:none}.pill.is-error{background:LinkText;color:Canvas}.ptip{forced-color-adjust:none;background:Canvas;color:CanvasText;border:1px solid CanvasText;box-shadow:none}}`;
 
   // src/inspector/overlay.ts
   var INTERCEPT = ["pointerdown", "mousedown", "pointerup", "mouseup", "click", "dblclick"];
@@ -8912,7 +8918,16 @@
     const h2 = el?.clientHeight ?? 0;
     return w > 0 && e.offsetX >= w || h2 > 0 && e.offsetY >= h2;
   }
+  var sameCopy = (a, b) => (a.part ? !!b.part && a.part.start === b.part.start && a.part.end === b.part.end : !b.part) && ((a.zone ?? a.el) === (b.zone ?? b.el) || a.el === b.el || !!a.hit && a.hit === b.hit);
   var dragBox = (s) => [Math.min(s.x0, s.x), Math.min(s.y0, s.y), Math.abs(s.x - s.x0), Math.abs(s.y - s.y0)];
+  function scrollers(el) {
+    const out = [];
+    for (let n = el, i = 0; n && i < 200; i++) {
+      if (n === document.scrollingElement || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth) out.push([n, n.scrollLeft, n.scrollTop]);
+      n = n.parentElement ?? (n.parentNode?.host || null);
+    }
+    return out;
+  }
   var grow3 = (b, d) => [b[0] - d, b[1] - d, b[2] + 2 * d, b[3] + 2 * d];
   var onText = (boxes, pt) => boxes.some((b) => within(grow3(b, SLOP), pt));
   var boxOf = (r) => [r.left, r.top, r.width, r.height];
@@ -9289,14 +9304,17 @@
      * While selecting: a press anywhere but our own UI (the primary button, without Alt, not a finger, which scrolls) may
      * draw a box. It shows once the pointer has moved BOX_MIN px, and from then on the gesture is the box's: neither the
      * page nor a label gets its release or click. Let go, it selects the labels it covers (OverlayHooks.boxed). A press
-     * that doesn't move is a click as always, and one on a scrollbar scrolls. True when the event was the box's.
+     * that doesn't move is a click as always, and one on a scrollbar scrolls. The box stays on the page: scrolled with the
+     * wheel meanwhile, it reaches what scrolls in and keeps what it covered that scrolled out (track, covered). With Ctrl
+     * held as it starts, it unselects what it covers instead (drawn red). True when the event was the box's.
      */
     boxing(m, t, mine3) {
       if (t === "pointerdown") {
         this.endBox();
         const p = m;
         if (p.button !== 0 || p.altKey || mine3 || p.pointerType === "touch" || onScrollbar(p)) return false;
-        this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, on: false, done: false };
+        const at = p.composedPath?.()[0] ?? p.target;
+        this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, scr: scrollers(at), cut: -1, far: /* @__PURE__ */ new Map(), met: /* @__PURE__ */ new Map(), un: p.ctrlKey, on: false, done: false };
         addEventListener("pointermove", this.onBoxMove, true);
         addEventListener("pointercancel", this.onBoxCancel, true);
         addEventListener("dragstart", this.onBoxDrag, true);
@@ -9323,6 +9341,7 @@
       if (!s.on) {
         if (Math.abs(s.x - s.x0) < BOX_MIN && Math.abs(s.y - s.y0) < BOX_MIN) return;
         s.on = true;
+        s.un ||= e.ctrlKey;
         this.noText(true);
       }
       this.invalidate(1);
@@ -9339,8 +9358,8 @@
       if (this.sel && !this.sel.done && !this.ours(e.composedPath())) e.preventDefault();
     };
     /**
-     * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go. Its release's mouseup and
-     * click are still the box's (boxing), until the next press or a moment later.
+     * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go (unselected, with Ctrl). Its
+     * release's mouseup and click are still the box's (boxing), until the next press or a moment later.
      */
     letGo(take) {
       const s = this.sel;
@@ -9355,7 +9374,7 @@
       this.invalidate(1);
       if (got.length)
         try {
-          this.o.boxed?.(got);
+          this.o.boxed?.(got, s.un);
         } catch (e) {
           if (false) console.error("[translator] box", e);
         }
@@ -9373,14 +9392,112 @@
       removeEventListener("selectstart", this.onBoxText, true);
       this.invalidate(1);
     }
-    /** The labels a box covers that can be selected, by their marks in the last frame. */
+    /**
+     * The labels a box covers that can be selected: those whose marks in the last frame lie in it (a label in a scrolling
+     * area, in its box there: from the box's corner for that area, areaOf; any other, in what shows of the box: inView),
+     * and those it covered before that the page has scrolled out of view since, while their text as last seen, moved as
+     * far as their area scrolled since, lies in it (Seen).
+     */
     covered(s) {
       const sx = this.sx;
       if (!sx) return [];
       const b = dragBox(s);
+      const v = this.inView(s, b);
+      const moved2 = /* @__PURE__ */ new Map();
       const out = [];
-      for (const r of this.recs.values()) if (!this.dead(r.a) && overlaps(b, r.boxes) && sx.can(r.a)) out.push(r.a);
+      for (const r of this.recs.values()) {
+        if (inert(r.look) || !sx.can(r.a)) continue;
+        const at = this.areaOf(s, r.a, moved2);
+        const own2 = at && dragBox({ x0: at.f.x - at.dx, y0: at.f.y - at.dy, x: s.x, y: s.y });
+        const seen = this.seenOf(s, r.a);
+        if (r.boxes.length) {
+          if (this.dead(r.a)) continue;
+          const box = own2 ?? v;
+          const hit2 = !!box && overlaps(box, r.boxes);
+          if (hit2 || seen) s.met.set(r.a, { boxes: r.boxes, dx: at?.dx ?? 0, dy: at?.dy ?? 0 });
+          if (hit2) out.push(r.a);
+        } else if (seen && this.laidOut(r.a)) {
+          const ddx = (at?.dx ?? 0) - seen.dx;
+          const ddy = (at?.dy ?? 0) - seen.dy;
+          if (overlaps(own2 ?? b, seen.boxes.map((m) => [m[0] - ddx, m[1] - ddy, m[2], m[3]]))) out.push(r.a);
+        }
+      }
       return out;
+    }
+    /**
+     * The box's record of a label's text (Sel.met): its own, else, once, that of the copy it replaced. A re-render gives a
+     * copy a new anchor (same component and text key) and keeps some of its elements (sameCopy); the old anchor is gone from
+     * the page. Copies of one component never share those elements, so an untouched copy never takes the record of one
+     * re-rendered or removed, whichever is met first.
+     */
+    seenOf(s, a) {
+      const own2 = s.met.get(a);
+      if (own2) return own2;
+      for (const [b, seen] of s.met)
+        if (b.comp === a.comp && b.key === a.key && !this.recs.has(b) && sameCopy(a, b)) {
+          s.met.delete(b);
+          s.met.set(a, seen);
+          return seen;
+        }
+      return void 0;
+    }
+    /** A label scrolled out of view is still on the page, and not hidden (its zone): the box keeps no label that went. */
+    laidOut(a) {
+      const z = a.zone ?? a.el;
+      return z.isConnected && (!z.checkVisibility || z.checkVisibility(VIS));
+    }
+    /**
+     * The scrolling area around a label (the innermost) and the box's corner for it (Far: where the box first met the area,
+     * the press when the area holds it, else the press brought inside what shows of the area), with how far the area's
+     * content has scrolled since (dx, dy; read once per area into `moved`). Null for a label in none (the page's header,
+     * its tabs): the box itself is its.
+     */
+    areaOf(s, a, moved2) {
+      const area = this.clipOf(a.zone ?? a.el).find(([, scrolls]) => scrolls)?.[0];
+      if (!area?.isConnected) return null;
+      let f = s.far.get(area);
+      if (!f) {
+        const c = this.clipFor(area, { l: 0, t: 0, r: innerWidth, b: innerHeight }, /* @__PURE__ */ new Map()).hard;
+        f = { x: Math.min(Math.max(s.x0, c.l), c.r), y: Math.min(Math.max(s.y0, c.t), c.b), scr: scrollers(area) };
+        s.far.set(area, f);
+      }
+      let d = moved2.get(area);
+      if (!d) {
+        d = [0, 0];
+        for (const [el, l0, t0] of f.scr)
+          if (el.isConnected) {
+            d[0] += el.scrollLeft - l0;
+            d[1] += el.scrollTop - t0;
+          }
+        moved2.set(area, d);
+      }
+      return { f, dx: d[0], dy: d[1] };
+    }
+    /** The press stays where it was on the page: it moves as far as each scrolling element around it scrolled (Sel.scr). */
+    track(s) {
+      s.scr.forEach((e, i) => {
+        const [el, l0, t0] = e;
+        if (!el.isConnected) return;
+        const l = el.scrollLeft;
+        const t = el.scrollTop;
+        if (l === l0 && t === t0) return;
+        s.x0 -= l - l0;
+        s.y0 -= t - t0;
+        e[1] = l;
+        e[2] = t;
+        if (s.cut < 0 || i < s.cut) s.cut = i;
+      });
+    }
+    /**
+     * What shows of a box (null: nothing): all of it until the page scrolls under it; then only what lies in the client area
+     * of the element that scrolled (Sel.cut), as what is outside it (the page's header, its tabs, the command bar) didn't.
+     */
+    inView(s, b) {
+      const el = s.cut < 0 ? null : s.scr[s.cut][0];
+      if (!el?.isConnected) return b;
+      const v = { l: 0, t: 0, r: innerWidth, b: innerHeight };
+      if (el !== document.scrollingElement && el !== document.documentElement) cut(v, this.inner(el));
+      return isect({ left: b[0], top: b[1], right: b[0] + b[2], bottom: b[1] + b[3] }, v);
     }
     /** While a box is drawn no text of the page gets selected (user-select on <html>, put back after). */
     noText(on) {
@@ -9769,9 +9886,13 @@
       this.hover = this.under();
       const sx = this.sx;
       const s = this.sel;
-      if (s?.on && !s.done) this.boxed = new Set(this.covered(s));
+      if (s && !s.done) this.track(s);
+      const drag = s?.on && !s.done ? s : null;
+      const lasso = drag && this.inView(drag, dragBox(drag));
+      if (drag) this.boxed = new Set(this.covered(drag));
       else if (this.boxed.size) this.boxed.clear();
-      const picked = (a) => !!sx && (this.boxed.has(a) || sx.has(a));
+      const un = !!drag?.un;
+      const picked = (a) => !!sx && (un ? sx.has(a) && !this.boxed.has(a) : this.boxed.has(a) || sx.has(a));
       const penOk = /* @__PURE__ */ new Map();
       const pens = [];
       for (const r of this.recs.values()) {
@@ -9794,7 +9915,9 @@
         const pk = live && picked(r.a);
         this.draw(r, `g is-${r.look || "na"}${hv ? " is-hv" : ""}${act ? " is-act" : ""}${fl ? " is-fl" : ""}${pl ? " is-pl" : ""}${pk ? " is-pk" : ""}`, hv || act || pk, view, dpr, penOk.get(r) ?? false, after.get(r.a));
       }
-      this.place(this.lasso, s?.on && !s.done ? dragBox(s) : null);
+      const lc = un ? "lasso is-un" : "lasso";
+      if (this.lasso.className !== lc) this.lasso.className = lc;
+      this.place(this.lasso, lasso);
       for (const p of this.pills) this.drawPill(p);
       this.drawTip(view, dpr);
       for (const fn of this.subs)
@@ -10642,6 +10765,12 @@
         }
       return n;
     }
+    /** Unselects each label selected (a box drawn with Ctrl held, let go), never selecting one: how many were removed. */
+    remove(as) {
+      let n = 0;
+      for (const a of as) if (this.m.delete(a.comp)) n++;
+      return n;
+    }
     clear() {
       this.m.clear();
     }
@@ -10669,7 +10798,7 @@
     }
     return out;
   }
-  var selectingText = (n) => `Click or drag over the labels you want · ${n.toLocaleString()} selected`;
+  var selectingText = (n) => `Click or drag over the labels you want · Ctrl+drag to unselect · ${n.toLocaleString()} selected`;
   function selectionLine(sel) {
     const pages = new Set(sel.map((s) => s.page)).size;
     return `${plural(sel.length, "label")} on ${plural(Math.max(1, pages), "page")}`;
@@ -11026,7 +11155,7 @@
       mutated,
       ours: () => [app.root.host],
       alt: () => emit("alt"),
-      boxed: (as) => addSelected(as)
+      boxed: (as, un) => un ? removeSelected(as) : addSelected(as)
     };
     const overlay = new Overlay(hooks);
     const preview = new Preview(app, (fn) => overlay.quiet(fn));
@@ -11675,6 +11804,11 @@
     }
     function addSelected(as) {
       if (!selecting || !chosen.add([...as].filter(canSelect), title())) return;
+      overlay.invalidate(1);
+      emit("items");
+    }
+    function removeSelected(as) {
+      if (!selecting || !chosen.remove(as)) return;
       overlay.invalidate(1);
       emit("items");
     }
@@ -12742,7 +12876,7 @@ ${l}`;
           ["Base language", ctx?.base ?? null],
           ["Languages", langs.join(", ")],
           ["Exported on", (/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " ") + " UTC"],
-          ["Version", "1.1.0"],
+          ["Version", "1.2.0"],
           ["Note", 'Empty cells mean "no translation" and never clear a label on import. The sheets up to "Dashboards Fields" use the XrmToolBox Easy Translator layout.']
         ];
         const blob = await writeXlsx([...layout(slots, langs), { name: INFO, rows: info }], { headerStyle: true, freezeHeader: true });
@@ -18236,7 +18370,7 @@ ${l}`;
           { head: "Settings" },
           app.managedMenuItem(),
           "-",
-          { head: `Dynamics Translator ${"1.1.0"}` }
+          { head: `Dynamics Translator ${"1.2.0"}` }
         ],
         { end: true }
       );
@@ -20646,7 +20780,7 @@ ${byId.get(itemId(it))?.now ?? ""}`);
         { label: "Show logical names", checked: prefs.showNames, keep: true, run: () => savePrefs({ showNames: !prefs.showNames }) },
         managedMenuItem(),
         "-",
-        { head: `Dynamics Translator ${"1.1.0"}` }
+        { head: `Dynamics Translator ${"1.2.0"}` }
       ], { end: true });
     }
     function managedMenuItem() {

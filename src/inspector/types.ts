@@ -125,8 +125,11 @@ export interface OverlayHooks {
   ours(): Node[];
   /** Alt pressed or released: while it is held the page works as usual. */
   alt?(held: boolean): void;
-  /** A box dragged over the page while selecting (OverlayApi.selection) was let go: the labels it covered. */
-  boxed?(as: Anchor[]): void;
+  /**
+   * A box dragged over the page while selecting (OverlayApi.selection) was let go: the labels it covered, to select, or
+   * to unselect (`un`: Ctrl was held as it started).
+   */
+  boxed?(as: Anchor[], un: boolean): void;
 }
 
 /** What the overlay asks while labels are being selected for an export (PageMode.select). */
@@ -173,7 +176,8 @@ export interface OverlayApi {
   invalidate(n?: number): void;
   /**
    * Selecting labels for an export (null: not): selected marks show a check, and a box dragged over the page (from a
-   * press anywhere but our own UI, without Alt) selects the labels it covers once let go (OverlayHooks.boxed).
+   * press anywhere but our own UI, without Alt) selects the labels it covers once let go, or unselects them when Ctrl
+   * was held as it started (OverlayHooks.boxed).
    */
   selection(s: SelectionLook | null): void;
 }

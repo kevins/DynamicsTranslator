@@ -304,10 +304,11 @@ window.__dxtE2E = { running: true, log: [], progress: [], keys: [] };
 
   await step('records', async () => {
     const FORM = await mainForm();
+    const { view, command } = await testIds();
     for (const [kind, id, set, col, prop] of [
-      ['view', (await testIds()).view, 'savedqueries', 'name', 'Name'],
+      ['view', view, 'savedqueries', 'name', 'Name'],
       ['form', FORM, 'systemforms', 'name', 'Name'],
-      ['command', (await testIds()).command, 'appactions', 'buttonlabeltext', 'Label'],
+      ['command', command, 'appactions', 'buttonlabeltext', 'Label'],
     ]) {
       store.add(await providers.loadRecords(ctx, kind, [id], lo));
       const key = `${kind}|${id}|${prop}`;

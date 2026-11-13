@@ -1,6 +1,6 @@
 {
   "name": "dynamics-translator",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "description": "Edge bookmarklet that translates Dynamics 365 / Dataverse model-driven apps where you see them: every label on the page, plus a spreadsheet workbench with Excel and CSV",
   "license": "MIT",

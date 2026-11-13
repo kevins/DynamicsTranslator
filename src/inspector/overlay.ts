@@ -452,13 +452,54 @@ export const overlaps = (b: Box, marks: readonly Box[]): boolean => marks.some((
 /** How far (px, either way) a press must move before it draws a selection box: less is a click. */
 export const BOX_MIN = 6;
 
-/** A press while selecting (Overlay.sel), which draws a box once it moves: the press (x0, y0) and the pointer now, in viewport px. */
+/**
+ * Where a selection box's corner is for the labels of one scrolling area (Overlay.areaOf): the press brought inside the
+ * area's visible part when the box first met it (x, y, viewport px), with the scroll offsets then of the area and of each
+ * one around it (scrollers). It moves with them from then on, like content: what the area scrolls out of view stays in
+ * the box, also when the press is outside the area (a box dragged from the page's header down into the form).
+ */
+interface Far {
+  x: number;
+  y: number;
+  scr: Array<[Element, number, number]>;
+}
+
+/**
+ * A label's text as a selection box last saw it (Sel.met): its marks (viewport px) and how far its scrolling area had
+ * scrolled then since the box met that area (dx, dy). Scrolled out of view, the text is those marks, moved as far as the
+ * area has scrolled since: never the label's wider zone.
+ */
+interface Seen {
+  boxes: Box[];
+  dx: number;
+  dy: number;
+}
+
+/**
+ * A press while selecting (Overlay.sel), which draws a box once it moves: the press (x0, y0) and the pointer now, in
+ * viewport px. The press stays where it was on the page: it moves as the page scrolls under it (Overlay.track).
+ */
 interface Sel {
   id: number;
   x0: number;
   y0: number;
   x: number;
   y: number;
+  /** The elements around the press that can scroll it, innermost first (scrollers), with their scroll offsets as last read. */
+  scr: Array<[Element, number, number]>;
+  /** The innermost of them that has scrolled since the press (its index in `scr`), -1 while none has: the box then shows only in its client area (Overlay.inView). */
+  cut: number;
+  /** The box's corner for the labels of each scrolling area it has met, by that area (Far). */
+  far: Map<Element, Far>;
+  /**
+   * The labels the box has covered so far, each copy of a component on its own (a column shown in two grids: two copies,
+   * two places, perhaps two scrolling areas), with its text as last seen (Seen): one scrolled out of view since still
+   * counts while that text lies in the box. A copy the page re-renders takes over the record of the one it replaces
+   * (Overlay.seenOf).
+   */
+  met: Map<Anchor, Seen>;
+  /** Ctrl was held as the box started: it unselects what it covers instead (OverlayHooks.boxed). */
+  un: boolean;
   /** Moved far enough to draw (BOX_MIN): from then on the gesture is the box's. */
   on: boolean;
   /** Let go or cancelled: its release's mouseup and click are still the box's, until the next press. */
@@ -476,8 +517,31 @@ export function onScrollbar(e: Pick<MouseEvent, 'target' | 'offsetX' | 'offsetY'
   return (w > 0 && e.offsetX >= w) || (h > 0 && e.offsetY >= h);
 }
 
+/**
+ * Two anchors of one component are one copy of it, the page having re-rendered part of it: the same part of their text
+ * (a self-linked view's header shows one column's name twice in one text, two parts sharing every element), and they
+ * share its zone (a grid's header cell, kept while its label and text are rendered again), its element, or the larger
+ * element around it.
+ */
+export const sameCopy = (a: Pick<Anchor, 'el' | 'zone' | 'hit' | 'part'>, b: Pick<Anchor, 'el' | 'zone' | 'hit' | 'part'>): boolean =>
+  (a.part ? !!b.part && a.part.start === b.part.start && a.part.end === b.part.end : !b.part) &&
+  ((a.zone ?? a.el) === (b.zone ?? b.el) || a.el === b.el || (!!a.hit && a.hit === b.hit));
+
 /** The box between the press and the pointer. */
 export const dragBox =(s: Pick<Sel, 'x0' | 'y0' | 'x' | 'y'>): Box => [Math.min(s.x0, s.x), Math.min(s.y0, s.y), Math.abs(s.x - s.x0), Math.abs(s.y - s.y0)];
+
+/**
+ * The elements around `el` (across open shadow roots) that can scroll it, innermost first, with their scroll offsets now:
+ * a selection box's press moves with them (Overlay.track). Elements whose content fits can't scroll and are left out.
+ */
+function scrollers(el: Element | null): Array<[Element, number, number]> {
+  const out: Array<[Element, number, number]> = [];
+  for (let n = el, i = 0; n && i < 200; i++) {
+    if (n === document.scrollingElement || n.scrollHeight > n.clientHeight || n.scrollWidth > n.clientWidth) out.push([n, n.scrollLeft, n.scrollTop]);
+    n = n.parentElement ?? ((n.parentNode as ShadowRoot | null)?.host || null);
+  }
+  return out;
+}
 /** A box grown by `d` px on every side. */
 const grow = (b: Box, d: number): Box => [b[0] - d, b[1] - d, b[2] + 2 * d, b[3] + 2 * d];
 /** Whether a point is on one of a label's marks, or within SLOP px of one. */
@@ -901,14 +965,17 @@ export class Overlay implements OverlayApi {
    * While selecting: a press anywhere but our own UI (the primary button, without Alt, not a finger, which scrolls) may
    * draw a box. It shows once the pointer has moved BOX_MIN px, and from then on the gesture is the box's: neither the
    * page nor a label gets its release or click. Let go, it selects the labels it covers (OverlayHooks.boxed). A press
-   * that doesn't move is a click as always, and one on a scrollbar scrolls. True when the event was the box's.
+   * that doesn't move is a click as always, and one on a scrollbar scrolls. The box stays on the page: scrolled with the
+   * wheel meanwhile, it reaches what scrolls in and keeps what it covered that scrolled out (track, covered). With Ctrl
+   * held as it starts, it unselects what it covers instead (drawn red). True when the event was the box's.
    */
   private boxing(m: MouseEvent, t: string, mine: boolean): boolean {
     if (t === 'pointerdown') {
       this.endBox();
       const p = m as PointerEvent;
       if (p.button !== 0 || p.altKey || mine || p.pointerType === 'touch' || onScrollbar(p)) return false;
-      this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, on: false, done: false };
+      const at = (p.composedPath?.()[0] ?? p.target) as Element | null;
+      this.sel = { id: p.pointerId, x0: p.clientX, y0: p.clientY, x: p.clientX, y: p.clientY, scr: scrollers(at), cut: -1, far: new Map(), met: new Map(), un: p.ctrlKey, on: false, done: false };
       addEventListener('pointermove', this.onBoxMove, true);
       addEventListener('pointercancel', this.onBoxCancel, true);
       addEventListener('dragstart', this.onBoxDrag, true);
@@ -937,6 +1004,9 @@ export class Overlay implements OverlayApi {
     if (!s.on) {
       if (Math.abs(s.x - s.x0) < BOX_MIN && Math.abs(s.y - s.y0) < BOX_MIN) return;
       s.on = true;
+      // Ctrl pressed after the press, before the box shows, counts too; from then on the box keeps what it does (Ctrl may
+      // be let go, for the wheel: Ctrl and the wheel zoom the page).
+      s.un ||= e.ctrlKey;
       this.noText(true);
     }
     this.invalidate(1);
@@ -957,8 +1027,8 @@ export class Overlay implements OverlayApi {
   };
 
   /**
-   * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go. Its release's mouseup and
-   * click are still the box's (boxing), until the next press or a moment later.
+   * The box is let go (`take`) or cancelled (Escape): what it covers is selected when let go (unselected, with Ctrl). Its
+   * release's mouseup and click are still the box's (boxing), until the next press or a moment later.
    */
   private letGo(take: boolean): void {
     const s = this.sel;
@@ -973,7 +1043,7 @@ export class Overlay implements OverlayApi {
     this.invalidate(1);
     if (got.length)
       try {
-        this.o.boxed?.(got);
+        this.o.boxed?.(got, s.un);
       } catch (e) {
         if (__DEV__) console.error('[translator] box', e);
       }
@@ -993,14 +1063,119 @@ export class Overlay implements OverlayApi {
     this.invalidate(1);
   }
 
-  /** The labels a box covers that can be selected, by their marks in the last frame. */
+  /**
+   * The labels a box covers that can be selected: those whose marks in the last frame lie in it (a label in a scrolling
+   * area, in its box there: from the box's corner for that area, areaOf; any other, in what shows of the box: inView),
+   * and those it covered before that the page has scrolled out of view since, while their text as last seen, moved as
+   * far as their area scrolled since, lies in it (Seen).
+   */
   private covered(s: Sel): Anchor[] {
     const sx = this.sx;
     if (!sx) return [];
     const b = dragBox(s);
+    const v = this.inView(s, b);
+    const moved = new Map<Element, [number, number]>();
     const out: Anchor[] = [];
-    for (const r of this.recs.values()) if (!this.dead(r.a) && overlaps(b, r.boxes) && sx.can(r.a)) out.push(r.a);
+    for (const r of this.recs.values()) {
+      if (inert(r.look) || !sx.can(r.a)) continue;
+      const at = this.areaOf(s, r.a, moved);
+      const own = at && dragBox({ x0: at.f.x - at.dx, y0: at.f.y - at.dy, x: s.x, y: s.y });
+      const seen = this.seenOf(s, r.a);
+      if (r.boxes.length) {
+        if (this.dead(r.a)) continue;
+        const box = own ?? v;
+        const hit = !!box && overlaps(box, r.boxes);
+        // This copy's text where it shows now, for when it scrolls out: once the box has covered it.
+        if (hit || seen) s.met.set(r.a, { boxes: r.boxes, dx: at?.dx ?? 0, dy: at?.dy ?? 0 });
+        if (hit) out.push(r.a);
+      } else if (seen && this.laidOut(r.a)) {
+        // Scrolled out: its text shows no more (its zone may still show a little), so only where that text lies counts.
+        const ddx = (at?.dx ?? 0) - seen.dx;
+        const ddy = (at?.dy ?? 0) - seen.dy;
+        if (overlaps(own ?? b, seen.boxes.map((m): Box => [m[0] - ddx, m[1] - ddy, m[2], m[3]]))) out.push(r.a);
+      }
+    }
     return out;
+  }
+
+  /**
+   * The box's record of a label's text (Sel.met): its own, else, once, that of the copy it replaced. A re-render gives a
+   * copy a new anchor (same component and text key) and keeps some of its elements (sameCopy); the old anchor is gone from
+   * the page. Copies of one component never share those elements, so an untouched copy never takes the record of one
+   * re-rendered or removed, whichever is met first.
+   */
+  private seenOf(s: Sel, a: Anchor): Seen | undefined {
+    const own = s.met.get(a);
+    if (own) return own;
+    for (const [b, seen] of s.met)
+      if (b.comp === a.comp && b.key === a.key && !this.recs.has(b) && sameCopy(a, b)) {
+        s.met.delete(b);
+        s.met.set(a, seen);
+        return seen;
+      }
+    return undefined;
+  }
+
+  /** A label scrolled out of view is still on the page, and not hidden (its zone): the box keeps no label that went. */
+  private laidOut(a: Anchor): boolean {
+    const z = a.zone ?? a.el;
+    return z.isConnected && (!z.checkVisibility || z.checkVisibility(VIS));
+  }
+
+  /**
+   * The scrolling area around a label (the innermost) and the box's corner for it (Far: where the box first met the area,
+   * the press when the area holds it, else the press brought inside what shows of the area), with how far the area's
+   * content has scrolled since (dx, dy; read once per area into `moved`). Null for a label in none (the page's header,
+   * its tabs): the box itself is its.
+   */
+  private areaOf(s: Sel, a: Anchor, moved: Map<Element, [number, number]>): { f: Far; dx: number; dy: number } | null {
+    const area = this.clipOf(a.zone ?? a.el).find(([, scrolls]) => scrolls)?.[0];
+    if (!area?.isConnected) return null;
+    let f = s.far.get(area);
+    if (!f) {
+      const c = this.clipFor(area, { l: 0, t: 0, r: innerWidth, b: innerHeight }, new Map()).hard;
+      f = { x: Math.min(Math.max(s.x0, c.l), c.r), y: Math.min(Math.max(s.y0, c.t), c.b), scr: scrollers(area) };
+      s.far.set(area, f);
+    }
+    let d = moved.get(area);
+    if (!d) {
+      d = [0, 0];
+      for (const [el, l0, t0] of f.scr)
+        if (el.isConnected) {
+          d[0] += el.scrollLeft - l0;
+          d[1] += el.scrollTop - t0;
+        }
+      moved.set(area, d);
+    }
+    return { f, dx: d[0], dy: d[1] };
+  }
+
+  /** The press stays where it was on the page: it moves as far as each scrolling element around it scrolled (Sel.scr). */
+  private track(s: Sel): void {
+    s.scr.forEach((e, i) => {
+      const [el, l0, t0] = e;
+      if (!el.isConnected) return;
+      const l = el.scrollLeft;
+      const t = el.scrollTop;
+      if (l === l0 && t === t0) return;
+      s.x0 -= l - l0;
+      s.y0 -= t - t0;
+      e[1] = l;
+      e[2] = t;
+      if (s.cut < 0 || i < s.cut) s.cut = i;
+    });
+  }
+
+  /**
+   * What shows of a box (null: nothing): all of it until the page scrolls under it; then only what lies in the client area
+   * of the element that scrolled (Sel.cut), as what is outside it (the page's header, its tabs, the command bar) didn't.
+   */
+  private inView(s: Sel, b: Box): Box | null {
+    const el = s.cut < 0 ? null : s.scr[s.cut][0];
+    if (!el?.isConnected) return b;
+    const v: Clip = { l: 0, t: 0, r: innerWidth, b: innerHeight };
+    if (el !== document.scrollingElement && el !== document.documentElement) cut(v, this.inner(el));
+    return isect({ left: b[0], top: b[1], right: b[0] + b[2], bottom: b[1] + b[3] }, v);
   }
 
   /** While a box is drawn no text of the page gets selected (user-select on <html>, put back after). */
@@ -1445,9 +1620,14 @@ export class Overlay implements OverlayApi {
     // While selecting: selected labels, and those a box being drawn covers, show a check where the pencil goes.
     const sx = this.sx;
     const s = this.sel;
-    if (s?.on && !s.done) this.boxed = new Set(this.covered(s));
+    if (s && !s.done) this.track(s);
+    const drag = s?.on && !s.done ? s : null;
+    const lasso = drag && this.inView(drag, dragBox(drag));
+    if (drag) this.boxed = new Set(this.covered(drag));
     else if (this.boxed.size) this.boxed.clear();
-    const picked = (a: Anchor): boolean => !!sx && (this.boxed.has(a) || sx.has(a));
+    // A box drawn with Ctrl unselects: the selected labels it covers show as not selected.
+    const un = !!drag?.un;
+    const picked = (a: Anchor): boolean => !!sx && (un ? sx.has(a) && !this.boxed.has(a) : this.boxed.has(a) || sx.has(a));
     const penOk = new Map<Rec, boolean>();
     const pens: Array<[Anchor, Box]> = [];
     for (const r of this.recs.values()) {
@@ -1471,7 +1651,9 @@ export class Overlay implements OverlayApi {
       const pk = live && picked(r.a);
       this.draw(r, `g is-${r.look || 'na'}${hv ? ' is-hv' : ''}${act ? ' is-act' : ''}${fl ? ' is-fl' : ''}${pl ? ' is-pl' : ''}${pk ? ' is-pk' : ''}`, hv || act || pk, view, dpr, penOk.get(r) ?? false, after.get(r.a));
     }
-    this.place(this.lasso, s?.on && !s.done ? dragBox(s) : null);
+    const lc = un ? 'lasso is-un' : 'lasso';
+    if (this.lasso.className !== lc) this.lasso.className = lc;
+    this.place(this.lasso, lasso);
     for (const p of this.pills) this.drawPill(p);
     this.drawTip(view, dpr);
     for (const fn of this.subs)

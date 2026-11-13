@@ -33,10 +33,10 @@ links from a README, so the button you drag is on that page.
 
 | Item | Value |
 | --- | --- |
-| Tool | A bookmarklet: a favourite whose address is a small program. On the favourites bar it is named *Translator*. Version 1.1.0 |
+| Tool | A bookmarklet: a favourite whose address is a small program. On the favourites bar it is named *Translator*. Version 1.2.0 |
 | Runs on | Any page of a model-driven app (`https://<org>.crm.dynamics.com/main.aspx...`), with your own sign-in: translation on the page for records, lists and dashboards, the Workbench on any page. See [Open it](#open-it) |
 | Browser | Microsoft Edge, the supported and tested browser. The link unpacks itself with the browser's `DecompressionStream` |
-| Link size | About 288,000 characters: the code is compressed inside the link and unpacked by the browser. Edge runs favourites of up to about 2,000,000 characters |
+| Link size | About 289,000 characters: the code is compressed inside the link and unpacked by the browser. Edge runs favourites of up to about 2,000,000 characters |
 | Installs in the environment | Nothing: no solution, no app registration, no server code. Saving a classic command bar label creates a small temporary solution for the time of the save and deletes it again. See [Safety](#safety) |
 | Documentation | [Technical reference (Word)](docs/Dynamics%20Translator%20-%20Technical%20Reference.docx)<br>[Developer guide: how the translator is built and how to change it](docs/developer-guide.md) (also as [Word](docs/Dynamics%20Translator%20-%20Developer%20Guide.docx)) |
 | License | [MIT](LICENSE) |
@@ -412,7 +412,7 @@ What the translator remembers is kept: the target language and the languages sho
 the *All labels* sheet is docked or floating and where it floats, the **Show logical names** setting, the Workbench's
 options, sheet and column widths, the Workbench window's place, and Recent publishes (a list that a build older than
 1.0.0 kept for the whole environment rather than per account is removed unread: see [Privacy](#privacy)). To see which
-version runs, open the [⋯ menu](#the--menu): its last line reads *Dynamics Translator 1.1.0*.
+version runs, open the [⋯ menu](#the--menu): its last line reads *Dynamics Translator 1.2.0*.
 
 ## Use
 
@@ -654,7 +654,8 @@ instead, and the bar rises above the area switcher where it would cover it. From
 * **✕**: closes the translator.
 
 While labels are [selected for an export](#select-labels-to-export), the status says how many (*Click or drag over the
-labels you want · 3 selected*), and **Select all**, **Download…** and **Cancel** take the place of the buttons after it.
+labels you want · Ctrl+drag to unselect · 3 selected*), and **Select all**, **Download…** and **Cancel** take the place
+of the buttons after it.
 
 As the window narrows, *Translator* goes, the languages become codes (*EN → FR*), the button texts collapse to their
 icons and **Review and publish** becomes **Publish**.
@@ -1049,12 +1050,14 @@ rather than those of whole tables as the [Workbench](#the-workbench) does:
   nothing of yours to export: a click on it says so.
 * A box dragged over the page, as on the Windows desktop, selects every label it covers: they show as selected while
   it is dragged, and are selected once you let go. It starts anywhere on the page with a press that moves a few
-  pixels (a press that doesn't move is a click), adds to the selection and never takes from it. **Escape** while
-  dragging takes the box away, selecting nothing. With **Alt** held, the page works as usual.
+  pixels (a press that doesn't move is a click), adds to the selection and never takes from it. With **Ctrl** held,
+  the box unselects the labels it covers instead. The mouse wheel scrolls the page while you drag, and the box stays
+  on the page: it reaches the labels that scroll in and keeps the ones it covered that scroll out of view. **Escape**
+  while dragging takes the box away, selecting nothing. With **Alt** held, the page works as usual.
 * The selection stays while you go to other tabs, forms and records, so one file can hold the labels of several pages.
-* The bar says how many are selected (*Click or drag over the labels you want · 3 selected*), with **Select all** (every
-  label marked on the page now), **Download…** and **Cancel** (stops selecting and clears the selection) in place of
-  its other buttons.
+* The bar says how many are selected (*Click or drag over the labels you want · Ctrl+drag to unselect · 3 selected*),
+  with **Select all** (every label marked on the page now), **Download…** and **Cancel** (stops selecting and clears
+  the selection) in place of its other buttons.
 
 **Download…** opens *Download selected labels*: how many labels, on how many pages, then *Include* and *Languages*,
 every box checked. *Include* lists only what the selection has: *Form labels*, *Column names*, *Tooltips*, *Choice
@@ -1726,7 +1729,7 @@ file's languages are added to the columns shown.
   to be sure an earlier request finished.
 * *Settings*: **Allow changes to managed labels**, checked while it is on: off each time the translator opens. See
   *Allowing changes to managed labels* under [Marks](#marks).
-* The version: *Dynamics Translator 1.1.0*.
+* The version: *Dynamics Translator 1.2.0*.
 
 The Workbench's **⋯** has the same, with **Keyboard shortcuts** and the setting **Show logical names** (the logical
 name under the title in the *Edit translations* dialog).
@@ -3047,7 +3050,7 @@ you type is what is published. And it never adds an unmanaged layer: the labels 
 
 ## Build
 
-Requirements: Node.js 21.2 or later (version 1.1.0 was built and tested with Node.js 22), with npm. Nothing else: the build runs on any operating system Node.js supports.
+Requirements: Node.js 21.2 or later (version 1.2.0 was built and tested with Node.js 22), with npm. Nothing else: the build runs on any operating system Node.js supports.
 
 ```
 npm install
@@ -3074,8 +3077,8 @@ TypeScript 5.6.3, @xmldom/xmldom 0.9.12): use it for release builds.
    `DecompressionStream` and runs it (as a script, where the page forbids `eval`); and writes the link,
    `translator.bookmarklet.txt`.
 
-Then it prints the sizes, for example `translator: … | bookmarklet 287,505 bytes (280.8 KB)`. For version 1.1.0 the
-link is about 290,000 characters.
+Then it prints the sizes, for example `translator: … | bookmarklet 288,800 bytes (282.0 KB)`. For version 1.2.0 the
+link is about 289,000 characters.
 
 **The size limit.** Edge runs a `javascript:` favourite up to its 2 MiB limit on addresses: measured in Edge 155, a link
 of 2,040,060 characters ran and one of 2,100,060 silently did nothing. The build stops below that, with a margin:

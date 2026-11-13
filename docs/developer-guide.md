@@ -70,7 +70,7 @@ get a build running. Then go to the chapter you need:
   unmanaged table, *Project*, in a test app whose navigation has a group *Delivery* with *Projects* and
   *Organizations* (the account table, which comes from a managed solution).
 * Times and sizes come from a test environment and from the build of version 1.0.0. Yours will differ.
-* The guide describes version 1.0.0 (`version` in `package.json`). It exists twice, with the same content: as
+* The guide describes version 1.2.0 (`version` in `package.json`). It exists twice, with the same content: as
   Markdown, `docs/developer-guide.md`, and as a Word document,
   [`docs/Dynamics Translator - Developer Guide.docx`](Dynamics%20Translator%20-%20Developer%20Guide.docx).
 
@@ -10508,15 +10508,19 @@ anchor (the list still has the field).
   `attribute|<table>.<column>` `DisplayName`, only when its label shows one of that column's texts and, where a form
   API knows the control, binds it to that very column. The scanner remembers the composite control's cell
   (`scanner.parts`), which is where the sub-field shows: finding it from the list opens that cell's tab.
-* **A control's title in its own action bar** (`action_bar_header_title<control id>`) maps to the only cell of its
-  form with that control id that shows no column, where its text is one of the cell's labels: a title worded
+* **A control's title in its own action bar** (`action_bar_header_title<control id>`) maps to the cell of its form
+  with that control id (`titleCell`: the only one, else the copy the id names, as for a field: a form can hold two
+  timelines as `notescontrol`, which the page names `notescontrol` and `notescontrol1` in form order, LIVE-FINDINGS
+  41 and 101, and the copy must be in the section and tab around the title) that shows no column, where its text is
+  one of the cell's labels: a title worded
   otherwise, also over a cell without a label in the user's language, is never taken for it. The form API doesn't know
   the timeline. The timeline's heading there is its Name from the form designer, one text for every language, else
   Dynamics' own text (*Timeline*, *Chronologie* in French), whatever its cell's label says (verified in a test
   environment, LIVE-FINDINGS 101). Neither can be translated: once that cell is known, the heading is its mark, under a
   key of Microsoft's text, `builtin|timeline|<the cell's comp>|Label`
-  ([9.13](#913-microsofts-built-in-text-and-read-only-labels)). It gets no mark while the form's labels load, where two
-  cells share that control id, on another form or in a quick create form, nor where it holds two texts. Nothing else
+  ([9.13](#913-microsofts-built-in-text-and-read-only-labels)). It gets no mark while the form's labels load, where its
+  copy isn't where the page shows the title, on another form or in a quick create form, nor where it holds two texts.
+  Nothing else
   in a timeline is its label: the field container's rule and the `[data-control-name]` rule skip a timeline's cell,
   so a heading inside its box that reads like its label is still its Name or Dynamics' own.
 
@@ -12633,7 +12637,8 @@ motion*).
 
 **Select labels to export.** The first item of the ⋯ menu starts selection mode (`BarHooks.select`: the app closes
 *All labels*, then `PageMode.select(true)`). While it is on, the bar shows `selectingText` (*Click or drag over the
-labels you want · 3 selected*) and **Select all**, **Download…** and **Cancel** in place of **Review and publish**, **All
+labels you want · Ctrl+drag to unselect · 3 selected*) and **Select all**, **Download…** and **Cancel** in place of
+**Review and publish**, **All
 labels**, **Workbench** and **⋯**. In the controller (`inspector/mode.ts`), `onLabel` gives a click to `toggleSelected`
 instead of opening a popup; the selection is a `Chosen` (`inspector/selection.ts`), one entry per component (a label
 shown twice is selected once) with the slot key clicked and the page title, kept across navigation until **Cancel**
@@ -12644,7 +12649,20 @@ other pencil shows. It also draws the box: in `onPtr`, before `decide`, `boxing`
 button, no Alt, not touch); once the pointer has moved `BOX_MIN` (6 px) the gesture is the box's, its release, mouseup
 and click swallowed, text selection and native drags of the page prevented (`user-select` on `<html>` while it is
 drawn). Each frame marks what it covers (`overlaps`, on the marks' boxes, filtered by `can`); let go, `OverlayHooks.boxed`
-adds them (`Chosen.add` never unselects); **Escape** while drawing cancels it. **Download…** (`openDownload`) reads what
+adds them (`Chosen.add` never unselects), or, with Ctrl held as it started (`Sel.un`, the box red: `.lasso.is-un`),
+unselects them (`Chosen.remove`, `removeSelected`); **Escape** while drawing cancels it. The box stays on the page while
+the wheel scrolls: the press moves with the scrolling elements around it (`track`, `Sel.scr`); a label in a scrolling
+area is covered by the box from that area's corner (`areaOf`, `Far`: the press brought inside what shows of the area
+when the box first met it, moving with the area's content since), so a box started above the form keeps what the form
+scrolls out; a label it covered that is scrolled out of view (no marks) still counts while its text, as last seen and
+moved as far as its area scrolled since, lies in its box (`Sel.met`, `Seen`; never the label's wider zone). Each copy
+of a component is remembered on its own (a column shown in two grids: two places, perhaps two scrolling areas), and a
+copy the page re-renders takes over the record of the one it replaced (`seenOf`), found by an element it keeps (its
+zone, its element or the larger element around it) and the same part of its text (a self-linked view's header shows
+one column's name twice in one text: two parts sharing every element): `sameCopy`, never by the component alone, so
+another copy never takes it; a label hidden or removed meanwhile no longer counts (`laidOut`). Once the press itself has scrolled, a label in no scrolling area (the page's
+header, its tabs, the command bar) counts only within the area that scrolled, where the box is drawn too (`inView`).
+**Download…** (`openDownload`) reads what
 each selected label's popup shows (`selectedTexts`: `describe` without the anchor, its blocks by heading through
 `partOf`, its choices, and the slot clicked where no block lists it; only slots in the store), offers the parts present
 and every language, and downloads with the Workbench's `io.exportWorkbook` or `io.exportCsv`, pending edits merged in

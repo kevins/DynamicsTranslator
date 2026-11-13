@@ -53,6 +53,12 @@ export class Chosen {
       }
     return n;
   }
+  /** Unselects each label selected (a box drawn with Ctrl held, let go), never selecting one: how many were removed. */
+  remove(as: Iterable<Pick<Anchor, 'comp'>>): number {
+    let n = 0;
+    for (const a of as) if (this.m.delete(a.comp)) n++;
+    return n;
+  }
   clear(): void {
     this.m.clear();
   }
@@ -90,7 +96,7 @@ export function selectedTexts(app: AppApi, sel: readonly Selected[], model: (app
 }
 
 /** The bar's text while selecting. */
-export const selectingText = (n: number): string => `Click or drag over the labels you want · ${n.toLocaleString()} selected`;
+export const selectingText = (n: number): string => `Click or drag over the labels you want · Ctrl+drag to unselect · ${n.toLocaleString()} selected`;
 
 /** The dialog's line under its title: how many labels, on how many pages. */
 export function selectionLine(sel: readonly Selected[]): string {

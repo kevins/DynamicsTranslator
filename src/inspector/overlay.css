@@ -41,6 +41,8 @@
 .is-sel .g:not(.is-pk) .pn{display:none}
 .g.is-pk .pn{display:block;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'><path d='M5 10.5l3.2 3.2L15 7' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/></svg>")}
 .lasso{position:absolute;left:0;top:0;box-sizing:border-box;border:1px solid #0f6cbd;background:rgba(15,108,189,.12)}
+/* A box drawn with Ctrl held unselects what it covers: the app's red. */
+.lasso.is-un{border-color:#c50f1f;background:rgba(197,15,31,.1)}
 .is-alt .L{opacity:.25}
 .is-alt .pn,.is-alt .pill,.is-alt .ptip,.is-alt .g.is-pk .pn{display:none}
 @keyframes dxt-fl{from{box-shadow:0 0 0 10px transparent}}

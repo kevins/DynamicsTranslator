@@ -260,10 +260,23 @@ export function register(t: Kit): void {
     // Its box as the page renders it (`data-control-name`), its label reading as the heading does: Dynamics' heading only.
     const box = () => new El('div', { 'data-id': 'notescontrol', 'data-control-name': 'notescontrol', id: 'id-53_0' }).add(title(undefined, 'Chronologie'), new El('div', {}, 'Saisir une note…'));
     eq(scan(new El('body').add(section('timeline', box())), labelled(L('Timeline', 'Chronologie'))).list, [[head(timeline), 'Chronologie', false]], 'in its box');
-    // Its cell not known: no mark (its form not loaded yet, a cell of that id twice, another form, quick create).
-    eq(scan(wrapped(title()), columns).list, [], 'the form not loaded');
+    // Two timelines under one id (a form holding both as `notescontrol`, LIVE-FINDINGS 101): Dynamics names the second
+    // `notescontrol1` (copies are numbered in form order, LIVE-FINDINGS 41), and each heading is its own copy's, where the
+    // page shows it.
     const twice = cell('c4', 'notescontrol', '', L('Notes', 'Notes'), ['SUMMARY_TAB', 'other'], { classid: TIMELINE });
-    eq(scan(wrapped(title()), [...slots, twice]).list, [], 'two cells of that id: which one is unknown');
+    const SECOND = 'action_bar_header_titlenotescontrol1';
+    const inTab = (tab: string, sec: string, id?: string) => new El('body').add(new El('div', { role: 'tabpanel', 'data-id': `tabpanel-${tab}` }).add(section(sec, title(id))));
+    eq(scan(wrapped(title()), [...slots, twice]).list, [[head(timeline), 'Chronologie', false]], 'the first copy, in its section');
+    eq(scan(inTab('SUMMARY_TAB', 'other', SECOND), [...slots, twice]).list, [[head(twice), 'Chronologie', false]], 'the second copy, in its tab and section');
+    eq(scan(new El('body').add(title()), [...slots, twice]).list, [[head(timeline), 'Chronologie', false]], 'no section or tab around it: the plain id is the first copy');
+    const same = cell('c4', 'notescontrol', '', L('Notes', 'Notes'), ['SUMMARY_TAB', 'timeline'], { classid: TIMELINE });
+    eq(scan(wrapped(title(SECOND)), [...slots, same]).list, [[head(same), 'Chronologie', false]], 'both in one section: the number says which');
+    // Its cell not known: no mark (its form not loaded yet, a copy the page shows elsewhere than its cell, a number that
+    // names no copy, another form, quick create).
+    eq(scan(wrapped(title()), columns).list, [], 'the form not loaded');
+    eq(scan(inTab('SUMMARY_TAB', 'other'), [...slots, twice]).list, [], 'the plain id where the second copy is: the page and the form disagree');
+    eq(scan(inTab('GENERAL_TAB', 'timeline'), [...slots, twice]).list, [], 'the first copy, in another tab');
+    eq(scan(inTab('SUMMARY_TAB', 'timeline', SECOND), slots).list, [], 'a number that names no copy');
     eq(scan(wrapped(title(), OTHER), slots).list, [], 'another form');
     eq(scan(new El('body').add(quickCreate(title())), slots).list, [], 'quick create');
     eq(scan(wrapped(title(undefined, 'Activités', 'Notes')), slots).list, [], 'two texts: which one is the heading is unknown');

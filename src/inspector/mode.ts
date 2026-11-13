@@ -570,7 +570,7 @@ export const createPageMode: CreatePageMode = (app) => {
     mutated,
     ours: () => [app.root.host],
     alt: () => emit('alt'),
-    boxed: (as) => addSelected(as),
+    boxed: (as, un) => (un ? removeSelected(as) : addSelected(as)),
   };
   // The class, not only its OverlayApi: active() also takes the label the popup points at (marked alone).
   const overlay = new Overlay(hooks);
@@ -1460,6 +1460,13 @@ export const createPageMode: CreatePageMode = (app) => {
   /** Labels a box covered, or Select all: each one not selected yet is (never unselects). */
   function addSelected(as: Iterable<Anchor>): void {
     if (!selecting || !chosen.add([...as].filter(canSelect), title())) return;
+    overlay.invalidate(1);
+    emit('items');
+  }
+
+  /** Labels a box drawn with Ctrl held covered: each one selected is unselected. */
+  function removeSelected(as: Iterable<Anchor>): void {
+    if (!selecting || !chosen.remove(as)) return;
     overlay.invalidate(1);
     emit('items');
   }

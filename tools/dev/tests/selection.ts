@@ -113,7 +113,7 @@ export function register(t: Kit): void {
     eq([list[0].labels[FR], list[0].labels[EN], st.get(`field|${F}|c2|Label`)!.labels[FR]], ['Genre', 'Kind', 'Type'], 'the pending French text in the file; the store keeps what it read');
   });
 
-  test('selection: the labels selected, each component once, in the order selected: a click selects or unselects, a box and Select all only add; the bar and the dialog say how many, on how many pages', async () => {
+  test('selection: the labels selected, each component once, in the order selected: a click selects or unselects, a box and Select all only add, a box drawn with Ctrl only takes away; the bar and the dialog say how many, on how many pages', async () => {
     const { Chosen, selectingText, selectionLine, PARTS } = await selection();
     const c = new Chosen();
     eq([c.toggle({ comp: 'a', key: 'a|Label' }, 'P1'), c.toggle({ comp: 'b', key: 'b|Label' }, 'P1'), c.size], [true, true, 2]);
@@ -124,9 +124,10 @@ export function register(t: Kit): void {
       { comp: 'c', key: 'c|Label', page: 'P2' },
     ]);
     eq([selectionLine(c.list()), selectionLine(c.list().slice(0, 1)), selectionLine([pick('x'), pick('y'), pick('z', 'z|Label', 'Contact · Main form')])], ['2 labels on 2 pages', '1 label on 1 page', '3 labels on 2 pages']);
+    eq([c.remove([{ comp: 'c' }, { comp: 'd' }, { comp: 'c' }]), c.list()], [1, [{ comp: 'b', key: 'b|Label', page: 'P1' }]], 'a box drawn with Ctrl over c (selected), d and c again: only c taken away, nothing added');
     c.clear();
     eq([c.size, c.list()], [0, []]);
-    eq([selectingText(0), selectingText(1234)], ['Click or drag over the labels you want · 0 selected', 'Click or drag over the labels you want · 1,234 selected']);
+    eq([selectingText(0), selectingText(1234)], ['Click or drag over the labels you want · Ctrl+drag to unselect · 0 selected', 'Click or drag over the labels you want · Ctrl+drag to unselect · 1,234 selected']);
     eq(
       PARTS.map((p) => p[1]),
       ['Form labels', 'Column names', 'Tooltips', 'Choice values', 'Other labels'],

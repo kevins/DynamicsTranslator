@@ -1,5 +1,24 @@
 # Changes
 
+## 1.2.0 (November 2026)
+
+Selecting labels to export with a box is easier: the page can scroll while you drag, and Ctrl takes labels away.
+
+**What is new**
+
+* **The selection box stays on the page while you scroll.** In *Select labels to export*, the mouse wheel scrolls the
+  page while you drag a box: the box reaches the labels that scroll in and keeps the ones it covered that scroll out of
+  view, also when it was started above the form, on the page's header.
+* **Ctrl+drag unselects.** A box started with Ctrl held unselects the labels it covers instead, drawn red; Ctrl can be
+  let go once the box shows, to scroll with the wheel. The bar says so: *Click or drag over the labels you want ·
+  Ctrl+drag to unselect · 3 selected*.
+
+**Fixes**
+
+* **The timeline's heading on a form with two timelines** has its grey mark and its popup. The form gives both
+  timelines the same name and the page calls the second one `notescontrol1`: the translator could tell neither
+  heading's timeline, so it marked neither.
+
 ## 1.1.0 (November 2026)
 
 Form field labels on main forms. A save now writes only the labels it changes, so it no longer stores copies of

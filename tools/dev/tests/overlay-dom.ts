@@ -347,8 +347,9 @@ export function register(t: Kit): void {
 
   test("overlay dom: selecting labels (selection()): a press that moves draws a box; the labels it covers show as selected as it goes and are selected once it is let go (boxed); its release and click reach neither the page nor a label; a press that doesn't move is a click as always; Escape cancels a box; Alt, a finger, our own UI or a label that can't be selected never take part; off, no box", async () => {
     const got: string[][] = [];
+    const uns: boolean[] = [];
     const sel = new Set<string>();
-    const s = await setup({ boxed: (as) => (got.push(as.map((a) => a.comp)), as.forEach((a) => sel.add(a.comp))) });
+    const s = await setup({ boxed: (as, un) => (got.push(as.map((a) => a.comp)), uns.push(un), as.forEach((a) => (un ? sel.delete(a.comp) : sel.add(a.comp)))) });
     try {
       let can = (_: Anchor) => true;
       s.ov.selection({ has: (a) => sel.has(a.comp), can: (a) => can(a) });
@@ -390,7 +391,27 @@ export function register(t: Kit): void {
       frame();
       eq(cls(), [true, false], 'only what can be selected shows as selected while it is drawn');
       fire('pointerup', s.sec, p(100, 170));
-      eq(got[1], ['field|f|1']);
+      eq([got[1], uns[1]], [['field|f|1'], false]);
+      // With Ctrl held as it starts, the box unselects: red, the selected labels it covers show as not selected as it
+      // goes, and are unselected once let go; Ctrl let go meanwhile (for the wheel), it still unselects.
+      can = () => true;
+      sel.add('option|e.a|1');
+      fire('pointerdown', s.sec, p(2, 95, { ctrlKey: true }));
+      fire('pointermove', s.sec, p(100, 130, { ctrlKey: true }));
+      frame();
+      eq([o.lasso.className, cls()], ['lasso is-un', [false, true]], 'red; "Nom" covered shows as not selected, "Oui" not covered still does');
+      fire('pointermove', s.sec, p(100, 170));
+      frame();
+      eq(cls(), [false, false], 'Ctrl let go: still unselecting');
+      fire('pointerup', s.sec, p(100, 170));
+      frame();
+      eq([got[2], uns[2], [...sel], o.lasso.hidden, o.lasso.className, cls()], [['field|f|1', 'option|e.a|1'], true, [], true, 'lasso', [false, false]], 'both unselected once let go');
+      // Ctrl pressed after the press, before the box shows: it unselects too.
+      sel.add('field|f|1');
+      fire('pointerdown', s.sec, p(2, 95));
+      fire('pointermove', s.sec, p(100, 130, { ctrlKey: true }));
+      fire('pointerup', s.sec, p(100, 130));
+      eq([uns[3], [...sel]], [true, []]);
       // With Alt, with a finger, from our own UI: no box (the page, or our UI, gets the gesture).
       sel.clear();
       for (const [t, more] of [[s.sec, { altKey: true }], [s.sec, { pointerType: 'touch' }], [s.inApp, {}]] as const) {
@@ -399,14 +420,14 @@ export function register(t: Kit): void {
         frame();
         ok(o.lasso.hidden && !fire('pointerup', t, p(100, 170, more)).stopped, `no box: ${JSON.stringify(more)}`);
       }
-      eq(got.length, 2);
+      eq(got.length, 4);
       // Not selecting: a drag is the page's.
       s.ov.selection(null);
       fire('pointerdown', s.sec, p(2, 95));
       fire('pointermove', s.sec, p(100, 170));
       frame();
       ok(o.lasso.hidden && !fire('pointerup', s.sec, p(100, 170)).prevented, 'no box when not selecting');
-      eq(got.length, 2);
+      eq(got.length, 4);
     } finally {
       s.ov.stop();
       s.undo();
@@ -700,6 +721,338 @@ export function register(t: Kit): void {
     e.append(...kids);
     return e;
   };
+
+  test("overlay dom: a selection box stays on the page as the page scrolls under it (the wheel): it reaches what scrolls in, keeps what it covered that scrolled out while that still lies in it, and shows and covers only in the area that scrolled, never the header above it", async () => {
+    const undo = install();
+    try {
+      // A form body scrolling inside 0..800 × 100..300 holds "Nom" (text 10..50 × 124..140) and, lower, "Oui" (text 10..40
+      // × 244..260); a tab above it, outside the scrolling area: "Onglet" (text 10..58 × 60..76).
+      const nom = text('Nom', [[10, 124, 50, 140]]);
+      const oui = text('Oui', [[10, 244, 40, 260]]);
+      const ong = text('Onglet', [[10, 60, 58, 76]]);
+      const lNom = el('LABEL', [10, 120, 200, 144], {}, el('SPAN', [10, 124, 50, 140], {}, nom));
+      const lOui = el('LABEL', [10, 240, 200, 264], {}, el('SPAN', [10, 244, 40, 260], {}, oui));
+      const lTab = el('LI', [10, 56, 100, 80], {}, el('SPAN', [10, 60, 58, 76], {}, ong));
+      const form = Object.assign(el('DIV', [0, 100, 800, 300], { overflowY: 'auto' }, lNom, lOui), { scrollTop: 0, scrollLeft: 0, scrollHeight: 1000, scrollWidth: 800 });
+      dom.doc.children[0].append(lTab, form);
+      /** The wheel: the form's content moves up by `dy`. */
+      const wheel = (dy: number) => {
+        form.scrollTop += dy;
+        for (const e of [lNom, lOui, ...lNom.children, ...lOui.children]) e.rect = [e.rect[0], e.rect[1] - dy, e.rect[2], e.rect[3] - dy];
+        for (const t of [nom, oui]) t.rects = t.rects.map((r) => ({ ...r, top: r.top - dy, bottom: r.bottom - dy }));
+      };
+      const A = (e: FakeEl, t: FakeEl, comp: string) => ({ el: e, text: t, comp, kind: 'field', key: comp + '|Label', role: 'label' }) as unknown as Anchor;
+      const all = [A(lNom, nom, 'field|f|1'), A(lOui, oui, 'field|f|2'), A(lTab, ong, 'tab|f|1')];
+      const got: string[][] = [];
+      const { Overlay } = await overlay();
+      const ov = new Overlay({ ...plain, look: () => 'ok', boxed: (as) => void got.push(as.map((a) => a.comp)) });
+      ov.start();
+      ov.sync(all);
+      ov.selection({ has: () => false, can: () => true });
+      const o = ov as unknown as { recs: Map<Anchor, { g: { className: string } }>; lasso: { hidden: boolean; style: Record<string, string> } };
+      const picked = () => all.filter((a) => o.recs.get(a)!.g.className.includes('is-pk')).map((a) => a.comp);
+      const lasso = () => (o.lasso.hidden ? null : [o.lasso.style.transform, o.lasso.style.width, o.lasso.style.height]);
+      const p = (x: number, y: number, more: Record<string, unknown> = {}) => ({ clientX: x, clientY: y, pointerId: 1, buttons: 1, ...more }) as never;
+      const frame = () => dom.raf?.();
+      frame();
+      // Until the page scrolls, the box is the box: dragged from above the tab down over "Nom", it covers both.
+      const body = dom.doc.children[0];
+      fire('pointerdown', body, p(2, 50));
+      fire('pointermove', body, p(100, 150));
+      frame();
+      eq([picked(), lasso()], [['field|f|1', 'tab|f|1'], ['translate(2px,50px)', '98px', '100px']], 'no scroll: every label it covers');
+      fire('pointerup', body, p(100, 150));
+      eq(got, [['field|f|1', 'tab|f|1']]);
+      // Pressed in the form at y 110 and dragged over "Nom" only.
+      fire('pointerdown', form, p(2, 110));
+      fire('pointermove', form, p(100, 150));
+      frame();
+      eq(picked(), ['field|f|1']);
+      // The wheel scrolls the form 60 px: "Nom" goes out of view above it, still in the box (kept); the press moved up with
+      // it to y 50, and the box shows and covers only inside the form: "Onglet", above it, doesn't take part.
+      wheel(60);
+      frame();
+      eq([picked(), lasso()], [['field|f|1'], ['translate(2px,100px)', '98px', '50px']], 'the part of the box in the form');
+      // Down to y 230: "Oui", scrolled in, is covered too.
+      fire('pointermove', form, p(100, 230));
+      frame();
+      eq(picked(), ['field|f|1', 'field|f|2']);
+      // 100 px more: "Nom" out of view, "Oui" cut at the form's top edge (no marks), both kept; with the pointer left of
+      // them they aren't in the box any more, back over them they are again.
+      wheel(100);
+      frame();
+      eq(picked(), ['field|f|1', 'field|f|2'], 'both kept');
+      fire('pointermove', form, p(5, 230));
+      frame();
+      eq(picked(), [], 'left of them: neither');
+      fire('pointermove', form, p(100, 230));
+      frame();
+      eq(picked(), ['field|f|1', 'field|f|2'], 'back over them: both');
+      fire('pointerup', form, p(100, 230));
+      eq(got[1], ['field|f|1', 'field|f|2'], 'let go: what it covered on the page, the tab left out');
+      // Pressed above the form (the tab's row) and dragged down into it over "Nom": once the form scrolls under it, what
+      // it covered there stays in it, as from a press in the form (its corner there moves with the form: from the form's
+      // top edge it crossed), and the tab, which doesn't scroll, stays in it too; the whole box shows.
+      wheel(-160);
+      fire('pointerdown', body, p(2, 50));
+      fire('pointermove', body, p(100, 140));
+      frame();
+      eq([picked(), lasso()], [['field|f|1', 'tab|f|1'], ['translate(2px,50px)', '98px', '90px']]);
+      wheel(100);
+      frame();
+      eq([picked(), lasso()], [['field|f|1', 'tab|f|1'], ['translate(2px,50px)', '98px', '90px']], '"Nom" (now 20..44, above the press) kept');
+      fire('pointermove', body, p(100, 230));
+      frame();
+      eq(picked(), ['field|f|1', 'field|f|2', 'tab|f|1'], '"Oui", scrolled in, covered');
+      fire('pointerup', body, p(100, 230));
+      eq(got[2], ['field|f|1', 'field|f|2', 'tab|f|1']);
+      // Shrunk off a scrolled-out label's text into the blank part of its zone, the box no longer covers it: its text
+      // decides, never the wider zone. Dragged right to left over "Nom" (text 10..50 in a label 10..200), the form
+      // scrolled until the text is out of view (kept while the box spans it), then the pointer right of the text.
+      wheel(-100);
+      fire('pointerdown', form, p(180, 110));
+      fire('pointermove', form, p(2, 150));
+      frame();
+      eq(picked(), ['field|f|1']);
+      wheel(60);
+      frame();
+      eq(picked(), ['field|f|1'], 'scrolled out, still spanned: kept');
+      fire('pointermove', form, p(100, 150));
+      frame();
+      eq(picked(), [], 'the box right of its text: not covered, though it crosses the label');
+      fire('pointerup', form, p(100, 150));
+      eq(got.length, 3, 'nothing selected');
+      // The same with Ctrl, "Nom" selected: it stays selected.
+      const chosen = new Set(['field|f|1']);
+      ov.selection({ has: (a) => chosen.has(a.comp), can: () => true });
+      wheel(-60);
+      fire('pointerdown', form, p(180, 110, { ctrlKey: true }));
+      fire('pointermove', form, p(2, 150));
+      frame();
+      eq(picked(), [], 'covered by the Ctrl box: shows as not selected');
+      wheel(60);
+      frame();
+      fire('pointermove', form, p(100, 150));
+      frame();
+      eq(picked(), ['field|f|1'], 'the Ctrl box right of its text: shows as selected again');
+      fire('pointerup', form, p(100, 150));
+      eq([got.length, [...chosen]], [3, ['field|f|1']], 'nothing taken away');
+      ov.stop();
+    } finally {
+      undo();
+    }
+  });
+
+  test("overlay dom: a selection box remembers each copy of a label on its own: a covered copy scrolled out counts by its own text, never by another copy's outside the box (a column in two grids), in one scrolling area or two, either order, adding or with Ctrl; a copy the page re-renders keeps the record; a label hidden or removed meanwhile doesn't count", async () => {
+    const { Overlay } = await overlay();
+    /** One page: "Nom" (copy A, text 10..50) in a scrolling area, and with `two` copy B of the same column (text 400..440). */
+    const page = (b: 'none' | 'same' | 'other') => {
+      const tA = text('Nom', [[10, 124, 50, 140]]);
+      const tB = text('Nom', [[400, 124, 440, 140]]);
+      const lA = el('LABEL', [10, 120, 200, 144], {}, el('SPAN', [10, 124, 50, 140], {}, tA));
+      const lB = el('LABEL', [400, 120, 600, 144], {}, el('SPAN', [400, 124, 440, 140], {}, tB));
+      const area = (r: [number, number, number, number], ...kids: FakeEl[]) => Object.assign(el('DIV', r, { overflowY: 'auto' }, ...kids), { scrollTop: 0, scrollLeft: 0, scrollHeight: 1000, scrollWidth: r[2] - r[0] });
+      const L = b === 'other' ? area([0, 100, 350, 300], lA) : b === 'same' ? area([0, 100, 800, 300], lA, lB) : area([0, 100, 800, 300], lA);
+      dom.doc.children[0].append(L, ...(b === 'other' ? [area([350, 100, 800, 300], lB)] : []));
+      /** The wheel over the area holding A: its content moves up by `dy` (B with it only when it is in that area). */
+      const wheel = (dy: number) => {
+        (L as unknown as { scrollTop: number }).scrollTop += dy;
+        for (const e of [lA, ...lA.children, ...(b === 'same' ? [lB, ...lB.children] : [])]) e.rect = [e.rect[0], e.rect[1] - dy, e.rect[2], e.rect[3] - dy];
+        for (const t of b === 'same' ? [tA, tB] : [tA]) t.rects = t.rects.map((q) => ({ ...q, top: q.top - dy, bottom: q.bottom - dy }));
+      };
+      const copy = (e: FakeEl, t: FakeEl) => ({ el: e, text: t, comp: 'attribute|e.col', kind: 'attribute', key: 'attribute|e.col|DisplayName', role: 'label' }) as unknown as Anchor;
+      return { L, lA, tA, wheel, copy, A: copy(lA, tA), B: copy(lB, tB) };
+    };
+    const p = (x: number, y: number, more: Record<string, unknown> = {}) => ({ clientX: x, clientY: y, pointerId: 1, buttons: 1, ...more }) as never;
+    for (const b of ['same', 'other'] as const)
+      for (const outsideFirst of [false, true])
+        for (const un of [false, true]) {
+          const undo = install();
+          try {
+            const g = page(b);
+            const got: Array<[string[], boolean]> = [];
+            const chosen = new Set(un ? ['attribute|e.col'] : []);
+            const ov = new Overlay({ ...plain, look: () => 'ok', boxed: (as, u) => void got.push([as.map((a) => a.comp), u]) });
+            ov.start();
+            ov.sync(outsideFirst ? [g.B, g.A] : [g.A, g.B]);
+            ov.selection({ has: (a) => chosen.has(a.comp), can: () => true });
+            dom.raf?.();
+            // A box over copy A only (x 2..100), then A's area wheeled 60 px: A's text is out of view, still in the box.
+            fire('pointerdown', g.L, p(2, 110, { ctrlKey: un }));
+            fire('pointermove', g.L, p(100, 150));
+            dom.raf?.();
+            g.wheel(60);
+            dom.raf?.();
+            fire('pointerup', g.L, p(100, 150));
+            eq(got, [[['attribute|e.col'], un]], `${b === 'same' ? 'one area' : 'two areas'}, ${outsideFirst ? 'the outside copy first' : 'the covered copy first'}, ${un ? 'Ctrl' : 'adding'}`);
+            ov.stop();
+          } finally {
+            undo();
+          }
+        }
+    for (const what of ['re-rendered', 'hidden', 'removed'] as const) {
+      const undo = install();
+      try {
+        const g = page('none');
+        const got: string[][] = [];
+        const ov = new Overlay({ ...plain, look: () => 'ok', boxed: (as) => void got.push(as.map((a) => a.comp)) });
+        ov.start();
+        ov.sync([g.A]);
+        ov.selection({ has: () => false, can: () => true });
+        dom.raf?.();
+        fire('pointerdown', g.L, p(2, 110));
+        fire('pointermove', g.L, p(100, 150));
+        dom.raf?.();
+        g.wheel(60);
+        // Out of view: Dynamics renders it again (a new anchor, same component and key), hides it, or removes it.
+        if (what === 're-rendered') ov.sync([g.copy(g.lA, g.tA)]);
+        else if (what === 'hidden') g.lA.vis = false;
+        else g.lA.remove();
+        dom.raf?.();
+        fire('pointerup', g.L, p(100, 150));
+        eq(got, what === 're-rendered' ? [['attribute|e.col']] : [], what);
+        ov.stop();
+      } finally {
+        undo();
+      }
+    }
+  });
+
+  test("overlay dom: a copy the page re-renders keeps its own record only, found by the zone it keeps: never taken by another copy of the column met first, untouched or re-rendered too, in one scrolling area or two, adding or with Ctrl; a covered copy removed lends its record to no other copy", async () => {
+    const { Overlay } = await overlay();
+    const p = (x: number, y: number, more: Record<string, unknown> = {}) => ({ clientX: x, clientY: y, pointerId: 1, buttons: 1, ...more }) as never;
+    for (const two of [false, true])
+      for (const what of ['covered re-rendered', 'both re-rendered', 'covered removed'] as const)
+        for (const un of [false, true]) {
+          const undo = install();
+          try {
+            // Two copies of one column, each a header cell (its zone) holding a label and its text "Nom": A (text 10..50),
+            // B (text 400..440), B met first (the scanner's order); A covered, B outside the box.
+            const cell = (x: number) => {
+              const t = text('Nom', [[x, 124, x + 40, 140]]);
+              const sp = el('SPAN', [x, 124, x + 40, 140], {}, t);
+              return { t, sp, z: el('DIV', [x, 120, x + 190, 144], {}, sp) };
+            };
+            const A = cell(10);
+            const B = cell(400);
+            const area = (r: [number, number, number, number], ...kids: FakeEl[]) => Object.assign(el('DIV', r, { overflowY: 'auto' }, ...kids), { scrollTop: 0, scrollLeft: 0, scrollHeight: 1000, scrollWidth: r[2] - r[0] });
+            const L = two ? area([0, 100, 350, 300], A.z) : area([0, 100, 800, 300], A.z, B.z);
+            dom.doc.children[0].append(L, ...(two ? [area([350, 100, 800, 300], B.z)] : []));
+            const moved = two ? [A] : [A, B];
+            const wheel = (dy: number) => {
+              (L as unknown as { scrollTop: number }).scrollTop += dy;
+              for (const c of moved) {
+                for (const e of [c.z, c.sp]) e.rect = [e.rect[0], e.rect[1] - dy, e.rect[2], e.rect[3] - dy];
+                c.t.rects = c.t.rects.map((q) => ({ ...q, top: q.top - dy, bottom: q.bottom - dy }));
+              }
+            };
+            const anchor = (c: { t: FakeEl; sp: FakeEl; z: FakeEl }) => ({ el: c.sp, zone: c.z, text: c.t, comp: 'attribute|e.col', kind: 'attribute', key: 'attribute|e.col|DisplayName', role: 'label' }) as unknown as Anchor;
+            /** Dynamics renders a copy's label again: a new label and text in the same header cell, where they were. */
+            const rerender = (c: { t: FakeEl; sp: FakeEl; z: FakeEl }) => {
+              const t = text('Nom', c.t.rects.map((q) => [q.left, q.top, q.right, q.bottom] as [number, number, number, number]));
+              const sp = el('SPAN', [...c.sp.rect], {}, t);
+              c.sp.remove();
+              c.z.append(sp);
+              Object.assign(c, { t, sp });
+              return anchor(c);
+            };
+            const a = anchor(A);
+            const b = anchor(B);
+            const got: Array<[Anchor[], boolean]> = [];
+            const chosen = new Set(un ? ['attribute|e.col'] : []);
+            const ov = new Overlay({ ...plain, look: () => 'ok', boxed: (as, u) => void got.push([as, u]) });
+            ov.start();
+            ov.sync([b, a]);
+            ov.selection({ has: (x) => chosen.has(x.comp), can: () => true });
+            dom.raf?.();
+            fire('pointerdown', L, p(2, 110, { ctrlKey: un }));
+            fire('pointermove', L, p(100, 150));
+            dom.raf?.();
+            wheel(60);
+            dom.raf?.();
+            let a2: Anchor | null = null;
+            if (what === 'covered re-rendered') ov.sync([b, (a2 = rerender(A))]);
+            else if (what === 'both re-rendered') {
+              const b2 = rerender(B);
+              ov.sync([b2, (a2 = rerender(A))]);
+            } else {
+              A.z.remove();
+              ov.sync([b]);
+            }
+            dom.raf?.();
+            fire('pointerup', L, p(100, 150));
+            ov.stop();
+            // Which copies the box let go with: the re-rendered covered copy alone (by identity), or none.
+            const which = got.map(([as, u]) => [as.map((x) => (x === a2 ? 'A re-rendered' : x === a ? 'A' : x === b ? 'B' : 'B re-rendered')), u]);
+            eq(which, a2 ? [[['A re-rendered'], un]] : [], `${what}, ${two ? 'two areas' : 'one area'}, ${un ? 'Ctrl' : 'adding'}`);
+          } finally {
+            undo();
+          }
+        }
+  });
+
+  test("overlay dom: the two parts of one header text (a self-linked view's \"Parent Account (Parent Account)\": one column twice, every element shared) each keep their own record through a re-render: the covered part scrolled out sideways still counts, never by the other part's text, adding or with Ctrl", async () => {
+    const { Overlay } = await overlay();
+    const p = (x: number, y: number, more: Record<string, unknown> = {}) => ({ clientX: x, clientY: y, pointerId: 1, buttons: 1, ...more }) as never;
+    const TEXT = 'Parent Account (Parent Account)';
+    for (const rerendered of [false, true])
+      for (const un of [false, true]) {
+        const undo = install();
+        try {
+          // A grid scrolling sideways in 0..300 × 100..300 (scrolled 170 px), its header cell (the zone) holding one text:
+          // part 1 (0..14) at x 10..122, part 2 (16..30) at x 138..250 (8 px a character).
+          const mk = () => {
+            const t = text(TEXT, [[10, 124, 258, 140]]);
+            return { t, sp: el('SPAN', [10, 124, 258, 140], {}, t) };
+          };
+          let h = mk();
+          const zone = el('DIV', [10, 120, 400, 144], {}, h.sp);
+          const grid = Object.assign(el('DIV', [0, 100, 300, 300], { overflowX: 'auto' }, zone), { scrollTop: 0, scrollLeft: 170, scrollHeight: 200, scrollWidth: 1000 });
+          dom.doc.children[0].append(grid);
+          const parts = (sp: FakeEl, t: FakeEl) =>
+            [0, 16].map((start) => ({ el: sp, zone, text: t, part: { start, end: start + 14, text: 'Parent Account' }, comp: 'attribute|account.parentaccountid', kind: 'attribute', key: 'attribute|account.parentaccountid|DisplayName', role: 'header' }) as unknown as Anchor);
+          const [p1, p2] = parts(h.sp, h.t);
+          const got: Array<[Anchor[], boolean]> = [];
+          const chosen = new Set(un ? ['attribute|account.parentaccountid'] : []);
+          const ov = new Overlay({ ...plain, look: () => 'ok', boxed: (as, u) => void got.push([as, u]) });
+          ov.start();
+          ov.sync([p1, p2]);
+          ov.selection({ has: (x) => chosen.has(x.comp), can: () => true });
+          dom.raf?.();
+          // A box over part 2 only (x 130..290).
+          fire('pointerdown', grid, p(290, 115, { ctrlKey: un }));
+          fire('pointermove', grid, p(130, 150));
+          dom.raf?.();
+          // The grid scrolled back 170 px: part 1 now shows at 180..292, part 2 is out of view at 308..420; the pointer to
+          // x 296, so the box (its corner moved with the grid to 460) spans part 2 only.
+          (grid as unknown as { scrollLeft: number }).scrollLeft = 0;
+          for (const e of [zone, h.sp]) e.rect = [e.rect[0] + 170, e.rect[1], e.rect[2] + 170, e.rect[3]];
+          h.t.rects = h.t.rects.map((q) => ({ ...q, left: q.left + 170, right: q.right + 170 }));
+          fire('pointermove', grid, p(296, 150));
+          dom.raf?.();
+          let q1 = p1;
+          let q2 = p2;
+          if (rerendered) {
+            // Dynamics renders the header's label and text again, in the same header cell: two new part anchors.
+            const n = mk();
+            n.sp.rect = [...h.sp.rect];
+            n.t.rects = h.t.rects.map((q) => ({ ...q }));
+            h.sp.remove();
+            zone.append(n.sp);
+            h = n;
+            [q1, q2] = parts(n.sp, n.t);
+            ov.sync([q1, q2]);
+            dom.raf?.();
+          }
+          fire('pointerup', grid, p(296, 150));
+          ov.stop();
+          const which = got.map(([as, u]) => [as.map((x) => (x === q2 ? 'part 2' : x === q1 ? 'part 1' : 'old part')), u]);
+          eq(which, [[['part 2'], un]], `${rerendered ? 're-rendered' : 'not re-rendered'}, ${un ? 'Ctrl' : 'adding'}`);
+        } finally {
+          undo();
+        }
+      }
+  });
 
   test('overlay dom: a mark per line box of the label text; nothing for the field container or the rest of the label', async () => {
     const undo = install();
